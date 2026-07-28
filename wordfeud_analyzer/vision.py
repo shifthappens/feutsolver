@@ -148,6 +148,85 @@ def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
     return bonuses
 
 
+def detect_visible_tiles(image_path: str | Path) -> set[tuple[int, int]]:
+    """Find the coordinates of the off-white tiles already on the board.
+
+    The language model is very good at reading the glyphs, but can occasionally
+    count a board row incorrectly.  Tile backgrounds are visually unambiguous,
+    so this inexpensive local check lets us align its transcription with the
+    actual 15 by 15 grid before any score is calculated.
+    """
+    board, _ = _wordfeud_crop_images(image_path)
+    width, height = board.size
+    occupied: set[tuple[int, int]] = set()
+    for row in range(15):
+        for col in range(15):
+            # A spread of interior pixels avoids the letter and point glyphs.
+            # A placed tile can be off-white *or yellow* when Wordfeud marks a
+            # recent turn; all bonus colours have at least one substantially
+            # darker RGB channel. Six bright samples is deliberately
+            # conservative, so ordinary bonus squares never become tiles.
+            bright_samples = 0
+            for y_fraction in (0.18, 0.30, 0.70, 0.82):
+                for x_fraction in (0.18, 0.30, 0.70, 0.82):
+                    x = min(width - 1, int((col + x_fraction) * width / 15))
+                    y = min(height - 1, int((row + y_fraction) * height / 15))
+                    red, green, blue = board.getpixel((x, y))
+                    if min(red, green, blue) > 120:
+                        bright_samples += 1
+            if bright_samples >= 6:
+                occupied.add((row, col))
+    return occupied
+
+
+def _align_compact_to_visible_tiles(
+    compact: CompactVisionState,
+    visible_tiles: set[tuple[int, int]],
+) -> CompactVisionState:
+    """Correct a small global row/column offset in a model transcription.
+
+    We only apply a shift when both the model's letters and the local tile
+    detector agree strongly. This prevents a sparse or partially obscured board
+    from being moved on weak evidence.
+    """
+    model_tiles = {
+        (row, col)
+        for row, line in enumerate(compact.rows)
+        for col, char in enumerate(line)
+        if char != "."
+    }
+    if len(model_tiles) < 2 or len(visible_tiles) < 2:
+        return compact
+
+    def overlap(row_shift: int, col_shift: int) -> int:
+        return sum(
+            (row + row_shift, col + col_shift) in visible_tiles
+            for row, col in model_tiles
+            if 0 <= row + row_shift < 15 and 0 <= col + col_shift < 15
+        )
+
+    base_overlap = overlap(0, 0)
+    candidates = [
+        (overlap(row_shift, col_shift), row_shift, col_shift)
+        for row_shift in range(-2, 3)
+        for col_shift in range(-2, 3)
+    ]
+    best_overlap, row_shift, col_shift = max(candidates, key=lambda item: item[0])
+    enough_agreement = best_overlap >= 2 and best_overlap / len(model_tiles) >= 0.8
+    substantially_better = best_overlap >= base_overlap + 2
+    if (row_shift == 0 and col_shift == 0) or not enough_agreement or not substantially_better:
+        return compact
+
+    rows = [["."] * 15 for _ in range(15)]
+    for row, col in model_tiles:
+        new_row, new_col = row + row_shift, col + col_shift
+        if not (0 <= new_row < 15 and 0 <= new_col < 15):
+            return compact
+        rows[new_row][new_col] = compact.rows[row][col]
+    blanks = [(row + row_shift, col + col_shift) for row, col in compact.blanks]
+    return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=blanks)
+
+
 def _parse_content(content: Any) -> CompactVisionState:
     if isinstance(content, list):
         content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
@@ -214,6 +293,7 @@ def extract_board(
             content = response.json()["choices"][0]["message"]["content"]
             compact = _parse_content(content)
             visible_bonuses = detect_visible_bonuses(image_path)
+            compact = _align_compact_to_visible_tiles(compact, detect_visible_tiles(image_path))
             return _to_board_state(compact, visible_bonuses)
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
             errors.append(f"poging {attempt + 1}: {exc}")

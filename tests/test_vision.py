@@ -2,7 +2,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from wordfeud_analyzer.vision import CompactVisionState, _to_board_state, detect_visible_bonuses, wordfeud_crops
+from wordfeud_analyzer.vision import (
+    CompactVisionState,
+    _align_compact_to_visible_tiles,
+    _to_board_state,
+    detect_visible_bonuses,
+    detect_visible_tiles,
+    wordfeud_crops,
+)
 
 
 def test_wordfeud_crops_produce_square_board_and_rack(tmp_path: Path) -> None:
@@ -44,3 +51,27 @@ def test_detect_visible_bonuses_reads_each_coordinate_without_a_board_pattern(tm
     assert detected[9][4] == "DW"
     assert detected[14][14] == "TW"
     assert detected[4][4] == "NORMAL"
+
+
+def test_visible_tile_alignment_corrects_a_consistent_vision_row_offset(tmp_path: Path) -> None:
+    screenshot = tmp_path / "screenshot.png"
+    width, height, board_top = 588, 1275, round(1275 * 0.296)
+    image = Image.new("RGB", (width, height), (42, 45, 52))
+    draw = ImageDraw.Draw(image)
+    for row, col in [(6, 7), (7, 7), (8, 7), (9, 3), (9, 4), (9, 5), (9, 6), (9, 7)]:
+        draw.rectangle((int(col * width / 15) + 3, board_top + int(row * width / 15) + 3,
+                        int((col + 1) * width / 15) - 3, board_top + int((row + 1) * width / 15) - 3),
+                       fill=(225, 220, 210))
+    image.save(screenshot)
+    compact = CompactVisionState.model_validate({
+        "rows": ["." * 15 for _ in range(5)] + ["." * 7 + "B" + "." * 7,
+                                                    "." * 7 + "O" + "." * 7,
+                                                    "." * 7 + "M" + "." * 7,
+                                                    "...ZETJE" + "." * 7] + ["." * 15 for _ in range(6)],
+        "rack": ["T"],
+        "blanks": [],
+    })
+    assert detect_visible_tiles(screenshot) == {(6, 7), (7, 7), (8, 7), (9, 3), (9, 4), (9, 5), (9, 6), (9, 7)}
+    aligned = _align_compact_to_visible_tiles(compact, detect_visible_tiles(screenshot))
+    assert aligned.rows[6][7] == "B"
+    assert aligned.rows[9][3:8] == "ZETJE"

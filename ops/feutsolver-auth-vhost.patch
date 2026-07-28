@@ -1,0 +1,43 @@
+--- /etc/apache2/sites-available/coen.at-le-ssl.conf
++++ /etc/apache2/sites-available/coen.at-le-ssl.conf
+@@ -14,6 +14,34 @@
+-    <Location /feutsolver/>
+-        AuthType Basic
+-        AuthName "Wordfeud Analyzer"
+-        AuthUserFile /etc/apache2/.htpasswd-feutsolver
+-        Require valid-user
+-    </Location>
++    Alias /feutsolver-login /var/lib/feutsolver/feutsolver-login.html
++
++    <Location /feutsolver-login>
++        Require all granted
++    </Location>
++
++    <Location /feutsolver-login-submit>
++        SetHandler form-login-handler
++        AuthFormProvider file
++        AuthUserFile /etc/apache2/.htpasswd-feutsolver
++        AuthType form
++        AuthName "feutsolver"
++        AuthFormLoginRequiredLocation "/feutsolver-login"
++        AuthFormLoginSuccessLocation "/feutsolver/"
++        Session On
++        SessionMaxAge 2592000
++        SessionCookieName feutsolver_session path=/feutsolver/;httponly;secure;samesite=lax
++        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
++        SessionCookieRemove On
++    </Location>
++
++    <Location /feutsolver/>
++        AuthFormProvider file
++        AuthUserFile /etc/apache2/.htpasswd-feutsolver
++        AuthType form
++        AuthName "feutsolver"
++        AuthFormLoginRequiredLocation "/feutsolver-login"
++        Session On
++        SessionMaxAge 2592000
++        SessionCookieName feutsolver_session path=/feutsolver/;httponly;secure;samesite=lax
++        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
++        SessionCookieRemove On
++        Require valid-user
++    </Location>
