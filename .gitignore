@@ -1,0 +1,7 @@
+.env
+.venv/
+.streamlit/secrets.toml
+__pycache__/
+.pytest_cache/
+data/*.txt
+!data/voorbeeld_woorden.txt

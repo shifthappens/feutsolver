@@ -1,0 +1,57 @@
+name: Deploy Wordfeud Analyzer
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wordfeud-analyzer-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy production
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Check out release revision
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify application
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pytest -q
+
+      - name: Install restricted deploy key
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Pin server host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync application files only
+        run: |
+          rsync -rlptDz --delete --chmod=Du=rwx,Dg=rx,Dg+s,Fu=rw,Fg=r \
+            --include='/wordfeud_analyzer/' \
+            --include='/wordfeud_analyzer/**' \
+            --include='/data/' \
+            --include='/data/voorbeeld_woorden.txt' \
+            --include='/app.py' \
+            --include='/requirements.txt' \
+            --exclude='*' \
+            ./ \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}"
