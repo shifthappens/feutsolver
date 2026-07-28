@@ -4,4 +4,5 @@
 __pycache__/
 .pytest_cache/
 data/*.txt
+data/*.gaddag-cache-*
 !data/voorbeeld_woorden.txt

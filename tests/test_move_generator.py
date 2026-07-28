@@ -36,6 +36,17 @@ def test_score_uses_bonus_at_its_extracted_random_coordinate() -> None:
     assert horizontal.score == 7  # existing B (4) + new A on 3L (3)
 
 
+def test_existing_anchor_does_not_reuse_hidden_bonus() -> None:
+    state = empty_board(list("WEEPT"))
+    state.grid[9][3].letter = "Z"
+    state.grid[9][3].bonus = "TW"
+    state.grid[10][3].bonus = "DL"
+    state.grid[11][3].bonus = "TL"
+    moves = generate_moves(state, Gaddag(["ZWEEPT"]), limit=20)
+    vertical = next(move for move in moves if move.word == "ZWEEPT")
+    assert vertical.score == 25
+
+
 def test_opentaal_loader_excludes_names_and_punctuation(tmp_path) -> None:
     wordlist = tmp_path / "words.txt"
     wordlist.write_text("juweel\nWetzel\nt/m\n06-nummer\n", encoding="utf-8")

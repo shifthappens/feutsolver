@@ -86,21 +86,59 @@ def _image_data_url(image: Image.Image) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
+def _pixel_brightness(pixel: tuple[int, ...]) -> float:
+    return sum(pixel[:3]) / 3
+
+
+def _locate_board_top(image: Image.Image) -> int:
+    """Locate the full-width square board from its repeating 15-column grid.
+
+    Wordfeud moves the board vertically when the phone aspect ratio, status bar,
+    or header changes.  A fixed percentage therefore shifts cells and bonuses
+    relative to each other.  Within the board, the 16 vertical grid boundaries
+    are consistently darker than the 15 cell centres, so a one-board-height
+    sliding window gives us a device-independent top coordinate.
+    """
+    width, height = image.size
+    fallback = min(max(0, round(height * 0.296)), max(0, height - width))
+    if height <= width or width < 200:
+        return 0
+
+    row_scores: list[float] = []
+    boundary_x = [min(width - 1, round(index * width / 15)) for index in range(16)]
+    centre_x = [int((index + 0.5) * width / 15) for index in range(15)]
+    for y in range(height):
+        boundary_mean = sum(_pixel_brightness(image.getpixel((x, y))) for x in boundary_x) / len(boundary_x)
+        centre_mean = sum(_pixel_brightness(image.getpixel((x, y))) for x in centre_x) / len(centre_x)
+        row_scores.append(max(0.0, centre_mean - boundary_mean))
+
+    window_score = sum(row_scores[:width])
+    best_score, best_top = window_score, 0
+    for top in range(1, height - width + 1):
+        window_score += row_scores[top + width - 1] - row_scores[top - 1]
+        if window_score > best_score:
+            best_score, best_top = window_score, top
+
+    # Sparse synthetic images and unusual non-Wordfeud uploads do not contain
+    # enough repeated grid evidence; retain the previous safe fallback for them.
+    return best_top if best_score / width >= 8 else fallback
+
+
 def _wordfeud_crop_images(image_path: str | Path) -> tuple[Image.Image, Image.Image]:
     """Make the board and rack much larger and less ambiguous for the vision model.
 
     Current Wordfeud portrait screenshots span the full screen width with a square
-    board beginning at roughly 29.6% of the screenshot height. The original image
-    is used as a safe fallback for non-portrait images.
+    board, but its vertical position varies by device and header size. The original
+    image is used as a safe fallback for non-portrait images.
     """
     with Image.open(image_path) as source:
         image = source.convert("RGB")
     width, height = image.size
     if height <= width or width < 200:
         return image, image.copy()
-    board_top = round(height * 0.296)
+    board_top = _locate_board_top(image)
     board_bottom = min(height, board_top + width)
-    rack_top = round(height * 0.81)
+    rack_top = min(board_bottom, round(height * 0.81))
     return image.crop((0, board_top, width, board_bottom)), image.crop((0, rack_top, width, height))
 
 

@@ -5,6 +5,7 @@ from PIL import Image, ImageDraw
 from wordfeud_analyzer.vision import (
     CompactVisionState,
     _align_compact_to_visible_tiles,
+    _locate_board_top,
     _to_board_state,
     detect_visible_bonuses,
     detect_visible_tiles,
@@ -51,6 +52,31 @@ def test_detect_visible_bonuses_reads_each_coordinate_without_a_board_pattern(tm
     assert detected[9][4] == "DW"
     assert detected[14][14] == "TW"
     assert detected[4][4] == "NORMAL"
+
+
+def test_board_crop_is_located_from_grid_instead_of_fixed_screen_ratio(tmp_path: Path) -> None:
+    screenshot = tmp_path / "variable-header.png"
+    width, height, board_top = 600, 1200, 300
+    image = Image.new("RGB", (width, height), (60, 60, 60))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, board_top, width - 1, board_top + width - 1), fill=(47, 52, 55))
+    for boundary in range(16):
+        x = min(width - 1, round(boundary * width / 15))
+        draw.line((x, board_top, x, board_top + width - 1), fill=(25, 27, 29), width=3)
+    draw.rectangle((1, board_top + 1, width // 15 - 2, board_top + width // 15 - 2),
+                   fill=(106, 142, 78))
+    tile_row, tile_col = 9, 3
+    draw.rectangle((
+        int(tile_col * width / 15) + 4,
+        board_top + int(tile_row * width / 15) + 4,
+        int((tile_col + 1) * width / 15) - 4,
+        board_top + int((tile_row + 1) * width / 15) - 4,
+    ), fill=(225, 220, 210))
+    image.save(screenshot)
+
+    assert _locate_board_top(image) == board_top
+    assert detect_visible_bonuses(screenshot)[0][0] == "DL"
+    assert (tile_row, tile_col) in detect_visible_tiles(screenshot)
 
 
 def test_visible_tile_alignment_corrects_a_consistent_vision_row_offset(tmp_path: Path) -> None:
