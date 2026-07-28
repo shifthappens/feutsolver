@@ -2,15 +2,30 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from wordfeud_analyzer.vision import detect_visible_bonuses, wordfeud_crops
+from wordfeud_analyzer.vision import CompactVisionState, _to_board_state, detect_visible_bonuses, wordfeud_crops
 
 
 def test_wordfeud_crops_produce_square_board_and_rack(tmp_path: Path) -> None:
     screenshot = tmp_path / "screenshot.jpg"
     Image.new("RGB", (588, 1275), "black").save(screenshot)
     board, rack = wordfeud_crops(screenshot)
-    assert board.startswith("data:image/png;base64,")
-    assert rack.startswith("data:image/png;base64,")
+    assert board.startswith("data:image/jpeg;base64,")
+    assert rack.startswith("data:image/jpeg;base64,")
+
+
+def test_compact_vision_response_becomes_full_board_state() -> None:
+    compact = CompactVisionState.model_validate({
+        "rows": ["." * 15 for _ in range(7)] + ["." * 7 + "A" + "." * 7] + ["." * 15 for _ in range(7)],
+        "rack": ["T", "E", "S", "T"],
+        "blanks": [(7, 7)],
+    })
+    bonuses = [["NORMAL" for _ in range(15)] for _ in range(15)]
+    bonuses[0][0] = "TW"
+    state = _to_board_state(compact, bonuses)
+    assert state.grid[0][0].bonus == "TW"
+    assert state.grid[7][7].letter == "A"
+    assert state.grid[7][7].bonus == "NORMAL"
+    assert state.grid[7][7].is_blank
 
 
 def test_detect_visible_bonuses_reads_each_coordinate_without_a_board_pattern(tmp_path: Path) -> None:

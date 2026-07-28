@@ -1,7 +1,9 @@
 """Deterministic legal-move generation and Wordfeud scoring."""
 from __future__ import annotations
 
+from array import array
 from collections import Counter
+import pickle
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,32 +20,28 @@ LETTER_VALUES = {
 }
 LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
+GADDAG_CACHE_VERSION = 3
 
 
 class Gaddag:
-    """Compact, minimized GADDAG lexicon.
+    """Packed, minimized Dutch word automaton.
 
-    Each word is represented around every split (ABC -> +ABC, A+BC, BA+C).
-    The strings are minimized into a directed acyclic word graph, so a Dutch
-    word list remains practical in Python while retaining GADDAG traversal.
+    The previous full GADDAG expanded every word around every split. That made
+    a 5 MB OpenTaal list consume more than 600 MB on a 1 GB VPS. The anchored
+    forward traversal below needs only a minimal forward DAWG: it keeps exactly
+    the same legality checks, while storing each word once.
     """
-
-    SEPARATOR = "+"
 
     def __init__(self, words: Iterable[str] = ()) -> None:
         clean_words = {normalise_word(word) for word in words}
         clean_words = {word for word in clean_words if 2 <= len(word) <= BOARD_SIZE}
-        sequences = sorted(
-            prefix[::-1] + self.SEPARATOR + word[len(prefix):]
-            for word in clean_words
-            for prefix in (word[:split] for split in range(len(word)))
-        )
+        sequences = sorted(clean_words)
         self.count = len(clean_words)
-        self._states, self.root = self._from_sorted_sequences(sequences)
+        self._set_graph(*self._from_sorted_sequences(sequences))
 
     @classmethod
     def from_wordlist(cls, path: str | Path) -> "Gaddag":
-        """Build a compact GADDAG without holding millions of strings in RAM."""
+        """Build a packed DAWG without holding the complete source list in RAM."""
         instance = cls.__new__(cls)
         instance.count = 0
         with tempfile.TemporaryDirectory(prefix="wordfeud-gaddag-") as directory:
@@ -57,16 +55,31 @@ class Gaddag:
                     if not 2 <= len(word) <= BOARD_SIZE:
                         continue
                     instance.count += 1
-                    for split in range(len(word)):
-                        target.write(word[:split][::-1] + cls.SEPARATOR + word[split:] + "\n")
+                    target.write(word + "\n")
             # External sorting keeps peak memory bounded for the complete OpenTaal list.
             subprocess.run(["sort", str(unsorted_path), "-o", str(sorted_path)], check=True)
             with sorted_path.open(encoding="ascii") as sequences:
-                instance._states, instance.root = cls._from_sorted_sequences(line.rstrip("\n") for line in sequences)
+                instance._set_graph(*cls._from_sorted_sequences(line.rstrip("\n") for line in sequences))
         return instance
 
+    def _set_graph(
+        self,
+        starts: array,
+        counts: array,
+        terminals: bytearray,
+        labels: bytearray,
+        targets: array,
+        root: int,
+    ) -> None:
+        self._starts = starts
+        self._counts = counts
+        self._terminals = terminals
+        self._labels = labels
+        self._targets = targets
+        self.root = root
+
     @staticmethod
-    def _from_sorted_sequences(sequences: Iterable[str]) -> tuple[list[tuple[dict[str, int], bool]], int]:
+    def _from_sorted_sequences(sequences: Iterable[str]) -> tuple[array, array, bytearray, bytearray, array, int]:
         """Incrementally minimize lexicographically sorted strings into a DAFSA."""
         nodes: list[dict[str, object]] = [{"children": {}, "terminal": False}]
         register: dict[tuple[bool, tuple[tuple[str, int], ...]], int] = {}
@@ -113,42 +126,59 @@ class Gaddag:
         minimise(0)
 
         # During construction, superseded suffix nodes remain in ``nodes``.
-        # Re-index only the reachable canonical graph: this is the difference
-        # between a practical Dutch GADDAG and a multi-gigabyte build graph.
-        compact: list[tuple[dict[str, int], bool] | None] = []
+        # Re-index only the reachable canonical graph into packed arrays. Python
+        # dicts per state used hundreds of MB for OpenTaal; these arrays make the
+        # retained lexicon small enough to avoid VPS swap thrashing.
         reindexed: dict[int, int] = {}
+        starts = array("I")
+        counts = array("B")
+        terminals = bytearray()
+        labels = bytearray()
+        targets = array("I")
 
         def copy_state(old_id: int) -> int:
             if old_id in reindexed:
                 return reindexed[old_id]
-            new_id = len(compact)
+            new_id = len(starts)
             reindexed[old_id] = new_id
-            compact.append(None)
             old = nodes[old_id]
             old_children = old["children"]
             assert isinstance(old_children, dict)
-            compact[new_id] = (
-                {char: copy_state(child_id) for char, child_id in old_children.items()},
-                bool(old["terminal"]),
-            )
+            starts.append(len(labels))
+            terminals.append(bool(old["terminal"]))
+            ordered_children = sorted(old_children.items())
+            counts.append(len(ordered_children))
+            # Reserve this state's contiguous edge range before recursively
+            # packing children. Otherwise a child's edges would split the
+            # parent's labels from its targets.
+            edge_start = len(labels)
+            labels.extend(ord(char) for char, _ in ordered_children)
+            targets.extend([0] * len(ordered_children))
+            for offset, (_, child_id) in enumerate(ordered_children):
+                targets[edge_start + offset] = copy_state(child_id)
             return new_id
 
         root = copy_state(0)
-        return [state for state in compact if state is not None], root
+        return starts, counts, terminals, labels, targets, root
 
     def transition(self, state_id: int, char: str) -> int | None:
-        return self._states[state_id][0].get(char)
+        code = ord(char)
+        start = self._starts[state_id]
+        for index in range(start, start + self._counts[state_id]):
+            if self._labels[index] == code:
+                return self._targets[index]
+        return None
 
     def children(self, state_id: int) -> Iterable[tuple[str, int]]:
-        return self._states[state_id][0].items()
+        start = self._starts[state_id]
+        for index in range(start, start + self._counts[state_id]):
+            yield chr(self._labels[index]), self._targets[index]
 
     def terminal(self, state_id: int) -> bool:
-        return self._states[state_id][1]
+        return bool(self._terminals[state_id])
 
     def contains(self, word: str) -> bool:
-        state_id = self.transition(self.root, self.SEPARATOR)
-        if state_id is None:
-            return False
+        state_id = self.root
         for char in normalise_word(word):
             state_id = self.transition(state_id, char)
             if state_id is None:
@@ -167,8 +197,39 @@ def _is_plain_netherlands_word(word: str) -> bool:
     return 2 <= len(word) <= BOARD_SIZE and word.isascii() and word.isalpha() and word == word.lower()
 
 
+def _cache_path(path: Path) -> Path:
+    return path.with_name(path.name + ".gaddag-cache-v2")
+
+
 def load_wordlist(path: str | Path) -> Gaddag:
-    return Gaddag.from_wordlist(path)
+    """Load a packed, persistent GADDAG; build it only when the word list changed."""
+    source = Path(path)
+    signature = (source.stat().st_mtime_ns, source.stat().st_size)
+    cache = _cache_path(source)
+    try:
+        with cache.open("rb") as handle:
+            version, cached_signature, count, graph = pickle.load(handle)
+        if version == GADDAG_CACHE_VERSION and cached_signature == signature:
+            instance = Gaddag.__new__(Gaddag)
+            instance.count = count
+            instance._set_graph(*graph)
+            return instance
+    except (OSError, EOFError, pickle.PickleError, ValueError):
+        pass
+
+    instance = Gaddag.from_wordlist(source)
+    try:
+        with tempfile.NamedTemporaryFile(dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
+            pickle.dump((GADDAG_CACHE_VERSION, signature, instance.count, (
+                instance._starts, instance._counts, instance._terminals,
+                instance._labels, instance._targets, instance.root,
+            )), handle, protocol=pickle.HIGHEST_PROTOCOL)
+            temporary_cache = Path(handle.name)
+        temporary_cache.replace(cache)
+    except OSError:
+        # A read-only local development word list still works; it simply is not cached.
+        pass
+    return instance
 
 
 def _in_bounds(row: int, col: int) -> bool:
@@ -306,103 +367,95 @@ def _materialise_move(state: BoardState, anchor: tuple[int, int], direction: str
     return "".join(letters), start_row, start_col
 
 
+def _candidate_starts(state: BoardState, direction: str, rack_size: int) -> list[tuple[int, int]]:
+    """Line starts that can reach an existing tile or perpendicular anchor."""
+    dr, dc = (0, 1) if direction == "H" else (1, 0)
+    if not _has_tiles(state):
+        return ([(7, col) for col in range(max(0, 8 - rack_size), 8)] if direction == "H"
+                else [(row, 7) for row in range(max(0, 8 - rack_size), 8)])
+    anchors = set(_anchors(state))
+    starts: list[tuple[int, int]] = []
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            before_row, before_col = row - dr, col - dc
+            if _in_bounds(before_row, before_col) and _letter(state, before_row, before_col):
+                continue
+            for offset in range(rack_size + 1):
+                current_row, current_col = row + dr * offset, col + dc * offset
+                if not _in_bounds(current_row, current_col):
+                    break
+                if _letter(state, current_row, current_col) or (offset < rack_size and (current_row, current_col) in anchors):
+                    starts.append((row, col))
+                    break
+    return starts
+
+
 def generate_moves(state: BoardState, lexicon: Gaddag, limit: int = 6) -> list[Move]:
-    """Generate legal moves with an anchored GADDAG traversal and cross checks."""
-    rack = Counter(state.rack)
-    candidates: dict[tuple[str, int, int, str], Move] = {}
+    """Generate from line starts with a compact forward DAWG and cross checks."""
+    if limit <= 0:
+        return []
+    initial_rack = Counter(state.rack)
+    board_has_tiles = _has_tiles(state)
+    best: list[Move] = []
+
+    def rank(move: Move) -> tuple[int, str, int, int, str]:
+        return (-move.score, move.word, move.row, move.col, move.direction)
+
+    def consider(move: Move) -> None:
+        key = (move.word, move.row, move.col, move.direction)
+        for index, current in enumerate(best):
+            if (current.word, current.row, current.col, current.direction) == key:
+                if rank(move) < rank(current):
+                    best[index] = move
+                    best.sort(key=rank)
+                return
+        if len(best) < limit or rank(move) < rank(best[-1]):
+            best.append(move)
+            best.sort(key=rank)
+            del best[limit:]
+
     for direction, (dr, dc) in (("H", (0, 1)), ("V", (1, 0))):
         checks = _cross_checks(state, lexicon, direction)
-        for anchor in _anchors(state):
-            _generate_left(
-                state, lexicon, rack, anchor, anchor[0] - dr, anchor[1] - dc,
-                direction, dr, dc, checks, lexicon.root, [], candidates,
-            )
-    return sorted(candidates.values(), key=lambda move: (-move.score, move.word, move.row, move.col))[:limit]
+        for start_row, start_col in _candidate_starts(state, direction, sum(initial_rack.values())):
+            rack = initial_rack.copy()
 
+            def walk(row: int, col: int, state_id: int, tiles: list[PlacedTile]) -> None:
+                # A word can end only before an empty square or at the board edge;
+                # an adjacent existing tile must be consumed as part of the word.
+                if lexicon.terminal(state_id) and (not _in_bounds(row, col) or not _letter(state, row, col)):
+                    word, word_row, word_col = _materialise_move(state, (start_row, start_col), direction, tiles)
+                    connected = (_touches_board(state, tiles) if board_has_tiles
+                                 else any(tile.row == 7 and tile.col == 7 for tile in tiles))
+                    if len(word) >= 2 and tiles and connected:
+                        score, cross_words = _score_move(state, word, word_row, word_col, direction, tiles)
+                        consider(Move(word=word, row=word_row, col=word_col, direction=direction,
+                                      score=score, tiles=tiles.copy(), cross_words=cross_words,
+                                      bingo=len(tiles) == 7))
+                if not _in_bounds(row, col):
+                    return
+                existing = _letter(state, row, col)
+                if existing:
+                    child = lexicon.transition(state_id, existing)
+                    if child is not None:
+                        walk(row + dr, col + dc, child, tiles)
+                    return
+                if len(tiles) >= sum(initial_rack.values()):
+                    return
+                for char, child in lexicon.children(state_id):
+                    if char not in checks[(row, col)]:
+                        continue
+                    if rack[char] > 0:
+                        rack[char] -= 1
+                        tiles.append(PlacedTile(row=row, col=col, letter=char))
+                        walk(row + dr, col + dc, child, tiles)
+                        tiles.pop()
+                        rack[char] += 1
+                    if rack["?"] > 0:
+                        rack["?"] -= 1
+                        tiles.append(PlacedTile(row=row, col=col, letter=char, is_blank=True))
+                        walk(row + dr, col + dc, child, tiles)
+                        tiles.pop()
+                        rack["?"] += 1
 
-def _generate_left(state: BoardState, lexicon: Gaddag, rack: Counter[str], anchor: tuple[int, int],
-                   row: int, col: int, direction: str, dr: int, dc: int,
-                   checks: dict[tuple[int, int], set[str]], state_id: int,
-                   tiles: list[PlacedTile], candidates: dict[tuple[str, int, int, str], Move]) -> None:
-    """Walk left from an anchor; the GADDAG's separator starts the right half."""
-    existing = _letter(state, row, col) if _in_bounds(row, col) else None
-    if not existing:
-        separator = lexicon.transition(state_id, lexicon.SEPARATOR)
-        if separator is not None:
-            _generate_right(state, lexicon, rack, anchor, anchor[0], anchor[1], direction, dr, dc,
-                            checks, separator, tiles, candidates)
-    if not _in_bounds(row, col):
-        return
-    if existing:
-        child = lexicon.transition(state_id, existing)
-        if child is not None:
-            _generate_left(state, lexicon, rack, anchor, row - dr, col - dc, direction, dr, dc,
-                           checks, child, tiles, candidates)
-        return
-    for char, child in lexicon.children(state_id):
-        if char == lexicon.SEPARATOR or char not in checks[(row, col)]:
-            continue
-        _place_left(state, lexicon, rack, anchor, row, col, direction, dr, dc, checks,
-                    char, child, tiles, candidates)
-
-
-def _place_left(state: BoardState, lexicon: Gaddag, rack: Counter[str], anchor: tuple[int, int],
-                row: int, col: int, direction: str, dr: int, dc: int,
-                checks: dict[tuple[int, int], set[str]], char: str, child: int,
-                tiles: list[PlacedTile], candidates: dict[tuple[str, int, int, str], Move]) -> None:
-    """Use a rack tile on the reversed (left) half of a GADDAG word."""
-    if rack[char] > 0:
-        rack[char] -= 1
-        tiles.append(PlacedTile(row=row, col=col, letter=char))
-        _generate_left(state, lexicon, rack, anchor, row - dr, col - dc, direction, dr, dc,
-                       checks, child, tiles, candidates)
-        tiles.pop()
-        rack[char] += 1
-    if rack["?"] > 0:
-        rack["?"] -= 1
-        tiles.append(PlacedTile(row=row, col=col, letter=char, is_blank=True))
-        _generate_left(state, lexicon, rack, anchor, row - dr, col - dc, direction, dr, dc,
-                       checks, child, tiles, candidates)
-        tiles.pop()
-        rack["?"] += 1
-
-
-def _generate_right(state: BoardState, lexicon: Gaddag, rack: Counter[str], anchor: tuple[int, int],
-                    row: int, col: int, direction: str, dr: int, dc: int,
-                    checks: dict[tuple[int, int], set[str]], state_id: int,
-                    tiles: list[PlacedTile], candidates: dict[tuple[str, int, int, str], Move]) -> None:
-    """Consume/place the right half and emit only complete board words."""
-    if lexicon.terminal(state_id) and (not _in_bounds(row, col) or not _letter(state, row, col)):
-        word, start_row, start_col = _materialise_move(state, anchor, direction, tiles)
-        if len(word) >= 2 and tiles:
-            score, cross_words = _score_move(state, word, start_row, start_col, direction, tiles)
-            key = (word, start_row, start_col, direction)
-            candidates[key] = Move(word=word, row=start_row, col=start_col, direction=direction,
-                                   score=score, tiles=tiles.copy(), cross_words=cross_words,
-                                   bingo=len(tiles) == 7)
-    if not _in_bounds(row, col):
-        return
-    existing = _letter(state, row, col)
-    if existing:
-        child = lexicon.transition(state_id, existing)
-        if child is not None:
-            _generate_right(state, lexicon, rack, anchor, row + dr, col + dc, direction, dr, dc,
-                            checks, child, tiles, candidates)
-        return
-    for char, child in lexicon.children(state_id):
-        if char == lexicon.SEPARATOR or char not in checks[(row, col)]:
-            continue
-        if rack[char] > 0:
-            rack[char] -= 1
-            tiles.append(PlacedTile(row=row, col=col, letter=char))
-            _generate_right(state, lexicon, rack, anchor, row + dr, col + dc, direction, dr, dc,
-                            checks, child, tiles, candidates)
-            tiles.pop()
-            rack[char] += 1
-        if rack["?"] > 0:
-            rack["?"] -= 1
-            tiles.append(PlacedTile(row=row, col=col, letter=char, is_blank=True))
-            _generate_right(state, lexicon, rack, anchor, row + dr, col + dc, direction, dr, dc,
-                            checks, child, tiles, candidates)
-            tiles.pop()
-            rack["?"] += 1
+            walk(start_row, start_col, lexicon.root, [])
+    return best

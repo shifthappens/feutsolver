@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from wordfeud_analyzer.models import BoardState, Move
 from wordfeud_analyzer.move_generator import load_wordlist, generate_moves
@@ -15,13 +16,20 @@ st.set_page_config(page_title="Wordfeud Analyzer", page_icon="🔤", layout="wid
 BONUS_CLASS = {"NORMAL": "normal", "DL": "dl", "TL": "tl", "DW": "dw", "TW": "tw"}
 BONUS_LABEL = {"NORMAL": "", "DL": "2L", "TL": "3L", "DW": "2W", "TW": "3W"}
 DEFAULT_WORDLIST = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
+MAX_UPLOAD_BYTES = 1 * 1024 * 1024
 if not DEFAULT_WORDLIST.exists():
     DEFAULT_WORDLIST = Path("data/voorbeeld_woorden.txt")
 
 
 def secret_or_env(name: str, default: str = "") -> str:
     """Prefer an environment variable, then Streamlit's gitignored secrets.toml."""
-    return os.getenv(name) or str(st.secrets.get(name, default))
+    environment_value = os.getenv(name)
+    if environment_value:
+        return environment_value
+    try:
+        return str(st.secrets.get(name, default))
+    except StreamlitSecretNotFoundError:
+        return default
 
 
 @st.cache_resource(show_spinner=False)
@@ -73,11 +81,12 @@ with st.sidebar:
     api_key_override = st.text_input("OpenRouter API key (tijdelijke override)", type="password")
     api_key = api_key_override or configured_api_key
     model = st.text_input("Vision-model", value=secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash"))
-    wordlist_upload = st.file_uploader("Nederlandse woordenlijst (.txt)", type=["txt"])
-    st.caption("Standaard: lokale OpenTaal-lijst." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Standaard: kleine demo-lijst. Upload voor echte analyse de OpenTaal `wordlist.txt`.")
+    st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
 image = st.file_uploader("Upload een Wordfeud-screenshot", type=["png", "jpg", "jpeg", "webp"])
-if image:
+if image and image.size > MAX_UPLOAD_BYTES:
+    st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
+elif image:
     st.image(image, caption="Ingelezen screenshot", width=420)
     if st.button("1. Lees bord uit", type="primary"):
         if not api_key:
@@ -93,12 +102,7 @@ if image:
                 st.session_state.board_json = state.model_dump_json(indent=2)
                 st.session_state.pop("board_state", None)
                 st.session_state.pop("moves", None)
-                if wordlist_upload:
-                    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as temporary:
-                        temporary.write(wordlist_upload.getvalue())
-                        st.session_state.wordlist_path = temporary.name
-                else:
-                    st.session_state.wordlist_path = str(DEFAULT_WORDLIST)
+                st.session_state.wordlist_path = str(DEFAULT_WORDLIST)
             except VisionExtractionError as error:
                 st.error(str(error))
             finally:

@@ -46,6 +46,8 @@ jobs:
       - name: Sync application files only
         run: |
           rsync -rlptDz --delete --chmod=Du=rwx,Dg=rx,Dg+s,Fu=rw,Fg=r \
+            --include='/.streamlit/' \
+            --include='/.streamlit/config.toml' \
             --include='/wordfeud_analyzer/' \
             --include='/wordfeud_analyzer/**' \
             --include='/data/' \

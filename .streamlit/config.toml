@@ -1,0 +1,6 @@
+[server]
+# The server rejects oversized files before they consume app memory.
+maxUploadSize = 1
+maxMessageSize = 5
+# Keep a mobile browser session available while its app is briefly backgrounded.
+disconnectedSessionTTL = 600

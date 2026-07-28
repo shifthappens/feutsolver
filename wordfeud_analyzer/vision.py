@@ -10,41 +10,80 @@ from typing import Any
 
 import requests
 from PIL import Image
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .models import BoardState
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 EXTRACTION_PROMPT = """You transcribe a Wordfeud game screenshot into data. Do not solve the game.
-Return JSON only, matching the provided schema exactly.
+Return JSON only, matching the provided compact schema exactly.
 
 You receive two images from the same screenshot. The FIRST is a tightly cropped square containing only the 15x15 board. The SECOND is a crop containing the player's rack at the bottom. Use those crops, not any assumed board pattern.
 
 Rules:
-- grid is exactly 15 rows of 15 cells, in screenshot order (top-to-bottom, left-to-right).
-- Every cell has `letter` (one uppercase A-Z character or null), `bonus` (NORMAL, DL, TL, DW, or TW), and `is_blank`.
+- `rows` is exactly 15 strings of exactly 15 characters, in screenshot order
+  (top-to-bottom, left-to-right). Use A-Z for placed letters and `.` for empty cells.
+- `rack` is the player's 1-7 rack letters; use `?` for an unassigned blank.
+- `blanks` lists only placed blank coordinates as `[row, column]`, zero based.
 - Read only the 15x15 game board: ignore the score header, player names, turn text and buttons.
-- Wordfeud's visible labels map exactly as follows: `2L` -> DL, `3L` -> TL, `2W` -> DW, and `3W` -> TW. A dark unlabelled square is NORMAL.
-- This may be a RANDOM board. Read every visible label at its own row/column; NEVER infer a standard Wordfeud/Scrabble bonus layout or mirror/rotate a layout.
+- Do not return bonus squares: the application detects every visible `2L`, `3L`,
+  `2W` and `3W` locally from the board crop, including random boards.
 - A placed tile is an off-white square. Its small superscript is its point value, not a second letter. Use only the large tile glyph as `letter`.
-- The bonus under an already placed tile is normally hidden and has already been consumed. In that case set its bonus to NORMAL rather than guessing it.
-- `is_blank` is true only for an already placed blank tile. Assigned blank letters still go in `letter`.
-- rack is the seven tiles at the very bottom of the screenshot; use their large glyphs as uppercase letters and ? for an unassigned blank.
+- The bonus under an already placed tile is hidden and has already been consumed.
+- An assigned blank's letter stays in `rows`; add only its coordinate to `blanks`.
+- The rack is at the very bottom of the screenshot; use its large glyphs.
 - Never invent letters or bonuses. If a detail cannot be read, use null/NORMAL and make the best faithful transcription.
 """
 
-BOARD_SCHEMA: dict[str, Any] = BoardState.model_json_schema()
+class CompactVisionState(BaseModel):
+    """Small model response: letters only; bonuses are deterministic local vision."""
+
+    rows: list[str] = Field(..., min_length=15, max_length=15)
+    rack: list[str] = Field(..., min_length=1, max_length=7)
+    blanks: list[tuple[int, int]] = Field(default_factory=list)
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def validate_rows(cls, value: object) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("rows must be a list")
+        rows = [str(row).strip().upper() for row in value]
+        if any(len(row) != 15 or any(char != "." and not ("A" <= char <= "Z") for char in row) for row in rows):
+            raise ValueError("each row must contain exactly 15 A-Z or . characters")
+        return rows
+
+    @field_validator("rack", mode="before")
+    @classmethod
+    def validate_rack(cls, value: object) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("rack must be a list")
+        rack = [str(letter).strip().upper() for letter in value]
+        if any(letter != "?" and (len(letter) != 1 or not ("A" <= letter <= "Z")) for letter in rack):
+            raise ValueError("rack entries must be A-Z or ?")
+        return rack
+
+    @model_validator(mode="after")
+    def validate_blanks(self) -> "CompactVisionState":
+        if len(set(self.blanks)) != len(self.blanks):
+            raise ValueError("blank coordinates must be unique")
+        if any(not (0 <= row < 15 and 0 <= col < 15) or self.rows[row][col] == "." for row, col in self.blanks):
+            raise ValueError("blanks must refer to placed letters")
+        return self
+
+
+COMPACT_BOARD_SCHEMA: dict[str, Any] = CompactVisionState.model_json_schema()
 
 
 class VisionExtractionError(RuntimeError):
     pass
 
 
-def _png_data_url(image: Image.Image) -> str:
+def _image_data_url(image: Image.Image) -> str:
+    """JPEG is substantially smaller than a PNG screenshot, without losing tile glyphs."""
     output = BytesIO()
-    image.save(output, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
 def _wordfeud_crop_images(image_path: str | Path) -> tuple[Image.Image, Image.Image]:
@@ -68,7 +107,7 @@ def _wordfeud_crop_images(image_path: str | Path) -> tuple[Image.Image, Image.Im
 def wordfeud_crops(image_path: str | Path) -> tuple[str, str]:
     """Return data URLs for the local board and rack crops used by the vision call."""
     board, rack = _wordfeud_crop_images(image_path)
-    return _png_data_url(board), _png_data_url(rack)
+    return _image_data_url(board), _image_data_url(rack)
 
 
 # RGB values sampled from the four Wordfeud bonus-square background colours.
@@ -109,7 +148,7 @@ def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
     return bonuses
 
 
-def _parse_content(content: Any) -> BoardState:
+def _parse_content(content: Any) -> CompactVisionState:
     if isinstance(content, list):
         content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
     if not isinstance(content, str):
@@ -117,7 +156,19 @@ def _parse_content(content: Any) -> BoardState:
     content = content.strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return BoardState.model_validate(json.loads(content))
+    return CompactVisionState.model_validate(json.loads(content))
+
+
+def _to_board_state(compact: CompactVisionState, visible_bonuses: list[list[str]]) -> BoardState:
+    blanks = set(compact.blanks)
+    return BoardState.model_validate({
+        "grid": [[{
+            "letter": None if char == "." else char,
+            "bonus": "NORMAL" if char != "." else visible_bonuses[row][col],
+            "is_blank": (row, col) in blanks,
+        } for col, char in enumerate(line)] for row, line in enumerate(compact.rows)],
+        "rack": compact.rack,
+    })
 
 
 def extract_board(
@@ -125,8 +176,8 @@ def extract_board(
     *,
     api_key: str | None = None,
     model: str | None = None,
-    retries: int = 2,
-    timeout_seconds: int = 90,
+    retries: int = 1,
+    timeout_seconds: int = 45,
 ) -> BoardState:
     """Extract and validate a board; retry invalid JSON/schema responses."""
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
@@ -138,8 +189,8 @@ def extract_board(
     payload = {
         "model": model,
         "temperature": 0,
-        # A 15x15 board of JSON cell objects is sizeable; leave enough room for all 225 cells.
-        "max_tokens": 12000,
+        # Compact 15-character rows avoid thousands of repetitive JSON tokens.
+        "max_tokens": 2_000,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": EXTRACTION_PROMPT},
             {"type": "image_url", "image_url": {"url": board_image}},
@@ -147,7 +198,7 @@ def extract_board(
         ]}],
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "wordfeud_board", "strict": True, "schema": BOARD_SCHEMA},
+            "json_schema": {"name": "wordfeud_letters", "strict": True, "schema": COMPACT_BOARD_SCHEMA},
         },
     }
     errors: list[str] = []
@@ -161,12 +212,9 @@ def extract_board(
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            state = _parse_content(content)
+            compact = _parse_content(content)
             visible_bonuses = detect_visible_bonuses(image_path)
-            for row in range(15):
-                for col in range(15):
-                    state.grid[row][col].bonus = visible_bonuses[row][col] if not state.grid[row][col].letter else "NORMAL"
-            return state
+            return _to_board_state(compact, visible_bonuses)
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
             errors.append(f"poging {attempt + 1}: {exc}")
             payload["messages"][0]["content"][0]["text"] = (
