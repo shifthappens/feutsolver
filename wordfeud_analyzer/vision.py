@@ -33,7 +33,7 @@ Rules:
 - The bonus under an already placed tile is hidden and has already been consumed.
 - An assigned blank's letter stays in `rows`; add only its coordinate to `blanks`.
 - The rack is at the very bottom of the screenshot; use its large glyphs.
-- Never invent letters or bonuses. If a detail cannot be read, use null/NORMAL and make the best faithful transcription.
+- Never invent letters. If a board detail cannot be read, use `.` and make the best faithful transcription.
 """
 
 class CompactVisionState(BaseModel):
