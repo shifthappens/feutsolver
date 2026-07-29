@@ -17,16 +17,36 @@ from .models import BoardState
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
-EXTRACTION_PROMPT = """You transcribe a Wordfeud game screenshot into data. Do not solve the game.
+EMPTY_ROW = "." * 15
+
+# Built from EMPTY_ROW instead of typed out, so the example can never teach the
+# model a row of the wrong length. `_EXAMPLE_ROWS` shows one word on row 8.
+_EXAMPLE_ROWS = [EMPTY_ROW] * 7 + ["....." + "WOORD" + "....."] + [EMPTY_ROW] * 7
+EXAMPLE_RESPONSE = json.dumps(
+    {"rows": _EXAMPLE_ROWS, "rack": ["A", "E", "N", "?"], "blanks": [], "confidence": 93},
+    separators=(",", ":"),
+)
+
+EXTRACTION_PROMPT = f"""You transcribe a Wordfeud game screenshot into data. Do not solve the game.
 Return JSON only, matching the provided compact schema exactly.
 
 You receive two images from the same screenshot. The FIRST is a tightly cropped square containing only the 15x15 board. The SECOND is a crop containing the player's rack at the bottom. Use those crops, not any assumed board pattern.
 
+Row format — this is where transcriptions usually go wrong, so follow it literally:
+- `rows` holds exactly 15 strings, top-to-bottom, and every string holds exactly
+  15 characters, left-to-right: one character per column, no spaces or separators.
+- Put each letter at its own column position and a `.` in every other column.
+- A completely empty row is exactly fifteen dots, never fewer: `{EMPTY_ROW}`
+- Never shorten, abbreviate or summarise a run of empty cells, and never leave a
+  row out because it is empty.
+- Before you answer, count the characters of each of the 15 strings; every count
+  must be 15. Fix any string that is off instead of returning it.
+
+A board whose only word is WOORD on row 8, columns 6-10, is returned exactly like this:
+{EXAMPLE_RESPONSE}
+
 Rules:
-- `rows` is exactly 15 strings of exactly 15 characters, in screenshot order
-  (top-to-bottom, left-to-right). Use A-Z for placed letters and `.` for empty cells.
-- Count every character. A completely empty row is exactly fifteen dots:
-  `...............`. Never shorten or abbreviate a run of empty cells.
+- Use A-Z for placed letters and `.` for empty cells, in screenshot order.
 - `rack` is the player's 1-7 rack letters; use `?` for an unassigned blank.
 - `blanks` lists only placed blank coordinates as `[row, column]`, zero based.
 - Read only the 15x15 game board: ignore the score header, player names, turn text and buttons.
@@ -41,8 +61,6 @@ Rules:
   you returned matches the screenshot exactly. Blurry, cropped, partially covered or
   otherwise unreadable screenshots must score well below 90; do not inflate it.
 """
-
-EMPTY_ROW = "." * 15
 
 
 class CompactVisionState(BaseModel):

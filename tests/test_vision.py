@@ -7,6 +7,8 @@ from PIL import Image, ImageDraw
 from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
+    EXAMPLE_RESPONSE,
+    EXTRACTION_PROMPT,
     MINIMUM_CONFIDENCE,
     CompactVisionState,
     LowConfidenceError,
@@ -174,6 +176,15 @@ def test_an_uncertain_extraction_is_rejected_instead_of_retried(
     assert raised.value.confidence == 72
     assert "72%" in str(raised.value)
     assert len(calls) == 1
+
+
+def test_the_prompt_example_is_itself_a_valid_response() -> None:
+    """A hand-typed example row of the wrong length would teach the exact defect."""
+    example = CompactVisionState.model_validate(json.loads(EXAMPLE_RESPONSE))
+    assert all(len(row) == 15 for row in example.rows)
+    assert example.rows[7] == ".....WOORD....."
+    assert EXAMPLE_RESPONSE in EXTRACTION_PROMPT
+    assert EXTRACTION_PROMPT.count("...............") >= 1
 
 
 def test_a_miscounted_empty_row_is_repaired_instead_of_failing_the_extraction() -> None:
