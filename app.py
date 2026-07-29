@@ -73,8 +73,6 @@ _ = st.markdown("""
 """, unsafe_allow_html=True)
 
 _ = st.title("Wordfeud Analyzer")
-_ = st.caption("Vision leest het bord; een lokaal, deterministisch algoritme valideert woorden en rekent zetten uit.")
-_ = st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
 api_key = secret_or_env("OPENROUTER_API_KEY")
 model = secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
@@ -140,5 +138,3 @@ if "board_state" in st.session_state:
                     detail += " · bingo +40"
                 st.write(detail)
                 render_board(state, move)
-else:
-    _ = st.info("Upload een screenshot en voeg voor volledige resultaten de OpenTaal-woordenlijst toe.")
