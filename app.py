@@ -84,7 +84,7 @@ if image and image.size > MAX_UPLOAD_BYTES:
     _ = st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
 elif image:
     _ = st.image(image, caption="Ingelezen screenshot", width=420)
-    if st.button("1. Lees bord uit", type="primary"):
+    if st.button("Lees bord uit en bereken top 6 zetten", type="primary"):
         if not api_key:
             _ = st.error("De OpenRouter API key is niet op de server geconfigureerd.")
         else:
@@ -92,39 +92,32 @@ elif image:
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
                 _ = temporary.write(image.getvalue())
                 image_path = temporary.name
+            st.session_state.pop("board_state", None)
+            st.session_state.pop("moves", None)
+            st.session_state.pop("confidence", None)
             try:
                 with st.spinner("Bord en bonusvakken worden uitgelezen…"):
-                    state = extract_board(image_path, api_key=api_key, model=model)
-                st.session_state.board_json = state.model_dump_json(indent=2)
-                st.session_state.pop("board_state", None)
-                st.session_state.pop("moves", None)
-                st.session_state.wordlist_path = str(DEFAULT_WORDLIST)
+                    extraction = extract_board(image_path, api_key=api_key, model=model)
+                with st.spinner("Legale zetten worden volledig doorgerekend…"):
+                    lexicon = get_lexicon(str(DEFAULT_WORDLIST))
+                    moves = generate_moves(extraction.state, lexicon, limit=6)
+                st.session_state.board_state = extraction.state.model_dump()
+                st.session_state.moves = [move.model_dump() for move in moves]
+                st.session_state.confidence = extraction.confidence
             except VisionExtractionError as error:
                 _ = st.error(str(error))
+            except Exception as error:
+                _ = st.error(f"De zetten konden niet worden berekend: {error}")
             finally:
                 Path(image_path).unlink(missing_ok=True)
-
-if "board_json" in st.session_state:
-    _ = st.subheader("Controleer de extractie")
-    _ = st.caption("Vooral bij een random bord: controleer of ieder zichtbaar 2L/3L/2W/3W-vak op de juiste plek staat. Pas JSON zo nodig aan vóór de scoreberekening.")
-    _ = st.text_area("Gevalideerde borddata", key="board_json", height=340)
-    if st.button("2. Valideer en bereken top 6 zetten", type="primary"):
-        try:
-            state = BoardState.model_validate_json(st.session_state.board_json)
-            wordlist_path = str(cast(object, st.session_state.get("wordlist_path", str(DEFAULT_WORDLIST))))
-            with st.spinner("Legale zetten worden volledig doorgerekend…"):
-                lexicon = get_lexicon(wordlist_path)
-                st.session_state.board_state = state.model_dump()
-                st.session_state.moves = [move.model_dump() for move in generate_moves(state, lexicon, limit=6)]
-        except Exception as error:
-            _ = st.error(f"Borddata is niet geldig: {error}")
 
 if "board_state" in st.session_state:
     state = BoardState.model_validate(st.session_state.board_state)
     stored_moves = cast(list[object], st.session_state.get("moves", []))
     moves = [Move.model_validate(item) for item in stored_moves]
+    confidence = cast(float, st.session_state.get("confidence", 0.0))
     _ = st.subheader("Uitgelezen bord")
-    _ = st.caption("Rack: " + " ".join(state.rack))
+    _ = st.caption(f"Rack: {' '.join(state.rack)} · vision-model {confidence:.0f}% zeker van deze uitlezing")
     render_board(state)
     _ = st.subheader("Suggesties")
     if not moves:
