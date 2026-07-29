@@ -1,14 +1,20 @@
+import json
 from pathlib import Path
+from typing import Any
 
+import pytest
 from PIL import Image, ImageDraw
 
 from wordfeud_analyzer.vision import (
+    MINIMUM_CONFIDENCE,
     CompactVisionState,
+    LowConfidenceError,
     _align_compact_to_visible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     detect_visible_bonuses,
     detect_visible_tiles,
+    extract_board,
     wordfeud_crops,
 )
 
@@ -26,6 +32,7 @@ def test_compact_vision_response_becomes_full_board_state() -> None:
         "rows": ["." * 15 for _ in range(7)] + ["." * 7 + "A" + "." * 7] + ["." * 15 for _ in range(7)],
         "rack": ["T", "E", "S", "T"],
         "blanks": [(7, 7)],
+        "confidence": 97,
     })
     bonuses = [["NORMAL" for _ in range(15)] for _ in range(15)]
     bonuses[0][0] = "TW"
@@ -96,8 +103,64 @@ def test_visible_tile_alignment_corrects_a_consistent_vision_row_offset(tmp_path
                                                     "...ZETJE" + "." * 7] + ["." * 15 for _ in range(6)],
         "rack": ["T"],
         "blanks": [],
+        "confidence": 95,
     })
     assert detect_visible_tiles(screenshot) == {(6, 7), (7, 7), (8, 7), (9, 3), (9, 4), (9, 5), (9, 6), (9, 7)}
     aligned = _align_compact_to_visible_tiles(compact, detect_visible_tiles(screenshot))
     assert aligned.rows[6][7] == "B"
     assert aligned.rows[9][3:8] == "ZETJE"
+
+
+class _FakeResponse:
+    def __init__(self, compact: dict[str, Any]) -> None:
+        self._compact = compact
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return {"choices": [{"message": {"content": json.dumps(self._compact)}}]}
+
+
+def _stub_openrouter(monkeypatch: pytest.MonkeyPatch, confidence: float) -> list[object]:
+    calls: list[object] = []
+    compact = {
+        "rows": ["." * 15 for _ in range(7)] + ["." * 7 + "A" + "." * 7] + ["." * 15 for _ in range(7)],
+        "rack": ["T", "E", "S", "T"],
+        "blanks": [],
+        "confidence": confidence,
+    }
+
+    def fake_post(*_args: object, **kwargs: object) -> _FakeResponse:
+        calls.append(kwargs)
+        return _FakeResponse(compact)
+
+    monkeypatch.setattr("wordfeud_analyzer.vision.requests.post", fake_post)
+    return calls
+
+
+def _blank_screenshot(tmp_path: Path) -> Path:
+    screenshot = tmp_path / "screenshot.png"
+    Image.new("RGB", (588, 1275), (42, 45, 52)).save(screenshot)
+    return screenshot
+
+
+def test_a_confident_extraction_is_used_without_a_verification_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ = _stub_openrouter(monkeypatch, MINIMUM_CONFIDENCE)
+    extraction = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
+    assert extraction.confidence == MINIMUM_CONFIDENCE
+    assert extraction.state.grid[7][7].letter == "A"
+    assert extraction.state.rack == ["T", "E", "S", "T"]
+
+
+def test_an_uncertain_extraction_is_rejected_instead_of_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _stub_openrouter(monkeypatch, 72)
+    with pytest.raises(LowConfidenceError) as raised:
+        _ = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
+    assert raised.value.confidence == 72
+    assert "72%" in str(raised.value)
+    assert len(calls) == 1

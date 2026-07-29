@@ -7,7 +7,7 @@ Een Nederlandse Wordfeud-analyzer met twee strikt gescheiden onderdelen:
 
 De app toont naast de beste zet vijf alternatieven. Iedere suggestie krijgt een eigen bordweergave; alleen de nieuwe stenen zijn groen gemarkeerd.
 
-Na de vision-extractie toont de app eerst de volledige JSON. Controleer bij een random bord de positie van alle zichtbare `2L`, `3L`, `2W` en `3W`-vakken en corrigeer die eventueel voordat je op **Valideer en bereken** klikt. Het algoritme gebruikt uitsluitend deze uitgelezen coördinaten: er zit geen standaardbord-layout in de scoreberekening.
+Eén klik volstaat: na de vision-extractie rekent de app direct door en toont hij de top 6. Er is geen JSON-controlestap meer. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord. Het algoritme gebruikt uitsluitend de uitgelezen coördinaten: er zit geen standaardbord-layout in de scoreberekening.
 
 ## Starten
 
@@ -44,7 +44,7 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 
 - De screenshot gaat alleen naar het gekozen vision-model. Bord, woordvalidatie en scores gaan niet naar een model.
 - Zet de sleutel in een omgevingsvariabele of Streamlit secrets, nooit in Git. `.env` staat in `.gitignore`.
-- Controleer na extractie visueel het getoonde bord voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerde score.
+- De app vertrouwt op de uitlezing van het vision-model zodra dat zelf minstens 90% zeker is. Blijf het getoonde bord vergelijken met je screenshot voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerde score.
 
 ## Testen
 

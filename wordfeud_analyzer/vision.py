@@ -6,7 +6,7 @@ import json
 import os
 from io import BytesIO
 from pathlib import Path
-from typing import TypeAlias, cast
+from typing import NamedTuple, TypeAlias, cast
 
 import requests
 from PIL import Image
@@ -35,6 +35,9 @@ Rules:
 - An assigned blank's letter stays in `rows`; add only its coordinate to `blanks`.
 - The rack is at the very bottom of the screenshot; use its large glyphs.
 - Never invent letters. If a board detail cannot be read, use `.` and make the best faithful transcription.
+- `confidence` is your own honest certainty, 0-100, that every letter and rack tile
+  you returned matches the screenshot exactly. Blurry, cropped, partially covered or
+  otherwise unreadable screenshots must score well below 90; do not inflate it.
 """
 
 class CompactVisionState(BaseModel):
@@ -43,6 +46,7 @@ class CompactVisionState(BaseModel):
     rows: list[str] = Field(..., min_length=15, max_length=15)
     rack: list[str] = Field(..., min_length=1, max_length=7)
     blanks: list[tuple[int, int]] = Field(default_factory=list)
+    confidence: float = Field(..., ge=0, le=100)
 
     @field_validator("rows", mode="before")
     @classmethod
@@ -75,9 +79,33 @@ class CompactVisionState(BaseModel):
 
 COMPACT_BOARD_SCHEMA: dict[str, JsonValue] = cast(dict[str, JsonValue], CompactVisionState.model_json_schema())
 
+# Below this self-reported certainty we discard the transcription entirely: a
+# silently misread board produces confident but wrong scores, which is worse
+# than telling the user to upload a better screenshot.
+MINIMUM_CONFIDENCE = 90.0
+
 
 class VisionExtractionError(RuntimeError):
     pass
+
+
+class LowConfidenceError(VisionExtractionError):
+    """The model transcribed the board but was not sure enough to trust it."""
+
+    def __init__(self, confidence: float) -> None:
+        self.confidence = confidence
+        super().__init__(
+            f"Het bord kon niet betrouwbaar worden uitgelezen: het vision-model is {confidence:.0f}% zeker "
+            f"en we gebruiken alleen resultaten vanaf {MINIMUM_CONFIDENCE:.0f}%. "
+            "Maak een scherpere, rechte screenshot van het volledige bord met rack en probeer opnieuw."
+        )
+
+
+class BoardExtraction(NamedTuple):
+    """A trusted board plus the certainty the vision model reported for it."""
+
+    state: BoardState
+    confidence: float
 
 
 def _image_data_url(image: Image.Image) -> str:
@@ -278,7 +306,12 @@ def _align_compact_to_visible_tiles(
             return compact
         rows[new_row][new_col] = compact.rows[row][col]
     blanks = [(row + row_shift, col + col_shift) for row, col in compact.blanks]
-    return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=blanks)
+    return CompactVisionState(
+        rows=["".join(row) for row in rows],
+        rack=compact.rack,
+        blanks=blanks,
+        confidence=compact.confidence,
+    )
 
 
 def _parse_content(content: object) -> CompactVisionState:
@@ -337,8 +370,13 @@ def extract_board(
     model: str | None = None,
     retries: int = 1,
     timeout_seconds: int = 45,
-) -> BoardState:
-    """Extract and validate a board; retry invalid JSON/schema responses."""
+) -> BoardExtraction:
+    """Extract and validate a board; retry invalid JSON/schema responses.
+
+    A transcription the model itself rates below `MINIMUM_CONFIDENCE` is rejected
+    instead of retried: repeating the same unreadable screenshot only produces the
+    same uncertainty, so the user is asked for a better one.
+    """
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
     model = model or os.environ.get("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
     if not api_key:
@@ -372,9 +410,11 @@ def extract_board(
             )
             response.raise_for_status()
             compact = _parse_content(_response_content(response))
+            if compact.confidence < MINIMUM_CONFIDENCE:
+                raise LowConfidenceError(compact.confidence)
             visible_bonuses = detect_visible_bonuses(image_path)
             compact = _align_compact_to_visible_tiles(compact, detect_visible_tiles(image_path))
-            return _to_board_state(compact, visible_bonuses)
+            return BoardExtraction(_to_board_state(compact, visible_bonuses), compact.confidence)
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
             errors.append(f"poging {attempt + 1}: {exc}")
             prompt = EXTRACTION_PROMPT + "\nYour previous answer was invalid. Return the full schema-valid JSON only."
