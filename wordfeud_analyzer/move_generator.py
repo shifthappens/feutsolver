@@ -8,7 +8,7 @@ import pickle
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import BinaryIO, Literal, TypedDict, TypeGuard, cast
+from typing import BinaryIO, Literal, TypeAlias, TypedDict, TypeGuard, cast
 
 from .models import BoardState, Move, PlacedTile
 
@@ -23,7 +23,9 @@ LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
 GADDAG_CACHE_VERSION = 3
 Direction = Literal["H", "V"]
-GraphData = tuple[array[int], array[int], bytearray, bytearray, array[int], int]
+# `array` only became subscriptable at runtime in Python 3.12; the element types
+# are quoted so this alias also evaluates on 3.11 without losing type information.
+GraphData: TypeAlias = tuple["array[int]", "array[int]", bytearray, bytearray, "array[int]", int]
 
 
 class _Node(TypedDict):
