@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 Bonus = Literal["NORMAL", "DL", "TL", "DW", "TW"]
@@ -40,8 +40,8 @@ class BoardState(BaseModel):
     @classmethod
     def normalise_rack(cls, value: object) -> list[str]:
         if not isinstance(value, list):
-            raise ValueError("rack must be a list")
-        rack = [str(letter).strip().upper() for letter in value]
+            raise TypeError("rack must be a list")
+        rack = [str(letter).strip().upper() for letter in cast(list[object], value)]
         if any(letter != "?" and (len(letter) != 1 or not "A" <= letter <= "Z") for letter in rack):
             raise ValueError("rack entries must be A-Z or ?")
         return rack

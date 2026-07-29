@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from array import array
 from collections import Counter
+from collections.abc import Iterable
 import pickle
 from pathlib import Path
 import subprocess
 import tempfile
-from typing import Iterable
+from typing import BinaryIO, Literal, TypedDict, TypeGuard, cast
 
 from .models import BoardState, Move, PlacedTile
 
@@ -21,6 +22,13 @@ LETTER_VALUES = {
 LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
 GADDAG_CACHE_VERSION = 3
+Direction = Literal["H", "V"]
+GraphData = tuple[array[int], array[int], bytearray, bytearray, array[int], int]
+
+
+class _Node(TypedDict):
+    children: dict[str, int]
+    terminal: bool
 
 
 class Gaddag:
@@ -31,6 +39,14 @@ class Gaddag:
     forward traversal below needs only a minimal forward DAWG: it keeps exactly
     the same legality checks, while storing each word once.
     """
+
+    count: int
+    _starts: array[int]
+    _counts: array[int]
+    _terminals: bytearray
+    _labels: bytearray
+    _targets: array[int]
+    root: int
 
     def __init__(self, words: Iterable[str] = ()) -> None:
         clean_words = {normalise_word(word) for word in words}
@@ -55,20 +71,30 @@ class Gaddag:
                     if not 2 <= len(word) <= BOARD_SIZE:
                         continue
                     instance.count += 1
-                    target.write(word + "\n")
+                    _ = target.write(word + "\n")
             # External sorting keeps peak memory bounded for the complete OpenTaal list.
-            subprocess.run(["sort", str(unsorted_path), "-o", str(sorted_path)], check=True)
+            _ = subprocess.run(["sort", str(unsorted_path), "-o", str(sorted_path)], check=True)
             with sorted_path.open(encoding="ascii") as sequences:
                 instance._set_graph(*cls._from_sorted_sequences(line.rstrip("\n") for line in sequences))
         return instance
 
+    @classmethod
+    def from_cached_graph(cls, count: int, graph: GraphData) -> "Gaddag":
+        instance = cls.__new__(cls)
+        instance.count = count
+        instance._set_graph(*graph)
+        return instance
+
+    def graph_data(self) -> GraphData:
+        return self._starts, self._counts, self._terminals, self._labels, self._targets, self.root
+
     def _set_graph(
         self,
-        starts: array,
-        counts: array,
+        starts: array[int],
+        counts: array[int],
         terminals: bytearray,
         labels: bytearray,
-        targets: array,
+        targets: array[int],
         root: int,
     ) -> None:
         self._starts = starts
@@ -79,9 +105,9 @@ class Gaddag:
         self.root = root
 
     @staticmethod
-    def _from_sorted_sequences(sequences: Iterable[str]) -> tuple[array, array, bytearray, bytearray, array, int]:
+    def _from_sorted_sequences(sequences: Iterable[str]) -> GraphData:
         """Incrementally minimize lexicographically sorted strings into a DAFSA."""
-        nodes: list[dict[str, object]] = [{"children": {}, "terminal": False}]
+        nodes: list[_Node] = [{"children": {}, "terminal": False}]
         register: dict[tuple[bool, tuple[tuple[str, int], ...]], int] = {}
         previous = ""
         path = [0]
@@ -92,7 +118,6 @@ class Gaddag:
                 state_id = path[index]
                 node = nodes[state_id]
                 children = node["children"]
-                assert isinstance(children, dict)
                 signature = (bool(node["terminal"]), tuple(sorted(children.items())))
                 canonical = register.get(signature)
                 if canonical is None:
@@ -100,7 +125,6 @@ class Gaddag:
                     register[signature] = canonical
                 parent = nodes[path[index - 1]]
                 parent_children = parent["children"]
-                assert isinstance(parent_children, dict)
                 parent_children[previous[index - 1]] = canonical
             path = path[: down_to + 1]
 
@@ -117,7 +141,6 @@ class Gaddag:
                 next_id = len(nodes)
                 nodes.append({"children": {}, "terminal": False})
                 children = nodes[current]["children"]
-                assert isinstance(children, dict)
                 children[char] = next_id
                 current = next_id
                 path.append(current)
@@ -130,11 +153,11 @@ class Gaddag:
         # dicts per state used hundreds of MB for OpenTaal; these arrays make the
         # retained lexicon small enough to avoid VPS swap thrashing.
         reindexed: dict[int, int] = {}
-        starts = array("I")
-        counts = array("B")
+        starts: array[int] = array("I")
+        counts: array[int] = array("B")
         terminals = bytearray()
         labels = bytearray()
-        targets = array("I")
+        targets: array[int] = array("I")
 
         def copy_state(old_id: int) -> int:
             if old_id in reindexed:
@@ -143,9 +166,8 @@ class Gaddag:
             reindexed[old_id] = new_id
             old = nodes[old_id]
             old_children = old["children"]
-            assert isinstance(old_children, dict)
-            starts.append(len(labels))
-            terminals.append(bool(old["terminal"]))
+            _ = starts.append(len(labels))
+            _ = terminals.append(bool(old["terminal"]))
             ordered_children = sorted(old_children.items())
             counts.append(len(ordered_children))
             # Reserve this state's contiguous edge range before recursively
@@ -201,6 +223,46 @@ def _cache_path(path: Path) -> Path:
     return path.with_name(path.name + ".gaddag-cache-v2")
 
 
+def _is_graph_data(value: object) -> TypeGuard[GraphData]:
+    if not isinstance(value, tuple):
+        return False
+    values = cast(tuple[object, ...], value)
+    if len(values) != 6:
+        return False
+    starts, counts, terminals, labels, targets, root = values
+    return (
+        isinstance(starts, array)
+        and isinstance(counts, array)
+        and isinstance(terminals, bytearray)
+        and isinstance(labels, bytearray)
+        and isinstance(targets, array)
+        and isinstance(root, int)
+    )
+
+
+def _read_cached_data(handle: BinaryIO) -> tuple[int, tuple[int, int], int, GraphData] | None:
+    loaded = cast(object, pickle.load(handle))
+    if not isinstance(loaded, tuple):
+        return None
+    values = cast(tuple[object, ...], loaded)
+    if len(values) != 4:
+        return None
+    version, signature, count, graph = values
+    if not isinstance(version, int) or not isinstance(count, int):
+        return None
+    if not isinstance(signature, tuple):
+        return None
+    signature_values = cast(tuple[object, ...], signature)
+    if len(signature_values) != 2:
+        return None
+    if not all(isinstance(value, int) for value in signature_values):
+        return None
+    if not _is_graph_data(graph):
+        return None
+    signature_ints = (cast(int, signature_values[0]), cast(int, signature_values[1]))
+    return version, signature_ints, count, graph
+
+
 def load_wordlist(path: str | Path) -> Gaddag:
     """Load a packed, persistent GADDAG; build it only when the word list changed."""
     source = Path(path)
@@ -208,24 +270,21 @@ def load_wordlist(path: str | Path) -> Gaddag:
     cache = _cache_path(source)
     try:
         with cache.open("rb") as handle:
-            version, cached_signature, count, graph = pickle.load(handle)
-        if version == GADDAG_CACHE_VERSION and cached_signature == signature:
-            instance = Gaddag.__new__(Gaddag)
-            instance.count = count
-            instance._set_graph(*graph)
-            return instance
+            cached = _read_cached_data(handle)
+        if cached is not None:
+            version, cached_signature, count, graph = cached
+            if version == GADDAG_CACHE_VERSION and cached_signature == signature:
+                return Gaddag.from_cached_graph(count, graph)
     except (OSError, EOFError, pickle.PickleError, ValueError):
         pass
 
     instance = Gaddag.from_wordlist(source)
     try:
         with tempfile.NamedTemporaryFile(dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
-            pickle.dump((GADDAG_CACHE_VERSION, signature, instance.count, (
-                instance._starts, instance._counts, instance._terminals,
-                instance._labels, instance._targets, instance.root,
-            )), handle, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump((GADDAG_CACHE_VERSION, signature, instance.count, instance.graph_data()),
+                        handle, protocol=pickle.HIGHEST_PROTOCOL)
             temporary_cache = Path(handle.name)
-        temporary_cache.replace(cache)
+        _ = temporary_cache.replace(cache)
     except OSError:
         # A read-only local development word list still works; it simply is not cached.
         pass
@@ -268,7 +327,8 @@ def _touches_board(state: BoardState, tiles: list[PlacedTile]) -> bool:
     return False
 
 
-def _score_move(state: BoardState, word: str, row: int, col: int, direction: str, tiles: list[PlacedTile]) -> tuple[int, list[str]]:
+def _score_move(state: BoardState, word: str, row: int, col: int, direction: Direction,
+                tiles: list[PlacedTile]) -> tuple[int, list[str]]:
     dr, dc = (0, 1) if direction == "H" else (1, 0)
     newly = {(tile.row, tile.col): tile for tile in tiles}
     main_sum, main_multiplier = 0, 1
@@ -330,7 +390,7 @@ def _anchors(state: BoardState) -> list[tuple[int, int]]:
     return anchors
 
 
-def _cross_checks(state: BoardState, lexicon: Gaddag, direction: str) -> dict[tuple[int, int], set[str]]:
+def _cross_checks(state: BoardState, lexicon: Gaddag, direction: Direction) -> dict[tuple[int, int], set[str]]:
     """Allowed letters per empty square, based on the perpendicular word."""
     pr, pc = (1, 0) if direction == "H" else (0, 1)
     allowed: dict[tuple[int, int], set[str]] = {}
@@ -349,7 +409,7 @@ def _cross_checks(state: BoardState, lexicon: Gaddag, direction: str) -> dict[tu
     return allowed
 
 
-def _materialise_move(state: BoardState, anchor: tuple[int, int], direction: str,
+def _materialise_move(state: BoardState, anchor: tuple[int, int], direction: Direction,
                       tiles: list[PlacedTile]) -> tuple[str, int, int]:
     """Read the completed main word from the board plus the proposed tiles."""
     dr, dc = (0, 1) if direction == "H" else (1, 0)
@@ -367,7 +427,7 @@ def _materialise_move(state: BoardState, anchor: tuple[int, int], direction: str
     return "".join(letters), start_row, start_col
 
 
-def _candidate_starts(state: BoardState, direction: str, rack_size: int) -> list[tuple[int, int]]:
+def _candidate_starts(state: BoardState, direction: Direction, rack_size: int) -> list[tuple[int, int]]:
     """Line starts that can reach an existing tile or perpendicular anchor."""
     dr, dc = (0, 1) if direction == "H" else (1, 0)
     if not _has_tiles(state):
@@ -414,21 +474,24 @@ def generate_moves(state: BoardState, lexicon: Gaddag, limit: int = 6) -> list[M
             best.sort(key=rank)
             del best[limit:]
 
-    for direction, (dr, dc) in (("H", (0, 1)), ("V", (1, 0))):
-        checks = _cross_checks(state, lexicon, direction)
-        for start_row, start_col in _candidate_starts(state, direction, sum(initial_rack.values())):
+    directions: tuple[Direction, ...] = ("H", "V")
+    for direction in directions:
+        move_direction: Direction = direction
+        dr, dc = (0, 1) if move_direction == "H" else (1, 0)
+        checks = _cross_checks(state, lexicon, move_direction)
+        for start_row, start_col in _candidate_starts(state, move_direction, sum(initial_rack.values())):
             rack = initial_rack.copy()
 
             def walk(row: int, col: int, state_id: int, tiles: list[PlacedTile]) -> None:
                 # A word can end only before an empty square or at the board edge;
                 # an adjacent existing tile must be consumed as part of the word.
                 if lexicon.terminal(state_id) and (not _in_bounds(row, col) or not _letter(state, row, col)):
-                    word, word_row, word_col = _materialise_move(state, (start_row, start_col), direction, tiles)
+                    word, word_row, word_col = _materialise_move(state, (start_row, start_col), move_direction, tiles)
                     connected = (_touches_board(state, tiles) if board_has_tiles
                                  else any(tile.row == 7 and tile.col == 7 for tile in tiles))
                     if len(word) >= 2 and tiles and connected:
-                        score, cross_words = _score_move(state, word, word_row, word_col, direction, tiles)
-                        consider(Move(word=word, row=word_row, col=word_col, direction=direction,
+                        score, cross_words = _score_move(state, word, word_row, word_col, move_direction, tiles)
+                        consider(Move(word=word, row=word_row, col=word_col, direction=move_direction,
                                       score=score, tiles=tiles.copy(), cross_words=cross_words,
                                       bingo=len(tiles) == 7))
                 if not _in_bounds(row, col):
@@ -448,13 +511,13 @@ def generate_moves(state: BoardState, lexicon: Gaddag, limit: int = 6) -> list[M
                         rack[char] -= 1
                         tiles.append(PlacedTile(row=row, col=col, letter=char))
                         walk(row + dr, col + dc, child, tiles)
-                        tiles.pop()
+                        _ = tiles.pop()
                         rack[char] += 1
                     if rack["?"] > 0:
                         rack["?"] -= 1
                         tiles.append(PlacedTile(row=row, col=col, letter=char, is_blank=True))
                         walk(row + dr, col + dc, child, tiles)
-                        tiles.pop()
+                        _ = tiles.pop()
                         rack["?"] += 1
 
             walk(start_row, start_col, lexicon.root, [])

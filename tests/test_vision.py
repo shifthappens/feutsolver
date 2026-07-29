@@ -4,9 +4,9 @@ from PIL import Image, ImageDraw
 
 from wordfeud_analyzer.vision import (
     CompactVisionState,
-    _align_compact_to_visible_tiles,
-    _locate_board_top,
-    _to_board_state,
+    _align_compact_to_visible_tiles,  # pyright: ignore[reportPrivateUsage]
+    _locate_board_top,  # pyright: ignore[reportPrivateUsage]
+    _to_board_state,  # pyright: ignore[reportPrivateUsage]
     detect_visible_bonuses,
     detect_visible_tiles,
     wordfeud_crops,

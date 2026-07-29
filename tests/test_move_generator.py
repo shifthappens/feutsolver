@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from wordfeud_analyzer.models import BoardState
 from wordfeud_analyzer.move_generator import Gaddag, generate_moves, load_wordlist
 
@@ -47,11 +49,15 @@ def test_existing_anchor_does_not_reuse_hidden_bonus() -> None:
     assert vertical.score == 25
 
 
-def test_opentaal_loader_excludes_names_and_punctuation(tmp_path) -> None:
+def test_opentaal_loader_excludes_names_digits_and_punctuation(tmp_path: Path) -> None:
     wordlist = tmp_path / "words.txt"
-    wordlist.write_text("juweel\nWetzel\nt/m\n06-nummer\n", encoding="utf-8")
+    _ = wordlist.write_text("juweel\nWetzel\nt/m\n06-nummer\n", encoding="utf-8")
     gaddag = load_wordlist(wordlist)
+    cached_gaddag = load_wordlist(wordlist)
     assert gaddag.contains("JUWEEL")
+    assert gaddag.count == 1
+    assert cached_gaddag.contains("JUWEEL")
+    assert cached_gaddag.count == 1
     assert not gaddag.contains("WETZEL")
     assert not gaddag.contains("TM")
 

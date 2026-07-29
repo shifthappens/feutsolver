@@ -6,7 +6,7 @@ import json
 import os
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TypeAlias, cast
 
 import requests
 from PIL import Image
@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from .models import BoardState
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 EXTRACTION_PROMPT = """You transcribe a Wordfeud game screenshot into data. Do not solve the game.
 Return JSON only, matching the provided compact schema exactly.
@@ -48,7 +49,7 @@ class CompactVisionState(BaseModel):
     def validate_rows(cls, value: object) -> list[str]:
         if not isinstance(value, list):
             raise ValueError("rows must be a list")
-        rows = [str(row).strip().upper() for row in value]
+        rows = [str(row).strip().upper() for row in cast(list[object], value)]
         if any(len(row) != 15 or any(char != "." and not ("A" <= char <= "Z") for char in row) for row in rows):
             raise ValueError("each row must contain exactly 15 A-Z or . characters")
         return rows
@@ -57,8 +58,8 @@ class CompactVisionState(BaseModel):
     @classmethod
     def validate_rack(cls, value: object) -> list[str]:
         if not isinstance(value, list):
-            raise ValueError("rack must be a list")
-        rack = [str(letter).strip().upper() for letter in value]
+            raise TypeError("rack must be a list")
+        rack = [str(letter).strip().upper() for letter in cast(list[object], value)]
         if any(letter != "?" and (len(letter) != 1 or not ("A" <= letter <= "Z")) for letter in rack):
             raise ValueError("rack entries must be A-Z or ?")
         return rack
@@ -72,7 +73,7 @@ class CompactVisionState(BaseModel):
         return self
 
 
-COMPACT_BOARD_SCHEMA: dict[str, Any] = CompactVisionState.model_json_schema()
+COMPACT_BOARD_SCHEMA: dict[str, JsonValue] = cast(dict[str, JsonValue], CompactVisionState.model_json_schema())
 
 
 class VisionExtractionError(RuntimeError):
@@ -86,8 +87,19 @@ def _image_data_url(image: Image.Image) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def _pixel_brightness(pixel: tuple[int, ...]) -> float:
-    return sum(pixel[:3]) / 3
+def _pixel_brightness(pixel: int | float | tuple[int, ...] | None) -> float:
+    if pixel is None:
+        raise TypeError("image pixel cannot be None")
+    if isinstance(pixel, tuple):
+        return sum(pixel[:3]) / 3
+    return float(pixel)
+
+
+def _rgb_pixel(image: Image.Image, coordinates: tuple[int, int]) -> tuple[int, int, int]:
+    pixel = image.getpixel(coordinates)
+    if not isinstance(pixel, tuple) or len(pixel) != 3:
+        raise TypeError("expected an RGB image")
+    return pixel
 
 
 def _locate_board_top(image: Image.Image) -> int:
@@ -167,13 +179,17 @@ def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
         result_row: list[str] = []
         for col in range(15):
             # Four interior-corner samples evade both bonus text and tile letters.
-            samples = []
+            samples: list[tuple[int, int, int]] = []
             for y_fraction in (0.15, 0.85):
                 for x_fraction in (0.15, 0.85):
                     x = min(width - 1, int((col + x_fraction) * width / 15))
                     y = min(height - 1, int((row + y_fraction) * height / 15))
-                    samples.append(board.getpixel((x, y)))
-            rgb = tuple(sorted(sample[channel] for sample in samples)[len(samples) // 2] for channel in range(3))
+                    samples.append(_rgb_pixel(board, (x, y)))
+            channel_medians = [
+                sorted(sample[channel] for sample in samples)[len(samples) // 2]
+                for channel in range(3)
+            ]
+            rgb = (channel_medians[0], channel_medians[1], channel_medians[2])
             name, distance = min(
                 ((name, sum((rgb[channel] - reference[channel]) ** 2 for channel in range(3)))
                  for name, reference in BONUS_BACKGROUND_RGB.items()),
@@ -209,7 +225,7 @@ def detect_visible_tiles(image_path: str | Path) -> set[tuple[int, int]]:
                 for x_fraction in (0.18, 0.30, 0.70, 0.82):
                     x = min(width - 1, int((col + x_fraction) * width / 15))
                     y = min(height - 1, int((row + y_fraction) * height / 15))
-                    red, green, blue = board.getpixel((x, y))
+                    red, green, blue = _rgb_pixel(board, (x, y))
                     if min(red, green, blue) > 120:
                         bright_samples += 1
             if bright_samples >= 6:
@@ -265,15 +281,41 @@ def _align_compact_to_visible_tiles(
     return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=blanks)
 
 
-def _parse_content(content: Any) -> CompactVisionState:
+def _parse_content(content: object) -> CompactVisionState:
     if isinstance(content, list):
-        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        text_parts: list[str] = []
+        for part in cast(list[object], content):
+            if not isinstance(part, dict):
+                continue
+            text = cast(dict[str, object], part).get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+        content = "".join(text_parts)
     if not isinstance(content, str):
         raise ValueError("model response had no JSON text")
     content = content.strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return CompactVisionState.model_validate(json.loads(content))
+    return CompactVisionState.model_validate(cast(object, json.loads(content)))
+
+
+def _response_content(response: requests.Response) -> object:
+    payload = cast(object, response.json())
+    if not isinstance(payload, dict):
+        raise ValueError("model response was not a JSON object")
+    choices = cast(dict[str, object], payload).get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("model response contained no choices")
+    first_choice = cast(object, choices[0])
+    if not isinstance(first_choice, dict):
+        raise ValueError("model response contained an invalid choice")
+    message = cast(dict[str, object], first_choice).get("message")
+    if not isinstance(message, dict):
+        raise ValueError("model response contained no message")
+    content = cast(dict[str, object], message).get("content")
+    if content is None:
+        raise ValueError("model response contained no message content")
+    return content
 
 
 def _to_board_state(compact: CompactVisionState, visible_bonuses: list[list[str]]) -> BoardState:
@@ -303,24 +345,25 @@ def extract_board(
         raise VisionExtractionError("OPENROUTER_API_KEY ontbreekt. Zet hem in .env of Streamlit secrets.")
 
     board_image, rack_image = wordfeud_crops(image_path)
-    payload = {
-        "model": model,
-        "temperature": 0,
-        # Compact 15-character rows avoid thousands of repetitive JSON tokens.
-        "max_tokens": 2_000,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": EXTRACTION_PROMPT},
-            {"type": "image_url", "image_url": {"url": board_image}},
-            {"type": "image_url", "image_url": {"url": rack_image}},
-        ]}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "wordfeud_letters", "strict": True, "schema": COMPACT_BOARD_SCHEMA},
-        },
-    }
     errors: list[str] = []
+    prompt = EXTRACTION_PROMPT
     for attempt in range(retries + 1):
         try:
+            payload: dict[str, JsonValue] = {
+                "model": model,
+                "temperature": 0,
+                # Compact 15-character rows avoid thousands of repetitive JSON tokens.
+                "max_tokens": 2_000,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": board_image}},
+                    {"type": "image_url", "image_url": {"url": rack_image}},
+                ]}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "wordfeud_letters", "strict": True, "schema": COMPACT_BOARD_SCHEMA},
+                },
+            }
             response = requests.post(
                 OPENROUTER_URL,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -328,14 +371,11 @@ def extract_board(
                 timeout=timeout_seconds,
             )
             response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
-            compact = _parse_content(content)
+            compact = _parse_content(_response_content(response))
             visible_bonuses = detect_visible_bonuses(image_path)
             compact = _align_compact_to_visible_tiles(compact, detect_visible_tiles(image_path))
             return _to_board_state(compact, visible_bonuses)
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
             errors.append(f"poging {attempt + 1}: {exc}")
-            payload["messages"][0]["content"][0]["text"] = (
-                EXTRACTION_PROMPT + "\nYour previous answer was invalid. Return the full schema-valid JSON only."
-            )
+            prompt = EXTRACTION_PROMPT + "\nYour previous answer was invalid. Return the full schema-valid JSON only."
     raise VisionExtractionError("Vision-extractie faalde na retries: " + " | ".join(errors))

@@ -3,22 +3,22 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from wordfeud_analyzer.models import BoardState, Move
-from wordfeud_analyzer.move_generator import load_wordlist, generate_moves
+from wordfeud_analyzer.move_generator import Gaddag, generate_moves, load_wordlist
 from wordfeud_analyzer.vision import VisionExtractionError, extract_board
 
 st.set_page_config(page_title="Wordfeud Analyzer", page_icon="🔤", layout="wide")
 
 BONUS_CLASS = {"NORMAL": "normal", "DL": "dl", "TL": "tl", "DW": "dw", "TW": "tw"}
 BONUS_LABEL = {"NORMAL": "", "DL": "2L", "TL": "3L", "DW": "2W", "TW": "3W"}
-DEFAULT_WORDLIST = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
+configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
 MAX_UPLOAD_BYTES = 1 * 1024 * 1024
-if not DEFAULT_WORDLIST.exists():
-    DEFAULT_WORDLIST = Path("data/voorbeeld_woorden.txt")
+DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
 
 
 def secret_or_env(name: str, default: str = "") -> str:
@@ -27,13 +27,13 @@ def secret_or_env(name: str, default: str = "") -> str:
     if environment_value:
         return environment_value
     try:
-        return str(st.secrets.get(name, default))
+        return str(cast(object, st.secrets.get(name, default)))
     except StreamlitSecretNotFoundError:
         return default
 
 
 @st.cache_resource(show_spinner=False)
-def get_lexicon(path: str):
+def get_lexicon(path: str) -> Gaddag:
     """A minimized GADDAG is expensive to build once, but safe to reuse."""
     return load_wordlist(path)
 
@@ -55,10 +55,10 @@ def render_board(state: BoardState, move: Move | None = None) -> None:
                 classes = BONUS_CLASS[cell.bonus]
             cells.append(f'<div class="cell {classes}" title="rij {r + 1}, kolom {c + 1}">{label}</div>')
     title = "Huidig bord" if move is None else f"{move.word} — {move.score} punten"
-    st.markdown(f"<div class='board-title'>{title}</div><div class='board'>{''.join(cells)}</div>", unsafe_allow_html=True)
+    _ = st.markdown(f"<div class='board-title'>{title}</div><div class='board'>{''.join(cells)}</div>", unsafe_allow_html=True)
 
 
-st.markdown("""
+_ = st.markdown("""
 <style>
 .board { display:grid; grid-template-columns:repeat(15,minmax(20px,1fr)); max-width:750px; aspect-ratio:1;
   border:3px solid #513724; background:#513724; gap:1px; margin:8px 0 24px; }
@@ -72,25 +72,25 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Wordfeud Analyzer")
-st.caption("Vision leest het bord; een lokaal, deterministisch algoritme valideert woorden en rekent zetten uit.")
-st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
+_ = st.title("Wordfeud Analyzer")
+_ = st.caption("Vision leest het bord; een lokaal, deterministisch algoritme valideert woorden en rekent zetten uit.")
+_ = st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
 api_key = secret_or_env("OPENROUTER_API_KEY")
 model = secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
 
 image = st.file_uploader("Upload een Wordfeud-screenshot", type=["png", "jpg", "jpeg", "webp"])
 if image and image.size > MAX_UPLOAD_BYTES:
-    st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
+    _ = st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
 elif image:
-    st.image(image, caption="Ingelezen screenshot", width=420)
+    _ = st.image(image, caption="Ingelezen screenshot", width=420)
     if st.button("1. Lees bord uit", type="primary"):
         if not api_key:
-            st.error("De OpenRouter API key is niet op de server geconfigureerd.")
+            _ = st.error("De OpenRouter API key is niet op de server geconfigureerd.")
         else:
-            suffix = Path(image.name).suffix or ".png"
+            suffix = Path(cast(str, image.name)).suffix or ".png"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
-                temporary.write(image.getvalue())
+                _ = temporary.write(image.getvalue())
                 image_path = temporary.name
             try:
                 with st.spinner("Bord en bonusvakken worden uitgelezen…"):
@@ -100,34 +100,35 @@ elif image:
                 st.session_state.pop("moves", None)
                 st.session_state.wordlist_path = str(DEFAULT_WORDLIST)
             except VisionExtractionError as error:
-                st.error(str(error))
+                _ = st.error(str(error))
             finally:
                 Path(image_path).unlink(missing_ok=True)
 
 if "board_json" in st.session_state:
-    st.subheader("Controleer de extractie")
-    st.caption("Vooral bij een random bord: controleer of ieder zichtbaar 2L/3L/2W/3W-vak op de juiste plek staat. Pas JSON zo nodig aan vóór de scoreberekening.")
-    st.text_area("Gevalideerde borddata", key="board_json", height=340)
+    _ = st.subheader("Controleer de extractie")
+    _ = st.caption("Vooral bij een random bord: controleer of ieder zichtbaar 2L/3L/2W/3W-vak op de juiste plek staat. Pas JSON zo nodig aan vóór de scoreberekening.")
+    _ = st.text_area("Gevalideerde borddata", key="board_json", height=340)
     if st.button("2. Valideer en bereken top 6 zetten", type="primary"):
         try:
             state = BoardState.model_validate_json(st.session_state.board_json)
-            wordlist_path = st.session_state.get("wordlist_path", str(DEFAULT_WORDLIST))
+            wordlist_path = str(cast(object, st.session_state.get("wordlist_path", str(DEFAULT_WORDLIST))))
             with st.spinner("Legale zetten worden volledig doorgerekend…"):
                 lexicon = get_lexicon(wordlist_path)
                 st.session_state.board_state = state.model_dump()
                 st.session_state.moves = [move.model_dump() for move in generate_moves(state, lexicon, limit=6)]
         except Exception as error:
-            st.error(f"Borddata is niet geldig: {error}")
+            _ = st.error(f"Borddata is niet geldig: {error}")
 
 if "board_state" in st.session_state:
     state = BoardState.model_validate(st.session_state.board_state)
-    moves = [Move.model_validate(item) for item in st.session_state.get("moves", [])]
-    st.subheader("Uitgelezen bord")
-    st.caption("Rack: " + " ".join(state.rack))
+    stored_moves = cast(list[object], st.session_state.get("moves", []))
+    moves = [Move.model_validate(item) for item in stored_moves]
+    _ = st.subheader("Uitgelezen bord")
+    _ = st.caption("Rack: " + " ".join(state.rack))
     render_board(state)
-    st.subheader("Suggesties")
+    _ = st.subheader("Suggesties")
     if not moves:
-        st.warning("Geen legale zet in de gekozen woordenlijst gevonden.")
+        _ = st.warning("Geen legale zet in de gekozen woordenlijst gevonden.")
     else:
         tabs = st.tabs([f"{index + 1}. {move.word} · {move.score}" for index, move in enumerate(moves)])
         for tab, move in zip(tabs, moves):
@@ -140,4 +141,4 @@ if "board_state" in st.session_state:
                 st.write(detail)
                 render_board(state, move)
 else:
-    st.info("Upload een screenshot en voeg voor volledige resultaten de OpenTaal-woordenlijst toe.")
+    _ = st.info("Upload een screenshot en voeg voor volledige resultaten de OpenTaal-woordenlijst toe.")
