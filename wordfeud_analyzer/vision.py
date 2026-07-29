@@ -288,8 +288,12 @@ def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
 
 # While a move is being composed, Wordfeud paints a saturated yellow score bubble on
 # the board. Its tiles are not submitted, so the words they form carry no approval —
-# a screenshot like that may neither be analysed nor learned from. The pale yellow of
-# a highlighted last move is far less saturated and stays well clear of this.
+# a screenshot like that may neither be analysed nor learned from.
+#
+# Only the bubble counts: not the tiles lying next to it, not its position, and not
+# the number it shows. Both themes paint it in the same accent yellow (measured at
+# 254,221,23), while the pale yellow of a highlighted last move is far less saturated
+# and stays well clear of this.
 PENDING_HUE_RANGE = (40.0, 70.0)
 PENDING_MINIMUM_SATURATION = 0.85
 PENDING_MINIMUM_VALUE = 0.75
