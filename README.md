@@ -11,7 +11,11 @@ Een Nederlandse Wordfeud-analyzer met twee strikt gescheiden onderdelen:
 
 Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden toegevoegd aan `data/geleerde-woorden.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
 
-Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n screenshot is te herkennen aan het gele scorebolletje op het bord en wordt geweigerd — vóór er een model aan te pas komt, zodat er ook niets van geleerd wordt.
+Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n screenshot wordt geweigerd vóór er een model aan te pas komt, zodat er ook niets van geleerd wordt.
+
+Het betrouwbaarste kenmerk is de knoppenbalk: zolang een zet klaarligt staat daar een gevulde blauwe **Speel**-knop in plaats van het neutrale Pas/Hussel. Dat werkt ook wanneer de tegels ongeldig liggen, want dan toont Wordfeud helemaal geen score. Ligt de zet wél geldig, dan verschijnt daarnaast het gele scorebolletje op het bord; ook dat wordt herkend, waar het ook ligt en welk getal er ook in staat.
+
+Los daarvan geldt een stelling over het bord zelf: in een geldige stand hangen alle tegels aaneen met het middenvak. Tegels die daar niet aan vastzitten zijn onmogelijk — ook als ze een bestaand woord vormen — en leiden eveneens tot weigering. Dat vangt bovendien een screenshot af waarvan de knoppen zijn weggesneden.
 
 OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `façade` wordt `FACADE`, `abituriënt` wordt `ABITURIENT`. Dat scheelt ruim drieduizend woorden die eerder volledig ontbraken.
 

@@ -107,6 +107,19 @@ class PendingMoveError(VisionExtractionError):
         )
 
 
+class LooseTilesError(VisionExtractionError):
+    """Tiles that do not hang together with the rest of the board."""
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        super().__init__(
+            f"Op deze screenshot liggen {count} tegel(s) los van de rest van het bord. "
+            "Zo'n stand kan Wordfeud niet accepteren, ook niet als het een bestaand woord vormt: "
+            "waarschijnlijk ligt er een zet klaar die nog niet gespeeld is. "
+            "Speel de zet of wis hem, en maak daarna een nieuwe screenshot."
+        )
+
+
 class LowConfidenceError(VisionExtractionError):
     """The model read the tiles but was not sure enough to trust it."""
 
@@ -298,30 +311,85 @@ PENDING_HUE_RANGE = (40.0, 70.0)
 PENDING_MINIMUM_SATURATION = 0.85
 PENDING_MINIMUM_VALUE = 0.75
 
+# While tiles are on the board but not submitted, Wordfeud replaces the neutral
+# Pas/Hussel buttons with a filled blue Speel button beside Wis. That accent blue
+# appears nowhere else below the rack, in either theme. It is the more reliable of the
+# two signals: an invalid placement shows no score bubble at all, but the buttons
+# always change.
+ACTION_BUTTON_HUE_RANGE = (195.0, 230.0)
+ACTION_BUTTON_MINIMUM_SATURATION = 0.6
+ACTION_BUTTON_MINIMUM_VALUE = 0.5
+BUTTON_BAND_TOP = 0.86
 
-def detect_pending_move(image_path: str | Path) -> bool:
-    """Is a move being composed on this board, rather than played?"""
-    board, _ = _wordfeud_crop_images(image_path)
-    width, height = board.size
-    step = max(1, width // 300)
-    pixels = board.load()
+
+def _matching_fraction(
+    image: Image.Image, hue_range: tuple[float, float], minimum_saturation: float, minimum_value: float, step: int
+) -> float:
+    """Which part of the sampled pixels sits in this hue range and is that vivid."""
+    width, height = image.size
+    pixels = image.load()
     if pixels is None:
-        raise TypeError("could not read the board image")
-    matches = 0
+        raise TypeError("could not read the image")
+    matches, total = 0, 0
     for y in range(0, height, step):
         for x in range(0, width, step):
+            total += 1
             red, green, blue = cast(Rgb, pixels[x, y])[:3]
             hue, saturation, value = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
-            if (
-                PENDING_HUE_RANGE[0] <= hue * 360 <= PENDING_HUE_RANGE[1]
-                and saturation > PENDING_MINIMUM_SATURATION
-                and value > PENDING_MINIMUM_VALUE
-            ):
+            if hue_range[0] <= hue * 360 <= hue_range[1] and saturation > minimum_saturation and value > minimum_value:
                 matches += 1
-    # An eighth of one cell: far above the noise floor of a screenshot without a
-    # bubble, and far below the bubble itself.
-    samples_per_cell = max(1, (width // BOARD_SIZE // step) ** 2)
-    return matches > samples_per_cell / 8
+    return matches / total if total else 0.0
+
+
+def detect_pending_move(image_path: str | Path) -> bool:
+    """Is a move being composed on this board, rather than played?
+
+    Either signal is enough: the blue action button below the rack, or the score
+    bubble on the board for a placement Wordfeud can already price. Neither depends on
+    where the tiles lie or on what the bubble says.
+    """
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    width, height = image.size
+    step = max(1, width // 300)
+
+    band = image.crop((0, int(height * BUTTON_BAND_TOP), width, height))
+    button = _matching_fraction(
+        band, ACTION_BUTTON_HUE_RANGE, ACTION_BUTTON_MINIMUM_SATURATION, ACTION_BUTTON_MINIMUM_VALUE, step
+    )
+    if button > 0.005:
+        return True
+
+    board, _ = _wordfeud_crop_images(image_path)
+    bubble = _matching_fraction(
+        board, PENDING_HUE_RANGE, PENDING_MINIMUM_SATURATION, PENDING_MINIMUM_VALUE, step
+    )
+    # An eighth of one cell, as a share of the whole board.
+    return bubble > 1 / (8 * BOARD_SIZE * BOARD_SIZE)
+
+
+def _disconnected_tiles(tiles: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Tiles that do not hang together with the centre square.
+
+    Wordfeud's opening move covers the centre and every later move must touch what is
+    already there, so a legal position is always one connected group. A second group
+    means tiles were dropped loose on the board — invalid even when they spell a real
+    word — or that we misread the screenshot. Neither may be analysed.
+    """
+    if not tiles:
+        return set()
+    centre = (BOARD_SIZE // 2, BOARD_SIZE // 2)
+    if centre not in tiles:
+        return set(tiles)
+    connected = {centre}
+    frontier = [centre]
+    while frontier:
+        row, col = frontier.pop()
+        for neighbour in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbour in tiles and neighbour not in connected:
+                connected.add(neighbour)
+                frontier.append(neighbour)
+    return tiles - connected
 
 
 def _implausible_tiles(tiles: set[tuple[int, int]]) -> set[tuple[int, int]]:
@@ -465,12 +533,9 @@ def extract_board(
 
     board_image, rack_image = _wordfeud_crop_images(image_path)
     tiles = sorted(detect_visible_tiles(image_path))
-    stray = _implausible_tiles(set(tiles))
-    if stray:
-        raise VisionExtractionError(
-            f"Het bord kon niet betrouwbaar worden herkend: {len(stray)} losse vakje(s) zonder buur. "
-            "Maak een rechte screenshot waarop het volledige bord zichtbaar is en probeer opnieuw."
-        )
+    loose = _disconnected_tiles(set(tiles)) | _implausible_tiles(set(tiles))
+    if loose:
+        raise LooseTilesError(len(loose))
     bonuses = detect_visible_bonuses(image_path)
 
     images = [_image_data_url(rack_image)] if not tiles else [

@@ -9,10 +9,12 @@ from pydantic import ValidationError
 from wordfeud_analyzer.vision import (
     BOARD_SIZE,
     MINIMUM_CONFIDENCE,
+    LooseTilesError,
     LowConfidenceError,
     PendingMoveError,
     TileReading,
     VisionExtractionError,
+    _disconnected_tiles,  # pyright: ignore[reportPrivateUsage]
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
@@ -46,10 +48,17 @@ def _screenshot(
     theme: dict[str, Rgb],
     tiles: set[tuple[int, int]] = frozenset(),
     bonuses: dict[tuple[int, int], str] | None = None,
+    play_button: bool = False,
 ) -> Path:
-    """Draw a Wordfeud-shaped screenshot in the given theme."""
+    """Draw a Wordfeud-shaped screenshot in the given theme.
+
+    `play_button` paints the filled blue Speel button that replaces the neutral
+    Pas/Hussel buttons while a move is being composed.
+    """
     image = Image.new("RGB", (WIDTH, HEIGHT), theme["outside"])
     draw = ImageDraw.Draw(image)
+    if play_button:
+        draw.rounded_rectangle((30, HEIGHT - 120, 250, HEIGHT - 40), radius=40, fill=(0, 122, 255))
     cell = WIDTH / BOARD_SIZE
     draw.rectangle((0, BOARD_TOP, WIDTH - 1, BOARD_TOP + WIDTH - 1), fill=theme["grid"])
     for row in range(BOARD_SIZE):
@@ -302,6 +311,52 @@ def test_a_move_that_is_not_played_yet_is_refused(
     assert calls == []
 
 
+@pytest.mark.parametrize("theme_name", list(THEMES))
+def test_the_play_button_marks_a_move_that_is_still_being_composed(
+    theme_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The surest signal: an invalid placement shows no score bubble, but this button."""
+    path = _screenshot(tmp_path / f"{theme_name}.png", THEMES[theme_name], {(7, 7), (7, 8)}, play_button=True)
+    assert detect_pending_move(path)
+    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A"], "rack": ["R"], "confidence": 99})
+
+    with pytest.raises(PendingMoveError):
+        _ = extract_board(path, api_key="test-key")
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("theme_name", list(THEMES))
+def test_the_neutral_buttons_of_a_played_board_are_not_a_pending_move(
+    theme_name: str, tmp_path: Path
+) -> None:
+    path = _screenshot(tmp_path / f"{theme_name}.png", THEMES[theme_name], {(7, 7), (7, 8)})
+    assert not detect_pending_move(path)
+
+
+def test_tiles_that_do_not_reach_the_centre_are_loose() -> None:
+    """A real word dropped loose on the board is still an impossible position."""
+    played = {(7, 7), (7, 8), (7, 9)}
+    loose = {(2, 3), (2, 4), (2, 5), (2, 6)}  # JLOE, spelling something, connected to nothing
+    assert _disconnected_tiles(played) == set()
+    assert _disconnected_tiles(played | loose) == loose
+    assert _disconnected_tiles({(0, 0), (0, 1)}) == {(0, 0), (0, 1)}  # nothing on the centre
+
+
+def test_a_loose_word_stops_the_extraction_before_any_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _screenshot(
+        tmp_path / "los.png", DARK_THEME, {(7, 7), (7, 8), (2, 3), (2, 4), (2, 5), (2, 6)}
+    )
+    calls = _stub_openrouter(monkeypatch, {"letters": list("KAJLOE"), "rack": ["R"], "confidence": 99})
+
+    with pytest.raises(LooseTilesError, match="los van de rest"):
+        _ = extract_board(path, api_key="test-key")
+
+    assert calls == []
+
+
 def test_tiles_alone_never_make_a_board_pending(tmp_path: Path) -> None:
     """Tiles lying anywhere are just letters; without the bubble nothing is pending."""
     crowded = {(row, col) for row in range(6, 12) for col in range(4, 11)}
@@ -335,7 +390,7 @@ def test_a_stray_tile_stops_the_extraction_before_any_model_call(
     path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (2, 2)})
     calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A", "T"], "rack": ["R"], "confidence": 96})
 
-    with pytest.raises(VisionExtractionError, match="losse vakje"):
+    with pytest.raises(LooseTilesError, match="los van de rest"):
         _ = extract_board(path, api_key="test-key")
 
     assert calls == []
