@@ -48,13 +48,16 @@ A board whose only word is WOORD on row 8, columns 6-10, is returned exactly lik
 Rules:
 - Use A-Z for placed letters and `.` for empty cells, in screenshot order.
 - `rack` is the player's 1-7 rack letters; use `?` for an unassigned blank.
-- `blanks` lists only placed blank coordinates as `[row, column]`, zero based.
 - Read only the 15x15 game board: ignore the score header, player names, turn text and buttons.
 - Do not return bonus squares: the application detects every visible `2L`, `3L`,
   `2W` and `3W` locally from the board crop, including random boards.
 - A placed tile is an off-white square. Its small superscript is its point value, not a second letter. Use only the large tile glyph as `letter`.
 - The bonus under an already placed tile is hidden and has already been consumed.
-- An assigned blank's letter stays in `rows`; add only its coordinate to `blanks`.
+- A blank is the one placed tile without a small point number next to its letter.
+  Its letter stays in `rows`; add only its coordinate to `blanks`.
+- A `blanks` entry is `[row, column]`, zero based, and must point at a letter you
+  actually wrote: `rows[row][column]` may not be `.`. Verify that before answering,
+  and leave a tile out of `blanks` when unsure — a wrong coordinate is worse than none.
 - The rack is at the very bottom of the screenshot; use its large glyphs.
 - Never invent letters. If a board detail cannot be read, use `.` and make the best faithful transcription.
 - `confidence` is your own honest certainty, 0-100, that every letter and rack tile
@@ -104,10 +107,15 @@ class CompactVisionState(BaseModel):
 
     @model_validator(mode="after")
     def validate_blanks(self) -> "CompactVisionState":
-        if len(set(self.blanks)) != len(self.blanks):
-            raise ValueError("blank coordinates must be unique")
-        if any(not (0 <= row < 15 and 0 <= col < 15) or self.rows[row][col] == "." for row, col in self.blanks):
-            raise ValueError("blanks must refer to placed letters")
+        # A blank coordinate that misses a transcribed letter is simply wrong, and
+        # we cannot know which tile it meant. Dropping it costs at most a few
+        # points on one existing tile, while rejecting the answer costs the user
+        # the entire board. Duplicates are merged for the same reason.
+        self.blanks = [
+            (row, col)
+            for row, col in dict.fromkeys(self.blanks)
+            if 0 <= row < 15 and 0 <= col < 15 and self.rows[row][col] != "."
+        ]
         return self
 
 

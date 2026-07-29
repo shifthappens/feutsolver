@@ -57,3 +57,11 @@ jobs:
             --exclude='*' \
             ./ \
             "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}"
+
+      # Copying the files is not enough: the running Streamlit process keeps the
+      # modules it imported at startup, so without this a green deploy can still
+      # serve the previous version.
+      - name: Restart the application
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'sudo systemctl restart feutsolver && sleep 3 && sudo systemctl is-active feutsolver'

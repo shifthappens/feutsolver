@@ -200,6 +200,44 @@ def test_a_miscounted_empty_row_is_repaired_instead_of_failing_the_extraction() 
     assert compact.rows[9] == "..ZETJE" + "." * 8
 
 
+def test_a_blank_coordinate_that_misses_a_letter_is_dropped_instead_of_rejected() -> None:
+    """The production failure: `blanks` pointed at an empty cell on a real board."""
+    rows = ["." * 15 for _ in range(15)]
+    rows[9] = "." * 5 + "HUT" + "." * 7
+    compact = CompactVisionState.model_validate({
+        "rows": rows,
+        "rack": ["R"],
+        "blanks": [[10, 2], [9, 7], [9, 7], [99, 0]],
+        "confidence": 95,
+    })
+    assert compact.blanks == [(9, 7)]
+
+
+def test_the_two_failed_production_attempts_now_produce_a_usable_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both answers that failed on Coen's board must survive on their own."""
+    board = [
+        "...............", "...............", "...............", "...............",
+        "...............", "...............", "...............", ".......Q...Z...",
+        "......FACADE...", ".....HUT...PECH", "B...POT.YOGI..E", "A....LOK...G..G",
+        "N.WONEN........", "KEI..N.........", ".NERD..........",
+    ]
+    rack = ["R", "V", "J", "N", "L", "O", "E"]
+    first = {"rows": board, "rack": rack, "blanks": [[10, 2]], "confidence": 94}
+    second = {"rows": [row if index != 1 else "." * 10 for index, row in enumerate(board)],
+              "rack": rack, "blanks": [[9, 7]], "confidence": 94}
+
+    for answer in (first, second):
+        calls = _stub_openrouter(monkeypatch, answer)
+        extraction = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
+        assert len(calls) == 1, "een geldig antwoord mag geen retry kosten"
+        assert extraction.state.grid[8][6].letter == "F"
+        assert extraction.state.grid[14][4].letter == "D"
+        assert extraction.state.rack == rack
+    assert extraction.state.grid[9][7].is_blank
+
+
 def test_a_short_row_holding_letters_is_still_rejected_and_names_the_row() -> None:
     rows = ["." * 15 for _ in range(15)]
     rows[4] = "..ZETJE"
