@@ -77,9 +77,7 @@ st.caption("Vision leest het bord; een lokaal, deterministisch algoritme validee
 
 with st.sidebar:
     st.header("Instellingen")
-    configured_api_key = secret_or_env("OPENROUTER_API_KEY")
-    api_key_override = st.text_input("OpenRouter API key (tijdelijke override)", type="password")
-    api_key = api_key_override or configured_api_key
+    api_key = secret_or_env("OPENROUTER_API_KEY")
     model = st.text_input("Vision-model", value=secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash"))
     st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
@@ -90,7 +88,7 @@ elif image:
     st.image(image, caption="Ingelezen screenshot", width=420)
     if st.button("1. Lees bord uit", type="primary"):
         if not api_key:
-            st.error("Vul eerst je OpenRouter API key in. Hij wordt niet opgeslagen.")
+            st.error("De OpenRouter API key is niet op de server geconfigureerd.")
         else:
             suffix = Path(image.name).suffix or ".png"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
