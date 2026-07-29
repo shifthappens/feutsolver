@@ -2,12 +2,16 @@
 
 Een Nederlandse Wordfeud-analyzer met twee strikt gescheiden onderdelen:
 
-1. `wordfeud_analyzer/vision.py` stuurt uitsluitend vergrote uitsneden van bord en rack naar een vision-model en valideert de 15×15 JSON-uitvoer met Pydantic. De zichtbare bonusvakken worden daarnaast lokaal op hun Wordfeud-kleur per cel herkend; er is geen vaste bordindeling.
+1. `wordfeud_analyzer/vision.py` lost de geometrie lokaal en deterministisch op: waar het bord staat, welke vakken een tegel dragen en welke bonus elk vrij vak heeft. Die tegels worden uitgesneden en in een vaste volgorde in één afbeelding gezet; het vision-model krijgt precies één vraag, namelijk welke letter op elke tegel staat. Het hoeft dus nooit rijen te tellen, een raster op te vullen of een coördinaat terug te geven, waardoor positiefouten per constructie niet kunnen ontstaan.
+
+   Tegel- en bonusherkenning ijken zichzelf per screenshot op de meest voorkomende celkleur, en bonusvakken worden op tint geclassificeerd. Daardoor werken het donkere en het lichte thema via hetzelfde codepad, en zit er nergens een vaste bordindeling in.
 2. `wordfeud_analyzer/move_generator.py` gebruikt een compacte, geminimaliseerde GADDAG met anker-vakken en kruiswoordchecks. Hij genereert legale zetten en berekent score, bonussen, blanco's en de 40-punten-bingo lokaal.
 
 De app toont naast de beste zet vijf alternatieven. Iedere suggestie krijgt een eigen bordweergave; alleen de nieuwe stenen zijn groen gemarkeerd.
 
-Eén klik volstaat: na de vision-extractie rekent de app direct door en toont hij de top 6. Er is geen JSON-controlestap meer. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord. Het algoritme gebruikt uitsluitend de uitgelezen coördinaten: er zit geen standaardbord-layout in de scoreberekening.
+Eén klik volstaat: na de vision-extractie rekent de app direct door en toont hij de top 6. Er is geen JSON-controlestap meer. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
+
+Omdat wij de tegels zelf uitsnijden en op volgorde zetten, blijft er nog één foutmodus over: het model geeft een ander aantal letters terug dan er tegels zijn. Dat is één controle, en de retry noemt het verwachte aantal. Losse tegels zonder buur kan Wordfeud niet produceren; die worden als herkenningsfout gemeld vóór er een model aan te pas komt.
 
 ## Starten
 

@@ -73,7 +73,7 @@ _ = st.markdown("""
 """, unsafe_allow_html=True)
 
 _ = st.title("Wordfeud Analyzer")
-_ = st.caption("Vision leest het bord; een lokaal, deterministisch algoritme valideert woorden en rekent zetten uit.")
+_ = st.caption("Vision leest alleen de letters van de tegels; positie, bonusvakken, woordvalidatie en scores zijn lokaal en deterministisch.")
 _ = st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
 api_key = secret_or_env("OPENROUTER_API_KEY")
