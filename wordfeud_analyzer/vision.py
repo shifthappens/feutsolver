@@ -17,14 +17,36 @@ from .models import BoardState
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
-EXTRACTION_PROMPT = """You transcribe a Wordfeud game screenshot into data. Do not solve the game.
+EMPTY_ROW = "." * 15
+
+# Built from EMPTY_ROW instead of typed out, so the example can never teach the
+# model a row of the wrong length. `_EXAMPLE_ROWS` shows one word on row 8.
+_EXAMPLE_ROWS = [EMPTY_ROW] * 7 + ["....." + "WOORD" + "....."] + [EMPTY_ROW] * 7
+EXAMPLE_RESPONSE = json.dumps(
+    {"rows": _EXAMPLE_ROWS, "rack": ["A", "E", "N", "?"], "blanks": [], "confidence": 93},
+    separators=(",", ":"),
+)
+
+EXTRACTION_PROMPT = f"""You transcribe a Wordfeud game screenshot into data. Do not solve the game.
 Return JSON only, matching the provided compact schema exactly.
 
 You receive two images from the same screenshot. The FIRST is a tightly cropped square containing only the 15x15 board. The SECOND is a crop containing the player's rack at the bottom. Use those crops, not any assumed board pattern.
 
+Row format — this is where transcriptions usually go wrong, so follow it literally:
+- `rows` holds exactly 15 strings, top-to-bottom, and every string holds exactly
+  15 characters, left-to-right: one character per column, no spaces or separators.
+- Put each letter at its own column position and a `.` in every other column.
+- A completely empty row is exactly fifteen dots, never fewer: `{EMPTY_ROW}`
+- Never shorten, abbreviate or summarise a run of empty cells, and never leave a
+  row out because it is empty.
+- Before you answer, count the characters of each of the 15 strings; every count
+  must be 15. Fix any string that is off instead of returning it.
+
+A board whose only word is WOORD on row 8, columns 6-10, is returned exactly like this:
+{EXAMPLE_RESPONSE}
+
 Rules:
-- `rows` is exactly 15 strings of exactly 15 characters, in screenshot order
-  (top-to-bottom, left-to-right). Use A-Z for placed letters and `.` for empty cells.
+- Use A-Z for placed letters and `.` for empty cells, in screenshot order.
 - `rack` is the player's 1-7 rack letters; use `?` for an unassigned blank.
 - `blanks` lists only placed blank coordinates as `[row, column]`, zero based.
 - Read only the 15x15 game board: ignore the score header, player names, turn text and buttons.
@@ -40,6 +62,7 @@ Rules:
   otherwise unreadable screenshots must score well below 90; do not inflate it.
 """
 
+
 class CompactVisionState(BaseModel):
     """Small model response: letters only; bonuses are deterministic local vision."""
 
@@ -54,8 +77,19 @@ class CompactVisionState(BaseModel):
         if not isinstance(value, list):
             raise ValueError("rows must be a list")
         rows = [str(row).strip().upper() for row in cast(list[object], value)]
-        if any(len(row) != 15 or any(char != "." and not ("A" <= char <= "Z") for char in row) for row in rows):
-            raise ValueError("each row must contain exactly 15 A-Z or . characters")
+        # Vision models regularly miscount a long run of dots, which used to fail
+        # the whole extraction over a row that carries no information at all.
+        # A row without letters can only mean "15 empty cells", so we restore its
+        # length; a row containing letters is never padded, because that would
+        # move real tiles to the wrong column.
+        rows = [EMPTY_ROW if not row.strip(".") else row for row in rows]
+        malformed = [
+            f"row {index + 1} has {len(row)} characters"
+            for index, row in enumerate(rows)
+            if len(row) != 15 or any(char != "." and not ("A" <= char <= "Z") for char in row)
+        ]
+        if malformed:
+            raise ValueError("each row must contain exactly 15 A-Z or . characters: " + ", ".join(malformed))
         return rows
 
     @field_validator("rack", mode="before")
@@ -351,6 +385,15 @@ def _response_content(response: requests.Response) -> object:
     return content
 
 
+def _short_reason(exc: Exception) -> str:
+    """Pydantic errors span several lines and repeat the whole board; keep the gist."""
+    text = " ".join(str(exc).split())
+    marker = "Value error, "
+    if marker in text:
+        text = text.split(marker, 1)[1].split(" [type=", 1)[0]
+    return text if len(text) <= 300 else text[:299] + "…"
+
+
 def _to_board_state(compact: CompactVisionState, visible_bonuses: list[list[str]]) -> BoardState:
     blanks = set(compact.blanks)
     return BoardState.model_validate({
@@ -416,6 +459,16 @@ def extract_board(
             compact = _align_compact_to_visible_tiles(compact, detect_visible_tiles(image_path))
             return BoardExtraction(_to_board_state(compact, visible_bonuses), compact.confidence)
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
-            errors.append(f"poging {attempt + 1}: {exc}")
-            prompt = EXTRACTION_PROMPT + "\nYour previous answer was invalid. Return the full schema-valid JSON only."
-    raise VisionExtractionError("Vision-extractie faalde na retries: " + " | ".join(errors))
+            reason = _short_reason(exc)
+            errors.append(f"poging {attempt + 1}: {reason}")
+            # Naming the actual defect lets the model repair that one row, instead
+            # of resending the same malformed answer after a generic complaint.
+            prompt = (
+                f"{EXTRACTION_PROMPT}\nYour previous answer was rejected: {reason}\n"
+                "Return the full schema-valid JSON only, with exactly 15 rows of exactly 15 characters each."
+            )
+    raise VisionExtractionError(
+        "Het bord kon niet worden uitgelezen; het vision-model gaf geen bruikbaar antwoord. "
+        "Probeer het opnieuw met een scherpe screenshot van het volledige bord. "
+        "(technisch: " + " | ".join(errors) + ")"
+    )

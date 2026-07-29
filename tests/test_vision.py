@@ -4,11 +4,15 @@ from typing import Any
 
 import pytest
 from PIL import Image, ImageDraw
+from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
+    EXAMPLE_RESPONSE,
+    EXTRACTION_PROMPT,
     MINIMUM_CONFIDENCE,
     CompactVisionState,
     LowConfidenceError,
+    VisionExtractionError,
     _align_compact_to_visible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
@@ -122,21 +126,29 @@ class _FakeResponse:
         return {"choices": [{"message": {"content": json.dumps(self._compact)}}]}
 
 
-def _stub_openrouter(monkeypatch: pytest.MonkeyPatch, confidence: float) -> list[object]:
-    calls: list[object] = []
-    compact = {
+def _compact_payload(confidence: float) -> dict[str, Any]:
+    return {
         "rows": ["." * 15 for _ in range(7)] + ["." * 7 + "A" + "." * 7] + ["." * 15 for _ in range(7)],
         "rack": ["T", "E", "S", "T"],
         "blanks": [],
         "confidence": confidence,
     }
 
-    def fake_post(*_args: object, **kwargs: object) -> _FakeResponse:
+
+def _stub_openrouter(monkeypatch: pytest.MonkeyPatch, *payloads: dict[str, Any]) -> list[dict[str, Any]]:
+    """Answer each call with the next payload, repeating the last one."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_post(*_args: object, **kwargs: Any) -> _FakeResponse:
         calls.append(kwargs)
-        return _FakeResponse(compact)
+        return _FakeResponse(payloads[min(len(calls) - 1, len(payloads) - 1)])
 
     monkeypatch.setattr("wordfeud_analyzer.vision.requests.post", fake_post)
     return calls
+
+
+def _sent_prompt(call: dict[str, Any]) -> str:
+    return str(call["json"]["messages"][0]["content"][0]["text"])
 
 
 def _blank_screenshot(tmp_path: Path) -> Path:
@@ -148,7 +160,7 @@ def _blank_screenshot(tmp_path: Path) -> Path:
 def test_a_confident_extraction_is_used_without_a_verification_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _ = _stub_openrouter(monkeypatch, MINIMUM_CONFIDENCE)
+    _ = _stub_openrouter(monkeypatch, _compact_payload(MINIMUM_CONFIDENCE))
     extraction = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
     assert extraction.confidence == MINIMUM_CONFIDENCE
     assert extraction.state.grid[7][7].letter == "A"
@@ -158,9 +170,71 @@ def test_a_confident_extraction_is_used_without_a_verification_step(
 def test_an_uncertain_extraction_is_rejected_instead_of_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls = _stub_openrouter(monkeypatch, 72)
+    calls = _stub_openrouter(monkeypatch, _compact_payload(72))
     with pytest.raises(LowConfidenceError) as raised:
         _ = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
     assert raised.value.confidence == 72
     assert "72%" in str(raised.value)
     assert len(calls) == 1
+
+
+def test_the_prompt_example_is_itself_a_valid_response() -> None:
+    """A hand-typed example row of the wrong length would teach the exact defect."""
+    example = CompactVisionState.model_validate(json.loads(EXAMPLE_RESPONSE))
+    assert all(len(row) == 15 for row in example.rows)
+    assert example.rows[7] == ".....WOORD....."
+    assert EXAMPLE_RESPONSE in EXTRACTION_PROMPT
+    assert EXTRACTION_PROMPT.count("...............") >= 1
+
+
+def test_a_miscounted_empty_row_is_repaired_instead_of_failing_the_extraction() -> None:
+    rows = ["." * 15 for _ in range(15)]
+    rows[1] = "." * 10  # the exact defect seen in production
+    rows[2] = ""
+    rows[3] = "." * 17
+    rows[9] = "..ZETJE" + "." * 8
+    compact = CompactVisionState.model_validate({"rows": rows, "rack": ["T"], "confidence": 95})
+    assert compact.rows[1] == "." * 15
+    assert compact.rows[2] == "." * 15
+    assert compact.rows[3] == "." * 15
+    assert compact.rows[9] == "..ZETJE" + "." * 8
+
+
+def test_a_short_row_holding_letters_is_still_rejected_and_names_the_row() -> None:
+    rows = ["." * 15 for _ in range(15)]
+    rows[4] = "..ZETJE"
+    with pytest.raises(ValidationError, match="row 5 has 7 characters"):
+        _ = CompactVisionState.model_validate({"rows": rows, "rack": ["T"], "confidence": 95})
+
+
+def test_a_rejected_answer_is_retried_with_the_concrete_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = _compact_payload(95)
+    broken["rows"] = list(broken["rows"])
+    broken["rows"][4] = "..ZETJE"
+    calls = _stub_openrouter(monkeypatch, broken, _compact_payload(95))
+
+    extraction = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
+
+    assert extraction.state.grid[7][7].letter == "A"
+    assert len(calls) == 2
+    assert "rejected" not in _sent_prompt(calls[0])
+    assert "row 5 has 7 characters" in _sent_prompt(calls[1])
+
+
+def test_a_persistent_failure_reports_a_readable_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = _compact_payload(95)
+    broken["rows"] = list(broken["rows"])
+    broken["rows"][4] = "..ZETJE"
+    _ = _stub_openrouter(monkeypatch, broken)
+
+    with pytest.raises(VisionExtractionError) as raised:
+        _ = extract_board(_blank_screenshot(tmp_path), api_key="test-key")
+
+    message = str(raised.value)
+    assert message.startswith("Het bord kon niet worden uitgelezen")
+    assert "row 5 has 7 characters" in message
+    assert "pydantic.dev" not in message
