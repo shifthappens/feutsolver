@@ -259,15 +259,32 @@ def test_an_empty_board_asks_only_for_the_rack(tmp_path: Path, monkeypatch: pyte
     assert "board is empty" in _sent_prompt(calls[0])
 
 
-def _yellow_bubble(path: Path, theme: dict[str, Rgb]) -> Path:
-    """A screenshot with Wordfeud's pending-score bubble drawn on the board."""
+def _yellow_bubble(
+    path: Path, theme: dict[str, Rgb], centre: tuple[float, float] = (0.5, 0.5), size: int = 60
+) -> Path:
+    """A screenshot with Wordfeud's pending-score bubble somewhere on the board.
+
+    The bubble is drawn without any digits in it: what identifies a move in progress
+    is the saturated yellow blob itself, not what it says or where it sits.
+    """
     _screenshot(path, theme, {(7, 7), (7, 8)})
     with Image.open(path) as opened:
         image = opened.convert("RGB")
+    x, y = centre[0] * WIDTH, BOARD_TOP + centre[1] * WIDTH
     draw = ImageDraw.Draw(image)
-    draw.ellipse((300, BOARD_TOP + 400, 360, BOARD_TOP + 435), fill=(255, 214, 0))
+    draw.ellipse((x - size / 2, y - size / 3, x + size / 2, y + size / 3), fill=(255, 214, 0))
     image.save(path)
     return path
+
+
+@pytest.mark.parametrize("centre", [(0.5, 0.5), (0.04, 0.02), (0.97, 0.98), (0.5, 0.0)])
+@pytest.mark.parametrize("size", [40, 90])
+def test_the_bubble_is_found_anywhere_on_the_board(
+    centre: tuple[float, float], size: int, tmp_path: Path
+) -> None:
+    """Nothing about the position or the tiles matters, only that the bubble is there."""
+    path = _yellow_bubble(tmp_path / "pending.png", DARK_THEME, centre, size)
+    assert detect_pending_move(path)
 
 
 @pytest.mark.parametrize("theme_name", list(THEMES))
@@ -283,6 +300,13 @@ def test_a_move_that_is_not_played_yet_is_refused(
         _ = extract_board(path, api_key="test-key")
 
     assert calls == []
+
+
+def test_tiles_alone_never_make_a_board_pending(tmp_path: Path) -> None:
+    """Tiles lying anywhere are just letters; without the bubble nothing is pending."""
+    crowded = {(row, col) for row in range(6, 12) for col in range(4, 11)}
+    path = _screenshot(tmp_path / "vol.png", DARK_THEME, crowded)
+    assert not detect_pending_move(path)
 
 
 @pytest.mark.parametrize("theme_name", list(THEMES))
