@@ -1,7 +1,14 @@
 from pathlib import Path
 
 from wordfeud_analyzer.models import BoardState
-from wordfeud_analyzer.move_generator import Gaddag, generate_moves, load_wordlist
+from wordfeud_analyzer.move_generator import (
+    Gaddag,
+    board_words,
+    generate_moves,
+    learn_words,
+    load_wordlist,
+    read_learned_words,
+)
 
 
 def empty_board(rack: list[str]) -> BoardState:
@@ -67,3 +74,63 @@ def test_gaddag_contains_words_from_both_sides_of_anchor() -> None:
     assert gaddag.contains("KAT")
     assert gaddag.contains("KATER")
     assert not gaddag.contains("KAS")
+
+
+def board_with(words: dict[tuple[int, int], str], rack: list[str]) -> BoardState:
+    """Place letters at fixed coordinates, so a test can state a board literally."""
+    state = empty_board(rack)
+    for (row, col), letter in words.items():
+        state.grid[row][col].letter = letter
+    return state
+
+
+def test_diacritics_are_folded_instead_of_dropping_the_word(tmp_path: Path) -> None:
+    """OpenTaal spells facade with a cedilla; a Wordfeud board never does."""
+    source = tmp_path / "lijst.txt"
+    _ = source.write_text("façade\nabituriënt\nExloërmond\nt/m\n06-nummer\nkat\n", encoding="utf-8")
+    lexicon = load_wordlist(source)
+    assert lexicon.contains("FACADE")
+    assert lexicon.contains("ABITURIENT")
+    assert lexicon.contains("KAT")
+    assert not lexicon.contains("EXLOERMOND")  # a capitalised name stays excluded
+    assert lexicon.count == 3
+
+
+def test_board_words_reads_both_directions_and_survives_the_edges() -> None:
+    state = board_with({(0, 0): "K", (0, 1): "A", (0, 2): "T", (1, 0): "I", (14, 14): "X"}, ["A"])
+    assert sorted(board_words(state)) == ["KAT", "KI"]
+
+
+def test_words_seen_on_a_board_are_learned_and_then_known(tmp_path: Path) -> None:
+    source = tmp_path / "lijst.txt"
+    _ = source.write_text("kat\n", encoding="utf-8")
+    learned = tmp_path / "geleerd.txt"
+
+    lexicon = load_wordlist(source, learned)
+    assert not lexicon.contains("GINS")
+
+    # learn_words dedupes against its own file; filtering against the main list is
+    # the caller's job, which is what the app does before calling this.
+    assert learn_words(["GINS"], learned) == ["gins"]
+    assert learn_words(["GINS"], learned) == []
+    assert read_learned_words(learned) == ["gins"]
+
+    relearned = load_wordlist(source, learned)
+    assert relearned.contains("GINS")
+    assert relearned.contains("KAT")
+
+
+def test_a_learned_word_makes_a_move_possible_that_was_rejected_before(tmp_path: Path) -> None:
+    """The point of learning: a cross word Wordfeud allows must stop blocking moves."""
+    source = tmp_path / "lijst.txt"
+    _ = source.write_text("gin\ngins\n", encoding="utf-8")
+    learned = tmp_path / "geleerd.txt"
+    state = board_with({(7, 7): "G", (7, 8): "I", (7, 9): "N"}, ["S"])
+
+    before = generate_moves(state, load_wordlist(source, learned), limit=20)
+    assert any(move.word == "GINS" for move in before)
+
+    _ = learn_words(["ZQX"], learned)
+    after = load_wordlist(source, learned)
+    assert after.contains("ZQX")
+    assert after.contains("GINS")

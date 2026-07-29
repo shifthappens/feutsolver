@@ -7,6 +7,14 @@ Een Nederlandse Wordfeud-analyzer met twee strikt gescheiden onderdelen:
    Tegel- en bonusherkenning ijken zichzelf per screenshot op de meest voorkomende celkleur, en bonusvakken worden op tint geclassificeerd. Daardoor werken het donkere en het lichte thema via hetzelfde codepad, en zit er nergens een vaste bordindeling in.
 2. `wordfeud_analyzer/move_generator.py` gebruikt een compacte, geminimaliseerde GADDAG met anker-vakken en kruiswoordchecks. Hij genereert legale zetten en berekent score, bonussen, blanco's en de 40-punten-bingo lokaal.
 
+## Woorden die op het bord liggen, worden geleerd
+
+Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden toegevoegd aan `data/geleerde-woorden.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
+
+Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n screenshot is te herkennen aan het gele scorebolletje op het bord en wordt geweigerd — vóór er een model aan te pas komt, zodat er ook niets van geleerd wordt.
+
+OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `façade` wordt `FACADE`, `abituriënt` wordt `ABITURIENT`. Dat scheelt ruim drieduizend woorden die eerder volledig ontbraken.
+
 De app toont naast de beste zet vijf alternatieven. Iedere suggestie krijgt een eigen bordweergave; alleen de nieuwe stenen zijn groen gemarkeerd.
 
 Eén klik volstaat: na de vision-extractie rekent de app direct door en toont hij de top 6. Er is geen JSON-controlestap meer. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
@@ -41,6 +49,8 @@ De lokale installatie gebruikt `data/opentaal-wordlist.txt` zodra dit bestand aa
 ```bash
 curl -fL https://raw.githubusercontent.com/OpenTaal/opentaal-wordlist/master/wordlist.txt -o data/opentaal-wordlist.txt
 ```
+
+De geleerde woorden staan los van de bronlijst in `data/geleerde-woorden.txt`. Dat bestand staat niet in Git en wordt niet meegedeployed: het hoort bij de server, net als de OpenTaal-lijst zelf. De deploy-rsync sluit het uit van overdracht, en `--delete` verwijdert uitgesloten bestanden niet, dus het overleeft een deploy. Draait de app als een gebruiker die niet in `data/` mag schrijven, zet dan `WORDFEUD_LEARNED_WORDS_PATH` naar een pad dat wél schrijfbaar is; lukt schrijven niet, dan blijven de suggesties gewoon kloppen maar wordt er niets onthouden.
 
 De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermelding van OpenTaal over wanneer je die verspreidt. De tool houdt uitsluitend kleine, alfabetische Nederlandse woorden van 2–15 letters over: nummers, leestekens, afkortingen en eigennamen worden uitgesloten. De eerste opbouw van de GADDAG kost lokaal circa een halve minuut voor de volledige lijst; binnen dezelfde draaiende Streamlit-app wordt hij gecachet.
 

@@ -96,6 +96,17 @@ class VisionExtractionError(RuntimeError):
     pass
 
 
+class PendingMoveError(VisionExtractionError):
+    """The screenshot shows a move that has not been submitted yet."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Op deze screenshot ligt een zet klaar die nog niet gespeeld is (het gele scorebolletje). "
+            "Wordfeud heeft die woorden dus nog niet goedgekeurd. Speel de zet of wis hem, "
+            "en maak daarna een nieuwe screenshot."
+        )
+
+
 class LowConfidenceError(VisionExtractionError):
     """The model read the tiles but was not sure enough to trust it."""
 
@@ -275,6 +286,40 @@ def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
     return bonuses
 
 
+# While a move is being composed, Wordfeud paints a saturated yellow score bubble on
+# the board. Its tiles are not submitted, so the words they form carry no approval —
+# a screenshot like that may neither be analysed nor learned from. The pale yellow of
+# a highlighted last move is far less saturated and stays well clear of this.
+PENDING_HUE_RANGE = (40.0, 70.0)
+PENDING_MINIMUM_SATURATION = 0.85
+PENDING_MINIMUM_VALUE = 0.75
+
+
+def detect_pending_move(image_path: str | Path) -> bool:
+    """Is a move being composed on this board, rather than played?"""
+    board, _ = _wordfeud_crop_images(image_path)
+    width, height = board.size
+    step = max(1, width // 300)
+    pixels = board.load()
+    if pixels is None:
+        raise TypeError("could not read the board image")
+    matches = 0
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            red, green, blue = cast(Rgb, pixels[x, y])[:3]
+            hue, saturation, value = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
+            if (
+                PENDING_HUE_RANGE[0] <= hue * 360 <= PENDING_HUE_RANGE[1]
+                and saturation > PENDING_MINIMUM_SATURATION
+                and value > PENDING_MINIMUM_VALUE
+            ):
+                matches += 1
+    # An eighth of one cell: far above the noise floor of a screenshot without a
+    # bubble, and far below the bubble itself.
+    samples_per_cell = max(1, (width // BOARD_SIZE // step) ** 2)
+    return matches > samples_per_cell / 8
+
+
 def _implausible_tiles(tiles: set[tuple[int, int]]) -> set[tuple[int, int]]:
     """Tiles without an orthogonal neighbour, which Wordfeud can never produce.
 
@@ -410,6 +455,9 @@ def extract_board(
     model = model or os.environ.get("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
     if not api_key:
         raise VisionExtractionError("OPENROUTER_API_KEY ontbreekt. Zet hem in .env of Streamlit secrets.")
+
+    if detect_pending_move(image_path):
+        raise PendingMoveError
 
     board_image, rack_image = _wordfeud_crop_images(image_path)
     tiles = sorted(detect_visible_tiles(image_path))

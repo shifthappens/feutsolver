@@ -8,6 +8,7 @@ import pickle
 from pathlib import Path
 import subprocess
 import tempfile
+import unicodedata
 from typing import BinaryIO, Literal, TypeAlias, TypedDict, TypeGuard, cast
 
 from .models import BoardState, Move, PlacedTile
@@ -21,7 +22,7 @@ LETTER_VALUES = {
 }
 LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
-GADDAG_CACHE_VERSION = 3
+GADDAG_CACHE_VERSION = 4
 Direction = Literal["H", "V"]
 # `array` only became subscriptable at runtime in Python 3.12; the element types
 # are quoted so this alias also evaluates on 3.11 without losing type information.
@@ -58,26 +59,40 @@ class Gaddag:
         self._set_graph(*self._from_sorted_sequences(sequences))
 
     @classmethod
-    def from_wordlist(cls, path: str | Path) -> "Gaddag":
-        """Build a packed DAWG without holding the complete source list in RAM."""
+    def from_wordlist(cls, *paths: str | Path) -> "Gaddag":
+        """Build a packed DAWG from one or more lists, without holding them in RAM."""
         instance = cls.__new__(cls)
-        instance.count = 0
         with tempfile.TemporaryDirectory(prefix="wordfeud-gaddag-") as directory:
             unsorted_path = Path(directory) / "sequences.txt"
             sorted_path = Path(directory) / "sequences-sorted.txt"
-            with Path(path).open(encoding="utf-8") as source, unsorted_path.open("w", encoding="ascii") as target:
-                for line in source:
-                    if not _is_plain_netherlands_word(line):
+            with unsorted_path.open("w", encoding="ascii") as target:
+                for path in paths:
+                    source_path = Path(path)
+                    if not source_path.exists():
                         continue
-                    word = normalise_word(line)
-                    if not 2 <= len(word) <= BOARD_SIZE:
-                        continue
-                    instance.count += 1
-                    _ = target.write(word + "\n")
-            # External sorting keeps peak memory bounded for the complete OpenTaal list.
-            _ = subprocess.run(["sort", str(unsorted_path), "-o", str(sorted_path)], check=True)
+                    with source_path.open(encoding="utf-8") as source:
+                        for line in source:
+                            if not _is_plain_netherlands_word(line):
+                                continue
+                            word = normalise_word(line)
+                            if not 2 <= len(word) <= BOARD_SIZE:
+                                continue
+                            _ = target.write(word + "\n")
+            # External sorting keeps peak memory bounded for the complete OpenTaal
+            # list; -u collapses the duplicates that folding diacritics creates, and
+            # any overlap between the two lists.
+            _ = subprocess.run(["sort", "-u", str(unsorted_path), "-o", str(sorted_path)], check=True)
+            counted = 0
+
+            def sequences_from(handle: Iterable[str]) -> Iterable[str]:
+                nonlocal counted
+                for line in handle:
+                    counted += 1
+                    yield line.rstrip("\n")
+
             with sorted_path.open(encoding="ascii") as sequences:
-                instance._set_graph(*cls._from_sorted_sequences(line.rstrip("\n") for line in sequences))
+                instance._set_graph(*cls._from_sorted_sequences(sequences_from(sequences)))
+            instance.count = counted
         return instance
 
     @classmethod
@@ -210,15 +225,28 @@ class Gaddag:
         return self.terminal(state_id)
 
 
+def fold_diacritics(word: str) -> str:
+    """Write a word the way it is played: façade becomes facade, abituriënt abiturient."""
+    decomposed = unicodedata.normalize("NFKD", word)
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
 def normalise_word(word: str) -> str:
-    word = word.strip().upper()
+    word = fold_diacritics(word).strip().upper()
     return word if word and all("A" <= char <= "Z" for char in word) else ""
 
 
 def _is_plain_netherlands_word(word: str) -> bool:
-    """Exclude OpenTaal entries such as 06-nummers, t/m and capitalised names."""
+    """Exclude OpenTaal entries such as 06-nummers, t/m and capitalised names.
+
+    Diacritics are folded instead of rejected: OpenTaal spells façade and abituriënt
+    with them, while a Wordfeud board only ever holds plain A-Z.
+    """
     word = word.strip()
-    return 2 <= len(word) <= BOARD_SIZE and word.isascii() and word.isalpha() and word == word.lower()
+    if not word or word != word.lower():
+        return False
+    folded = fold_diacritics(word)
+    return 2 <= len(folded) <= BOARD_SIZE and folded.isascii() and folded.isalpha()
 
 
 def _cache_path(path: Path) -> Path:
@@ -242,7 +270,7 @@ def _is_graph_data(value: object) -> TypeGuard[GraphData]:
     )
 
 
-def _read_cached_data(handle: BinaryIO) -> tuple[int, tuple[int, int], int, GraphData] | None:
+def _read_cached_data(handle: BinaryIO) -> tuple[int, tuple[int, ...], int, GraphData] | None:
     loaded = cast(object, pickle.load(handle))
     if not isinstance(loaded, tuple):
         return None
@@ -255,20 +283,35 @@ def _read_cached_data(handle: BinaryIO) -> tuple[int, tuple[int, int], int, Grap
     if not isinstance(signature, tuple):
         return None
     signature_values = cast(tuple[object, ...], signature)
-    if len(signature_values) != 2:
-        return None
-    if not all(isinstance(value, int) for value in signature_values):
+    if not signature_values or not all(isinstance(value, int) for value in signature_values):
         return None
     if not _is_graph_data(graph):
         return None
-    signature_ints = (cast(int, signature_values[0]), cast(int, signature_values[1]))
-    return version, signature_ints, count, graph
+    return version, cast(tuple[int, ...], signature_values), count, graph
 
 
-def load_wordlist(path: str | Path) -> Gaddag:
-    """Load a packed, persistent GADDAG; build it only when the word list changed."""
+def _signature(paths: Iterable[Path]) -> tuple[int, ...]:
+    """Rebuild whenever any source list changed, including the learned one."""
+    values: list[int] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            values.extend((0, 0))
+        else:
+            values.extend((stat.st_mtime_ns, stat.st_size))
+    return tuple(values)
+
+
+def load_wordlist(path: str | Path, learned_path: str | Path | None = None) -> Gaddag:
+    """Load a packed, persistent GADDAG; build it only when a word list changed.
+
+    `learned_path` holds words we saw lying on a real board. Wordfeud accepted those,
+    so they are legal here too, even when OpenTaal does not list them.
+    """
     source = Path(path)
-    signature = (source.stat().st_mtime_ns, source.stat().st_size)
+    sources = [source] + ([Path(learned_path)] if learned_path is not None else [])
+    signature = _signature(sources)
     cache = _cache_path(source)
     try:
         with cache.open("rb") as handle:
@@ -280,7 +323,7 @@ def load_wordlist(path: str | Path) -> Gaddag:
     except (OSError, EOFError, pickle.PickleError, ValueError):
         pass
 
-    instance = Gaddag.from_wordlist(source)
+    instance = Gaddag.from_wordlist(*sources)
     try:
         with tempfile.NamedTemporaryFile(dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
             pickle.dump((GADDAG_CACHE_VERSION, signature, instance.count, instance.graph_data()),
@@ -291,6 +334,56 @@ def load_wordlist(path: str | Path) -> Gaddag:
         # A read-only local development word list still works; it simply is not cached.
         pass
     return instance
+
+
+DEFAULT_LEARNED_WORDS_PATH = Path("data/geleerde-woorden.txt")
+
+
+def read_learned_words(path: str | Path) -> list[str]:
+    """The words we picked up from real boards, lowercase, in the order they came."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").split()
+    except OSError:
+        return []
+    return [normalise_word(line).lower() for line in lines if normalise_word(line)]
+
+
+def learn_words(words: Iterable[str], path: str | Path) -> list[str]:
+    """Append words that were played on a real board; return the ones that were new.
+
+    Wordfeud only lets a player submit a move its own dictionary accepts, so a word
+    lying on the board is proof of legality that OpenTaal may simply lack.
+    """
+    target = Path(path)
+    known = set(read_learned_words(target))
+    fresh = sorted({normalise_word(word).lower() for word in words} - known - {""})
+    if not fresh:
+        return []
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        for word in fresh:
+            _ = handle.write(word + "\n")
+    return fresh
+
+
+def board_words(state: BoardState) -> list[str]:
+    """Every maximal run of two or more letters on the board, in both directions."""
+    def letter_at(row: int, col: int) -> str | None:
+        return _letter(state, row, col) if _in_bounds(row, col) else None
+
+    found: list[str] = []
+    for dr, dc in ((0, 1), (1, 0)):
+        for row in range(BOARD_SIZE):
+            for col in range(BOARD_SIZE):
+                if letter_at(row, col) is None or letter_at(row - dr, col - dc) is not None:
+                    continue  # empty, or not the start of this run
+                word, r, c = "", row, col
+                while (letter := letter_at(r, c)) is not None:
+                    word += letter
+                    r, c = r + dr, c + dc
+                if len(word) >= 2:
+                    found.append(word)
+    return found
 
 
 def _in_bounds(row: int, col: int) -> bool:

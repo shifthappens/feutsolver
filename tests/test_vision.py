@@ -10,12 +10,14 @@ from wordfeud_analyzer.vision import (
     BOARD_SIZE,
     MINIMUM_CONFIDENCE,
     LowConfidenceError,
+    PendingMoveError,
     TileReading,
     VisionExtractionError,
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     _wordfeud_crop_images,  # pyright: ignore[reportPrivateUsage]
+    detect_pending_move,
     detect_visible_bonuses,
     detect_visible_tiles,
     extract_board,
@@ -255,6 +257,52 @@ def test_an_empty_board_asks_only_for_the_rack(tmp_path: Path, monkeypatch: pyte
     assert all(cell.letter is None for row in extraction.state.grid for cell in row)
     assert _sent_images(calls[0]) == 1
     assert "board is empty" in _sent_prompt(calls[0])
+
+
+def _yellow_bubble(path: Path, theme: dict[str, Rgb]) -> Path:
+    """A screenshot with Wordfeud's pending-score bubble drawn on the board."""
+    _screenshot(path, theme, {(7, 7), (7, 8)})
+    with Image.open(path) as opened:
+        image = opened.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((300, BOARD_TOP + 400, 360, BOARD_TOP + 435), fill=(255, 214, 0))
+    image.save(path)
+    return path
+
+
+@pytest.mark.parametrize("theme_name", list(THEMES))
+def test_a_move_that_is_not_played_yet_is_refused(
+    theme_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wordfeud has not approved those words, so the board may not be used or learned from."""
+    path = _yellow_bubble(tmp_path / f"{theme_name}.png", THEMES[theme_name])
+    assert detect_pending_move(path)
+    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A"], "rack": ["R"], "confidence": 99})
+
+    with pytest.raises(PendingMoveError, match="nog niet gespeeld"):
+        _ = extract_board(path, api_key="test-key")
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("theme_name", list(THEMES))
+def test_a_played_board_is_not_mistaken_for_a_pending_move(theme_name: str, tmp_path: Path) -> None:
+    """The pale yellow of a highlighted last move must not trigger the refusal."""
+    theme = dict(THEMES[theme_name])
+    highlighted = {(7, 7), (7, 8)}
+    path = _screenshot(tmp_path / f"{theme_name}.png", theme, highlighted)
+    with Image.open(path) as opened:
+        image = opened.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    cell = WIDTH / BOARD_SIZE
+    for row, col in highlighted:  # Wordfeud's "last move" tint
+        draw.rectangle(
+            (int(col * cell) + 2, BOARD_TOP + int(row * cell) + 2,
+             int((col + 1) * cell) - 3, BOARD_TOP + int((row + 1) * cell) - 3),
+            fill=(240, 220, 130),
+        )
+    image.save(path)
+    assert not detect_pending_move(path)
 
 
 def test_a_stray_tile_stops_the_extraction_before_any_model_call(
