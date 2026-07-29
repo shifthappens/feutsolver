@@ -61,7 +61,17 @@ jobs:
       # Copying the files is not enough: the running Streamlit process keeps the
       # modules it imported at startup, so without this a green deploy can still
       # serve the previous version.
+      # A system unit needs a passwordless sudo rule for the deploy user:
+      #   <deploy user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart feutsolver, \
+      #                                      /usr/bin/systemctl is-active feutsolver
+      # Without it the step fails loudly rather than leaving a green deploy that
+      # still serves the previous version.
       - name: Restart the application
         run: |
           ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            'sudo systemctl restart feutsolver && sleep 3 && sudo systemctl is-active feutsolver'
+            'sudo -n systemctl restart feutsolver || systemctl --user restart feutsolver' || {
+              echo "::error::Herstarten van feutsolver mislukt. Geef de deploy-gebruiker een NOPASSWD-sudoregel voor 'systemctl restart feutsolver', of draai de app als --user unit."
+              exit 1
+            }
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'sleep 3; sudo -n systemctl is-active feutsolver || systemctl --user is-active feutsolver'
