@@ -74,12 +74,10 @@ st.markdown("""
 
 st.title("Wordfeud Analyzer")
 st.caption("Vision leest het bord; een lokaal, deterministisch algoritme valideert woorden en rekent zetten uit.")
+st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
-with st.sidebar:
-    st.header("Instellingen")
-    api_key = secret_or_env("OPENROUTER_API_KEY")
-    model = st.text_input("Vision-model", value=secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash"))
-    st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
+api_key = secret_or_env("OPENROUTER_API_KEY")
+model = secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
 
 image = st.file_uploader("Upload een Wordfeud-screenshot", type=["png", "jpg", "jpeg", "webp"])
 if image and image.size > MAX_UPLOAD_BYTES:
