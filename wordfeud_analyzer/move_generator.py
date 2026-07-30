@@ -366,6 +366,43 @@ def learn_words(words: Iterable[str], path: str | Path) -> list[str]:
     return fresh
 
 
+def remove_word_from_wordlist(word: str, path: str | Path) -> bool:
+    """Permanently remove every spelling of a word from one source list."""
+    target_word = normalise_word(word)
+    if not target_word:
+        return False
+
+    source = Path(path)
+    temporary_path: Path | None = None
+    removed = False
+    try:
+        try:
+            source_handle = source.open(encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        with source_handle:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=source.parent,
+                prefix=source.name + ".",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                for line in source_handle:
+                    if normalise_word(line) == target_word:
+                        removed = True
+                        continue
+                    _ = temporary.write(line)
+        if removed and temporary_path is not None:
+            _ = temporary_path.replace(source)
+            temporary_path = None
+        return removed
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def board_words(state: BoardState) -> list[str]:
     """Every maximal run of two or more letters on the board, in both directions."""
     def letter_at(row: int, col: int) -> str | None:

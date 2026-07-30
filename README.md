@@ -21,6 +21,8 @@ OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `fa�
 
 De app toont naast de beste zet vijf alternatieven. Iedere suggestie krijgt een eigen bordweergave; alleen de nieuwe stenen zijn groen gemarkeerd.
 
+Onder de suggesties kun je een voorgesteld woord insturen om het permanent uit de geconfigureerde woordenlijst te verwijderen. De app bouwt de woordenlijstcache opnieuw op en vult de suggesties daarna aan met de eerstvolgende legale zet. Staat het woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
+
 Eén klik volstaat: na de vision-extractie rekent de app direct door en toont hij de top 6. Er is geen JSON-controlestap meer. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
 
 Omdat wij de tegels zelf uitsnijden en op volgorde zetten, blijft er nog één foutmodus over: het model geeft een ander aantal letters terug dan er tegels zijn. Dat is één controle, en de retry noemt het verwachte aantal. Losse tegels zonder buur kan Wordfeud niet produceren; die worden als herkenningsfout gemeld vóór er een model aan te pas komt.

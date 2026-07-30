@@ -8,6 +8,7 @@ from wordfeud_analyzer.move_generator import (
     learn_words,
     load_wordlist,
     read_learned_words,
+    remove_word_from_wordlist,
 )
 
 
@@ -118,6 +119,16 @@ def test_words_seen_on_a_board_are_learned_and_then_known(tmp_path: Path) -> Non
     relearned = load_wordlist(source, learned)
     assert relearned.contains("GINS")
     assert relearned.contains("KAT")
+
+
+def test_remove_word_from_wordlist_removes_diacritic_spelling(tmp_path: Path) -> None:
+    source = tmp_path / "lijst.txt"
+    _ = source.write_text("kat\nfaçade\nkamer\n", encoding="utf-8")
+
+    assert remove_word_from_wordlist("FACADE", source)
+    assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
+    assert not remove_word_from_wordlist("FACADE", source)
+    assert not load_wordlist(source).contains("FACADE")
 
 
 def test_a_learned_word_makes_a_move_possible_that_was_rejected_before(tmp_path: Path) -> None:

@@ -16,6 +16,8 @@ from wordfeud_analyzer.move_generator import (
     generate_moves,
     learn_words,
     load_wordlist,
+    normalise_word,
+    remove_word_from_wordlist,
 )
 from wordfeud_analyzer.vision import VisionExtractionError, extract_board
 
@@ -49,22 +51,27 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def get_lexicon(path: str, learned_path: str, learned_signature: tuple[int, int]) -> Gaddag:
+def get_lexicon(path: str, learned_path: str, source_signature: tuple[int, ...]) -> Gaddag:
     """A minimized GADDAG is expensive to build once, but safe to reuse.
 
-    `learned_signature` is part of the cache key on purpose: learning a word has to
-    produce a new lexicon, and leaving it out would silently serve the old one.
+    Both source signatures are part of the cache key: learning or removing a word
+    has to produce a new lexicon, and leaving either one out would silently serve
+    the old one.
     """
-    _ = learned_signature
+    _ = source_signature
     return load_wordlist(path, learned_path)
 
 
-def learned_signature() -> tuple[int, int]:
-    try:
-        stat = LEARNED_WORDS.stat()
-    except OSError:
-        return (0, 0)
-    return (stat.st_mtime_ns, stat.st_size)
+def lexicon_signature() -> tuple[int, ...]:
+    values: list[int] = []
+    for path in (DEFAULT_WORDLIST, LEARNED_WORDS):
+        try:
+            stat = path.stat()
+        except OSError:
+            values.extend((0, 0))
+        else:
+            values.extend((stat.st_mtime_ns, stat.st_size))
+    return tuple(values)
 
 
 def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]]:
@@ -73,7 +80,7 @@ def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]
     Wordfeud only accepts a move its own dictionary allows, so whatever lies on the
     board is legal by definition — even when OpenTaal does not list it.
     """
-    lexicon = get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), learned_signature())
+    lexicon = get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature())
     unknown = [word for word in board_words(state) if not lexicon.contains(word)]
     if not unknown:
         return lexicon, []
@@ -90,7 +97,7 @@ def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]
         else f"{len(added)} nieuwe woorden geleerd"
     )
     with st.spinner(f"{learned_message}; woordenlijst wordt opnieuw opgebouwd…"):
-        return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), learned_signature()), added
+        return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature()), added
 
 
 def render_board(state: BoardState, move: Move | None = None) -> None:
@@ -184,6 +191,38 @@ if "board_state" in st.session_state:
         _ = st.caption("Nieuw geleerd van dit bord: " + ", ".join(sorted(learned)))
     render_board(state)
     _ = st.subheader("Suggesties")
+    if moves:
+        with st.form("replace_suggestion", clear_on_submit=True):
+            word_to_replace = st.text_input("Een suggestie vervangen", placeholder="Typ een voorgesteld woord")
+            replace_submitted = st.form_submit_button("Vervang suggestie")
+        if replace_submitted:
+            entered_word = normalise_word(word_to_replace)
+            suggested_words = {move.word for move in moves}
+            if not entered_word:
+                _ = st.warning("Vul een geldig woord in.")
+            elif entered_word not in suggested_words:
+                _ = st.warning("Dat woord staat niet tussen de huidige suggesties.")
+            else:
+                try:
+                    removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)
+                    # A board-learned copy must also be removed, otherwise it would
+                    # immediately put the word back into the rebuilt lexicon.
+                    removed_from_learned = remove_word_from_wordlist(entered_word, LEARNED_WORDS)
+                except OSError as error:
+                    _ = st.error(f"Het woord kon niet uit de woordenlijst worden verwijderd ({error}).")
+                else:
+                    if not (removed_from_wordlist or removed_from_learned):
+                        _ = st.error("Het woord staat niet in de geconfigureerde woordenlijsten.")
+                    else:
+                        with st.spinner("Woordenlijst wordt bijgewerkt en nieuwe suggestie wordt berekend…"):
+                            updated_lexicon = get_lexicon(
+                                str(DEFAULT_WORDLIST),
+                                str(LEARNED_WORDS),
+                                lexicon_signature(),
+                            )
+                            replacement_moves = generate_moves(state, updated_lexicon, limit=6)
+                        st.session_state.moves = [move.model_dump() for move in replacement_moves]
+                        st.rerun()
     if not moves:
         _ = st.warning("Geen legale zet in de gekozen woordenlijst gevonden.")
     else:
