@@ -1,14 +1,19 @@
 from pathlib import Path
+import json
 
 from PIL import Image, ImageDraw
+from pytest import MonkeyPatch
 
 from wordfeud_analyzer.vision import (
     CompactVisionState,
     _align_compact_to_visible_tiles,  # pyright: ignore[reportPrivateUsage]
+    _ordered_tiles_schema,  # pyright: ignore[reportPrivateUsage]
+    _repair_compact_with_visible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     detect_visible_bonuses,
     detect_visible_tiles,
+    extract_board,
     wordfeud_crops,
 )
 
@@ -101,3 +106,119 @@ def test_visible_tile_alignment_corrects_a_consistent_vision_row_offset(tmp_path
     aligned = _align_compact_to_visible_tiles(compact, detect_visible_tiles(screenshot))
     assert aligned.rows[6][7] == "B"
     assert aligned.rows[9][3:8] == "ZETJE"
+
+
+def test_repair_restores_the_one_visible_tile_a_model_omitted() -> None:
+    compact = CompactVisionState.model_validate({
+        "rows": ["." * 15 for _ in range(15)],
+        "rack": ["Q"],
+        "blanks": [],
+    })
+    rows = list(compact.rows)
+    rows[4] = "A" + "." * 14
+    compact = CompactVisionState(rows=rows, rack=["Q"], blanks=[])
+    repaired = _repair_compact_with_visible_tiles(compact, {(4, 0), (4, 1)}, "z")
+    assert repaired.rows[4][:2] == "AZ"
+    assert repaired.blanks == [(4, 1)]
+
+
+def test_ordered_tile_schema_requires_the_local_tile_count() -> None:
+    schema = _ordered_tiles_schema(101, include_rack=True)
+    letters = schema["properties"]["letters"]
+    assert isinstance(letters, dict)
+    assert letters["minLength"] == 101
+    assert letters["maxLength"] == 101
+
+
+def test_extract_board_recovers_an_omitted_tile_from_a_contact_sheet(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    screenshot = tmp_path / "screenshot.png"
+    width, height, board_top = 588, 1275, round(1275 * 0.296)
+    image = Image.new("RGB", (width, height), (42, 45, 52))
+    draw = ImageDraw.Draw(image)
+    for row, col in [(4, 0), (4, 1)]:
+        draw.rectangle((int(col * width / 15) + 3, board_top + int(row * width / 15) + 3,
+                        int((col + 1) * width / 15) - 3, board_top + int((row + 1) * width / 15) - 3),
+                       fill=(225, 220, 210))
+    image.save(screenshot)
+
+    requests: list[dict[str, object]] = []
+    responses = iter([
+        {"rows": ["." * 15 for _ in range(4)] + ["A" + "." * 14] + ["." * 15 for _ in range(10)],
+         "rack": ["Q"], "blanks": []},
+        {"letters": "Z"},
+    ])
+
+    class FakeResponse:
+        def __init__(self, content: object) -> None:
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": json.dumps(self.content)}}]}
+
+    def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+        request_json = kwargs.get("json")
+        assert isinstance(request_json, dict)
+        requests.append(request_json)
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr("wordfeud_analyzer.vision.requests.post", fake_post)  # type: ignore[attr-defined]
+    state = extract_board(screenshot, api_key="test-key", model="test-model", retries=0)
+    assert state.grid[4][0].letter == "A"
+    assert state.grid[4][1].letter == "Z"
+    repair_schema = requests[1]["response_format"]
+    assert isinstance(repair_schema, dict)
+    json_schema = repair_schema["json_schema"]
+    assert isinstance(json_schema, dict)
+    schema = json_schema["schema"]
+    assert isinstance(schema, dict)
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    letters = properties["letters"]
+    assert isinstance(letters, dict)
+    assert letters["minLength"] == letters["maxLength"] == 1
+
+
+def test_extract_board_falls_back_after_provider_rejects_the_full_transcription(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    screenshot = tmp_path / "screenshot.png"
+    width, height, board_top = 588, 1275, round(1275 * 0.296)
+    image = Image.new("RGB", (width, height), (42, 45, 52))
+    draw = ImageDraw.Draw(image)
+    for row, col in [(4, 0), (4, 1)]:
+        draw.rectangle((int(col * width / 15) + 3, board_top + int(row * width / 15) + 3,
+                        int((col + 1) * width / 15) - 3, board_top + int((row + 1) * width / 15) - 3),
+                       fill=(225, 220, 210))
+    image.save(screenshot)
+
+    requests: list[dict[str, object]] = []
+    responses = iter(["provider could not produce 101 letters", "same failure", {"letters": "AB", "rack": ["Q"]}])
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": json.dumps(next(responses))}}]}
+
+    def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+        request_json = kwargs.get("json")
+        assert isinstance(request_json, dict)
+        requests.append(request_json)
+        return FakeResponse()
+
+    monkeypatch.setattr("wordfeud_analyzer.vision.requests.post", fake_post)
+    state = extract_board(screenshot, api_key="test-key", model="test-model")
+    assert [state.grid[4][col].letter for col in (0, 1)] == ["A", "B"]
+    fallback_format = requests[2]["response_format"]
+    assert isinstance(fallback_format, dict)
+    json_schema = fallback_format["json_schema"]
+    assert isinstance(json_schema, dict)
+    schema = json_schema["schema"]
+    assert isinstance(schema, dict)
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    letters = properties["letters"]
+    assert isinstance(letters, dict)
+    assert letters["minLength"] == letters["maxLength"] == 2

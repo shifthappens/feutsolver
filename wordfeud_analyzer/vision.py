@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from .models import BoardState
@@ -35,6 +35,28 @@ Rules:
 - An assigned blank's letter stays in `rows`; add only its coordinate to `blanks`.
 - The rack is at the very bottom of the screenshot; use its large glyphs.
 - Never invent letters. If a board detail cannot be read, use `.` and make the best faithful transcription.
+"""
+
+ORDERED_TILES_PROMPT = """Recover a Wordfeud board transcription. Do not solve the game.
+Return JSON only, matching the provided schema exactly.
+
+You receive three images from one screenshot: the full 15x15 board, the player's
+rack, and a contact sheet of the placed tiles. The contact sheet is authoritative:
+each enlarged tile is labelled with its zero-based `[row,column]` coordinate.
+
+`letters` is one character for every coordinate in the supplied list, in precisely
+that order. Use A-Z for a normal tile. Use lowercase a-z only when the tile is an
+assigned blank (it has no point value). Do not omit a tile, add a tile, or include
+spaces, punctuation, or dots. `rack` contains the 1-7 visible rack letters; use
+`?` for an unassigned blank. Read no score/header/button text.
+"""
+
+MISSING_TILES_PROMPT = """Read the labelled Wordfeud tile contact sheet. Do not solve the game.
+Return JSON only, matching the provided schema exactly. `letters` has one character
+per listed coordinate, in exactly that order. Use A-Z for normal tiles and lowercase
+a-z only for assigned blanks. Do not omit, add, or separate letters. The full board
+image is supplied only as context; read the enlarged, labelled tiles in the contact
+sheet and ignore all UI text.
 """
 
 class CompactVisionState(BaseModel):
@@ -85,6 +107,43 @@ def _image_data_url(image: Image.Image) -> str:
     output = BytesIO()
     image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _tile_contact_sheet(board: Image.Image, coordinates: list[tuple[int, int]]) -> Image.Image:
+    """Enlarge detected tiles and label their coordinates for recovery OCR.
+
+    A model can occasionally lose its place while counting a dense board.  The
+    board grid itself already gives us the exact occupied coordinates locally, so
+    this contact sheet turns a difficult 15x15 transcription into a sequence of
+    independently readable, labelled glyphs.  It is intentionally generated from
+    the same board crop that was used for tile detection.
+    """
+    if not coordinates:
+        raise ValueError("cannot create a contact sheet without tiles")
+
+    columns = 8
+    tile_size = 120
+    label_height = 22
+    gutter = 8
+    rows = (len(coordinates) + columns - 1) // columns
+    sheet = Image.new(
+        "RGB",
+        (columns * (tile_size + gutter) + gutter, rows * (tile_size + label_height + gutter) + gutter),
+        "white",
+    )
+    draw = ImageDraw.Draw(sheet)
+    width, height = board.size
+    for index, (row, col) in enumerate(coordinates):
+        left = int(col * width / 15)
+        top = int(row * height / 15)
+        right = max(left + 1, int((col + 1) * width / 15))
+        bottom = max(top + 1, int((row + 1) * height / 15))
+        tile = board.crop((left, top, right, bottom)).resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+        x = gutter + (index % columns) * (tile_size + gutter)
+        y = gutter + (index // columns) * (tile_size + label_height + gutter)
+        sheet.paste(tile, (x, y))
+        draw.text((x, y + tile_size + 2), f"[{row},{col}]", fill="black")
+    return sheet
 
 
 def _pixel_brightness(pixel: int | float | tuple[int, ...] | None) -> float:
@@ -281,6 +340,123 @@ def _align_compact_to_visible_tiles(
     return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=blanks)
 
 
+def _model_tile_coordinates(compact: CompactVisionState) -> set[tuple[int, int]]:
+    return {
+        (row, col)
+        for row, line in enumerate(compact.rows)
+        for col, char in enumerate(line)
+        if char != "."
+    }
+
+
+def _repair_compact_with_visible_tiles(
+    compact: CompactVisionState,
+    visible_tiles: set[tuple[int, int]],
+    recovered_letters: str,
+) -> CompactVisionState:
+    """Replace only the locally proven missing tiles with isolated OCR results.
+
+    The detector is deliberately used as a geometry oracle, never as OCR.  Model
+    letters at real coordinates are preserved, model hallucinations are discarded,
+    and the recovery response supplies exactly one glyph for each missing tile.
+    """
+    model_tiles = _model_tile_coordinates(compact)
+    missing_tiles = sorted(visible_tiles - model_tiles)
+    if len(recovered_letters) != len(missing_tiles):
+        raise ValueError(
+            f"expected {len(missing_tiles)} recovered letters for visible tiles, got {len(recovered_letters)}"
+        )
+    if any(len(letter) != 1 or not ("A" <= letter.upper() <= "Z") for letter in recovered_letters):
+        raise ValueError("recovered letters must be alphabetic")
+
+    rows = [["."] * 15 for _ in range(15)]
+    blanks: set[tuple[int, int]] = set()
+    old_blanks = set(compact.blanks)
+    for row, col in model_tiles & visible_tiles:
+        rows[row][col] = compact.rows[row][col]
+        if (row, col) in old_blanks:
+            blanks.add((row, col))
+    for (row, col), letter in zip(missing_tiles, recovered_letters):
+        rows[row][col] = letter.upper()
+        if letter.islower():
+            blanks.add((row, col))
+    return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=sorted(blanks))
+
+
+def _ordered_tiles_schema(letter_count: int, *, include_rack: bool) -> dict[str, JsonValue]:
+    """Build the small dynamic schema used when local geometry is known.
+
+    `minLength` plus `maxLength` makes the provider enforce the count before the
+    response reaches us.  This avoids the previous all-or-nothing failure mode in
+    which a 101-tile board was rejected because the model emitted 100 letters.
+    """
+    if letter_count < 0:
+        raise ValueError("letter_count cannot be negative")
+    properties: dict[str, JsonValue] = {
+        "letters": {
+            "type": "string",
+            "minLength": letter_count,
+            "maxLength": letter_count,
+            "pattern": f"^[A-Za-z]{{{letter_count}}}$" if letter_count else "^$",
+        },
+    }
+    required: list[JsonValue] = ["letters"]
+    if include_rack:
+        properties["rack"] = {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^[A-Z?]$"},
+            "minItems": 1,
+            "maxItems": 7,
+        }
+        required.append("rack")
+    return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+
+
+def _parse_ordered_tiles(content: object, letter_count: int, *, include_rack: bool) -> tuple[str, list[str] | None]:
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in cast(list[object], content):
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(cast(str, part["text"]))
+        content = "".join(text_parts)
+    if not isinstance(content, str):
+        raise ValueError("model response had no JSON text")
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    payload = json.loads(content)
+    if not isinstance(payload, dict):
+        raise ValueError("ordered tile response was not a JSON object")
+    letters = payload.get("letters")
+    if (not isinstance(letters, str) or len(letters) != letter_count
+            or any(len(letter) != 1 or not ("A" <= letter.upper() <= "Z") for letter in letters)):
+        raise ValueError(f"expected exactly {letter_count} alphabetic recovered letters")
+    rack_value = payload.get("rack")
+    if include_rack:
+        try:
+            rack = CompactVisionState.model_validate({"rows": ["." * 15] * 15, "rack": rack_value}).rack
+        except ValidationError as exc:
+            raise ValueError(f"invalid recovered rack: {exc}") from exc
+        return letters, rack
+    return letters, None
+
+
+def _compact_from_ordered_tiles(
+    coordinates: list[tuple[int, int]],
+    letters: str,
+    rack: list[str],
+) -> CompactVisionState:
+    if len(coordinates) != len(letters):
+        raise ValueError("ordered tile coordinate and letter counts differ")
+    rows = [["."] * 15 for _ in range(15)]
+    blanks: list[tuple[int, int]] = []
+    for (row, col), letter in zip(coordinates, letters):
+        rows[row][col] = letter.upper()
+        if letter.islower():
+            blanks.append((row, col))
+    return CompactVisionState(rows=["".join(row) for row in rows], rack=rack, blanks=blanks)
+
+
 def _parse_content(content: object) -> CompactVisionState:
     if isinstance(content, list):
         text_parts: list[str] = []
@@ -318,6 +494,39 @@ def _response_content(response: requests.Response) -> object:
     return content
 
 
+def _vision_request(
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+    images: list[str],
+    schema_name: str,
+    schema: dict[str, JsonValue],
+    timeout_seconds: int,
+) -> object:
+    payload: dict[str, JsonValue] = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 2_000,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            *[{"type": "image_url", "image_url": {"url": image}} for image in images],
+        ]}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+        },
+    }
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    return _response_content(response)
+
+
 def _to_board_state(compact: CompactVisionState, visible_bonuses: list[list[str]]) -> BoardState:
     blanks = set(compact.blanks)
     return BoardState.model_validate({
@@ -338,44 +547,83 @@ def extract_board(
     retries: int = 1,
     timeout_seconds: int = 45,
 ) -> BoardState:
-    """Extract and validate a board; retry invalid JSON/schema responses."""
+    """Extract a board, using local tile geometry to recover count mistakes.
+
+    The regular call remains cheap and compact.  If its layout disagrees with the
+    visible off-white tiles, only the missing tiles are re-read from an enlarged
+    contact sheet.  If a provider rejects the regular schema altogether, the final
+    fallback asks for a fixed-length sequence indexed by those same local tiles.
+    """
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
     model = model or os.environ.get("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
     if not api_key:
         raise VisionExtractionError("OPENROUTER_API_KEY ontbreekt. Zet hem in .env of Streamlit secrets.")
 
-    board_image, rack_image = wordfeud_crops(image_path)
+    board, rack_crop = _wordfeud_crop_images(image_path)
+    board_image = _image_data_url(board)
+    rack_image = _image_data_url(rack_crop)
+    visible_bonuses = detect_visible_bonuses(image_path)
+    visible_tiles = detect_visible_tiles(image_path)
+    ordered_visible_tiles = sorted(visible_tiles)
     errors: list[str] = []
     prompt = EXTRACTION_PROMPT
     for attempt in range(retries + 1):
         try:
-            payload: dict[str, JsonValue] = {
-                "model": model,
-                "temperature": 0,
-                # Compact 15-character rows avoid thousands of repetitive JSON tokens.
-                "max_tokens": 2_000,
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": board_image}},
-                    {"type": "image_url", "image_url": {"url": rack_image}},
-                ]}],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {"name": "wordfeud_letters", "strict": True, "schema": COMPACT_BOARD_SCHEMA},
-                },
-            }
-            response = requests.post(
-                OPENROUTER_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-            compact = _parse_content(_response_content(response))
-            visible_bonuses = detect_visible_bonuses(image_path)
-            compact = _align_compact_to_visible_tiles(compact, detect_visible_tiles(image_path))
+            compact = _parse_content(_vision_request(
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                images=[board_image, rack_image],
+                schema_name="wordfeud_letters",
+                schema=COMPACT_BOARD_SCHEMA,
+                timeout_seconds=timeout_seconds,
+            ))
+            compact = _align_compact_to_visible_tiles(compact, visible_tiles)
+            missing_tiles = sorted(visible_tiles - _model_tile_coordinates(compact))
+            if missing_tiles:
+                coordinates = ", ".join(f"[{row},{col}]" for row, col in missing_tiles)
+                recovery_content = _vision_request(
+                    api_key=api_key,
+                    model=model,
+                    prompt=MISSING_TILES_PROMPT + f"\nCoordinates, in required order: {coordinates}",
+                    images=[board_image, _image_data_url(_tile_contact_sheet(board, missing_tiles))],
+                    schema_name="wordfeud_missing_tiles",
+                    schema=_ordered_tiles_schema(len(missing_tiles), include_rack=False),
+                    timeout_seconds=timeout_seconds,
+                )
+                recovered_letters, _ = _parse_ordered_tiles(recovery_content, len(missing_tiles), include_rack=False)
+                compact = _repair_compact_with_visible_tiles(compact, visible_tiles, recovered_letters)
+            if _model_tile_coordinates(compact) != visible_tiles:
+                raise ValueError("model tile coordinates still disagree with the locally visible tiles")
             return _to_board_state(compact, visible_bonuses)
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
             errors.append(f"poging {attempt + 1}: {exc}")
             prompt = EXTRACTION_PROMPT + "\nYour previous answer was invalid. Return the full schema-valid JSON only."
+
+    # Provider-side schema rejection can leave us without a partial board to
+    # repair.  Fall back to a locally indexed sequence, so every detected tile
+    # has a required response slot and a 100/101 mismatch cannot strand the user.
+    try:
+        coordinates = ", ".join(f"[{row},{col}]" for row, col in ordered_visible_tiles)
+        fallback_images = [board_image, rack_image]
+        if ordered_visible_tiles:
+            fallback_images.append(_image_data_url(_tile_contact_sheet(board, ordered_visible_tiles)))
+        content = _vision_request(
+            api_key=api_key,
+            model=model,
+            prompt=ORDERED_TILES_PROMPT + f"\nCoordinates, in required order: {coordinates}",
+            images=fallback_images,
+            schema_name="wordfeud_ordered_tiles",
+            schema=_ordered_tiles_schema(len(ordered_visible_tiles), include_rack=True),
+            timeout_seconds=timeout_seconds,
+        )
+        letters, recovered_rack = _parse_ordered_tiles(content, len(ordered_visible_tiles), include_rack=True)
+        if recovered_rack is None:  # Defensive: include_rack above guarantees this.
+            raise ValueError("ordered tile recovery omitted the rack")
+        return _to_board_state(
+            _compact_from_ordered_tiles(ordered_visible_tiles, letters, recovered_rack),
+            visible_bonuses,
+        )
+    except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+        errors.append(f"herstelpoging: {exc}")
     raise VisionExtractionError("Vision-extractie faalde na retries: " + " | ".join(errors))
