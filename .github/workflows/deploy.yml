@@ -45,7 +45,8 @@ jobs:
 
       - name: Sync application files only
         run: |
-          rsync -rlptDz --delete --chmod=Du=rwx,Dg=rx,Dg+s,Fu=rw,Fg=r \
+          # www-data runs the service; setgid keeps the project service group on new files.
+          rsync -rlptDz --delete --chmod=Du=rwx,Dg=rxs,Do=,Fu=rw,Fg=r,Fo= \
             --include='/.streamlit/' \
             --include='/.streamlit/config.toml' \
             --include='/wordfeud_analyzer/' \
@@ -57,6 +58,26 @@ jobs:
             --exclude='*' \
             ./ \
             "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}"
+
+      - name: Re-assert and verify service-readable permissions
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -eu
+             find '${DEPLOY_PATH}/wordfeud_analyzer' -type d -exec chmod g+rx,g+s {} +
+             find '${DEPLOY_PATH}/wordfeud_analyzer' -type f -exec chmod g+r {} +
+             chmod g+rx,g+s '${DEPLOY_PATH}' '${DEPLOY_PATH}/.streamlit' '${DEPLOY_PATH}/data'
+             chmod g+r '${DEPLOY_PATH}/app.py' '${DEPLOY_PATH}/requirements.txt' '${DEPLOY_PATH}/.streamlit/config.toml' '${DEPLOY_PATH}/data/voorbeeld_woorden.txt'
+             test \"\$(stat -c '%G' '${DEPLOY_PATH}/app.py')\" = feutsolver-app
+             test \"\$(stat -c '%A' '${DEPLOY_PATH}/app.py' | cut -c5)\" = r
+             test \"\$(stat -c '%G' '${DEPLOY_PATH}')\" = feutsolver-app
+             test \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c5)\" = r
+             case \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c7)\" in x|s) ;; *) exit 1 ;; esac
+             echo 'Deployment permissions verified'"
 
       # Copying the files is not enough: the running Streamlit process keeps the
       # modules it imported at startup, so a deploy without a restart can still
