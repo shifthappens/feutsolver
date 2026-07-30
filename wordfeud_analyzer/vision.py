@@ -1,187 +1,199 @@
-"""Vision-only adapter: this module extracts data but never suggests or scores moves."""
+"""Vision-only adapter: this module extracts data but never suggests or scores moves.
+
+The geometry of a Wordfeud screenshot is solved locally and deterministically: where
+the board is, which squares hold a tile, and which bonus each free square carries.
+The language model is asked one thing only — which letter is printed on a tile — and
+never has to count rows, pad a grid or return a coordinate. That keeps its job pure
+OCR, and keeps every positional mistake out of the pipeline by construction.
+"""
 from __future__ import annotations
 
 import base64
+import colorsys
 import json
 import os
+from collections import Counter
+from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
-from typing import TypeAlias, cast
+from typing import NamedTuple, TypeAlias, cast
 
 import requests
 from PIL import Image, ImageDraw
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .models import BoardState
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
-EXTRACTION_PROMPT = """You transcribe a Wordfeud game screenshot into data. Do not solve the game.
-Return JSON only, matching the provided compact schema exactly.
+BOARD_SIZE = 15
+Rgb: TypeAlias = tuple[int, int, int]
 
-You receive two images from the same screenshot. The FIRST is a tightly cropped square containing only the 15x15 board. The SECOND is a crop containing the player's rack at the bottom. Use those crops, not any assumed board pattern.
+EXTRACTION_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
-Rules:
-- `rows` is exactly 15 strings of exactly 15 characters, in screenshot order
-  (top-to-bottom, left-to-right). Use A-Z for placed letters and `.` for empty cells.
-- `rack` is the player's 1-7 rack letters; use `?` for an unassigned blank.
-- `blanks` lists only placed blank coordinates as `[row, column]`, zero based.
-- Read only the 15x15 game board: ignore the score header, player names, turn text and buttons.
-- Do not return bonus squares: the application detects every visible `2L`, `3L`,
-  `2W` and `3W` locally from the board crop, including random boards.
-- A placed tile is an off-white square. Its small superscript is its point value, not a second letter. Use only the large tile glyph as `letter`.
-- The bonus under an already placed tile is hidden and has already been consumed.
-- An assigned blank's letter stays in `rows`; add only its coordinate to `blanks`.
-- The rack is at the very bottom of the screenshot; use its large glyphs.
-- Never invent letters. If a board detail cannot be read, use `.` and make the best faithful transcription.
+The first image contains every tile that lies on the board, cut out of the screenshot
+and laid out in a fixed order: left to right, then on to the next line. Return one
+letter for each of those tiles, in exactly that order.
+
+The second image is the player's rack. Return its letters from left to right.
+
+- Read the large glyph on a tile; the small number beside it is the tile's point value.
+- A blank tile carries no point value. Return the letter it represents in lowercase.
+- An unassigned blank on the rack is `?`.
+- `confidence` is your honest certainty, 0-100, that every letter you return matches
+  the image. Score well below 90 when glyphs are unclear; do not inflate it.
 """
 
-ORDERED_TILES_PROMPT = """Recover a Wordfeud board transcription. Do not solve the game.
-Return JSON only, matching the provided schema exactly.
+RACK_ONLY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
-You receive three images from one screenshot: the full 15x15 board, the player's
-rack, and a contact sheet of the placed tiles. The contact sheet is authoritative:
-each enlarged tile is labelled with its zero-based `[row,column]` coordinate.
+The board is empty, so only the player's rack matters. Return the rack letters from
+left to right, leaving `letters` empty.
 
-`letters` is one character for every coordinate in the supplied list, in precisely
-that order. Use A-Z for a normal tile. Use lowercase a-z only when the tile is an
-assigned blank (it has no point value). Do not omit a tile, add a tile, or include
-spaces, punctuation, or dots. `rack` contains the 1-7 visible rack letters; use
-`?` for an unassigned blank. Read no score/header/button text.
+- Read the large glyph on a tile; the small number beside it is the tile's point value.
+- An unassigned blank on the rack is `?`.
+- `confidence` is your honest certainty, 0-100, that every letter you return matches
+  the image. Score well below 90 when glyphs are unclear; do not inflate it.
 """
 
-MISSING_TILES_PROMPT = """Read the labelled Wordfeud tile contact sheet. Do not solve the game.
-Return JSON only, matching the provided schema exactly. `letters` has one character
-per listed coordinate, in exactly that order. Use A-Z for normal tiles and lowercase
-a-z only for assigned blanks. Do not omit, add, or separate letters. The full board
-image is supplied only as context; read the enlarged, labelled tiles in the contact
-sheet and ignore all UI text.
+RECOVERY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
+
+The first image is a contact sheet of every placed board tile. The tiles are enlarged
+and numbered in reading order; return the large glyph of tile 1, then tile 2, and so
+on, with no missing entries. The second image is the player's rack; return its
+letters from left to right.
+
+- Read only the large glyph; a small number is its point value.
+- Return a blank tile's assigned letter in lowercase, and an unassigned rack blank as `?`.
+- `confidence` is your honest certainty, 0-100, that every returned letter matches.
 """
 
-class CompactVisionState(BaseModel):
-    """Small model response: letters only; bonuses are deterministic local vision."""
 
-    rows: list[str] = Field(..., min_length=15, max_length=15)
-    rack: list[str] = Field(..., min_length=1, max_length=7)
-    blanks: list[tuple[int, int]] = Field(default_factory=list)
+class TileReading(BaseModel):
+    """The only thing the model returns: glyphs, in an order we imposed ourselves."""
 
-    @field_validator("rows", mode="before")
+    letters: list[str] = Field(..., max_length=BOARD_SIZE * BOARD_SIZE)
+    rack: list[str] = Field(..., max_length=7)
+    confidence: float = Field(..., ge=0, le=100)
+
+    @field_validator("letters", mode="before")
     @classmethod
-    def validate_rows(cls, value: object) -> list[str]:
+    def validate_letters(cls, value: object) -> list[str]:
         if not isinstance(value, list):
-            raise ValueError("rows must be a list")
-        rows = [str(row).strip().upper() for row in cast(list[object], value)]
-        if any(len(row) != 15 or any(char != "." and not ("A" <= char <= "Z") for char in row) for row in rows):
-            raise ValueError("each row must contain exactly 15 A-Z or . characters")
-        return rows
+            raise ValueError("letters must be a list")
+        letters = [str(letter).strip() for letter in cast(list[object], value)]
+        if any(len(letter) != 1 or not letter.isalpha() or not letter.isascii() for letter in letters):
+            raise ValueError("every entry in letters must be a single A-Z or a-z character")
+        return letters
 
     @field_validator("rack", mode="before")
     @classmethod
     def validate_rack(cls, value: object) -> list[str]:
         if not isinstance(value, list):
-            raise TypeError("rack must be a list")
+            raise ValueError("rack must be a list")
         rack = [str(letter).strip().upper() for letter in cast(list[object], value)]
         if any(letter != "?" and (len(letter) != 1 or not ("A" <= letter <= "Z")) for letter in rack):
             raise ValueError("rack entries must be A-Z or ?")
         return rack
 
-    @model_validator(mode="after")
-    def validate_blanks(self) -> "CompactVisionState":
-        if len(set(self.blanks)) != len(self.blanks):
-            raise ValueError("blank coordinates must be unique")
-        if any(not (0 <= row < 15 and 0 <= col < 15) or self.rows[row][col] == "." for row, col in self.blanks):
-            raise ValueError("blanks must refer to placed letters")
-        return self
+
+TILE_READING_SCHEMA: dict[str, JsonValue] = cast(dict[str, JsonValue], TileReading.model_json_schema())
 
 
-COMPACT_BOARD_SCHEMA: dict[str, JsonValue] = cast(dict[str, JsonValue], CompactVisionState.model_json_schema())
+def _tile_reading_schema(expected_letters: int) -> dict[str, JsonValue]:
+    """Make the model/provider enforce the count derived from local tile geometry."""
+    schema = deepcopy(TILE_READING_SCHEMA)
+    properties = cast(dict[str, JsonValue], schema["properties"])
+    letters = cast(dict[str, JsonValue], properties["letters"])
+    letters["minItems"] = expected_letters
+    letters["maxItems"] = expected_letters
+    return schema
+
+# Below this self-reported certainty we discard the reading entirely: a silently
+# misread board produces confident but wrong scores, which is worse than telling
+# the user to upload a better screenshot.
+MINIMUM_CONFIDENCE = 90.0
 
 
 class VisionExtractionError(RuntimeError):
     pass
 
 
-def _image_data_url(image: Image.Image) -> str:
-    """JPEG is substantially smaller than a PNG screenshot, without losing tile glyphs."""
-    output = BytesIO()
-    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
-    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+class PendingMoveError(VisionExtractionError):
+    """The screenshot shows a move that has not been submitted yet."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Op deze screenshot ligt een zet klaar die nog niet gespeeld is (het gele scorebolletje). "
+            "Wordfeud heeft die woorden dus nog niet goedgekeurd. Speel de zet of wis hem, "
+            "en maak daarna een nieuwe screenshot."
+        )
 
 
-def _tile_contact_sheet(board: Image.Image, coordinates: list[tuple[int, int]]) -> Image.Image:
-    """Enlarge detected tiles and label their coordinates for recovery OCR.
+class LooseTilesError(VisionExtractionError):
+    """Tiles that do not hang together with the rest of the board."""
 
-    A model can occasionally lose its place while counting a dense board.  The
-    board grid itself already gives us the exact occupied coordinates locally, so
-    this contact sheet turns a difficult 15x15 transcription into a sequence of
-    independently readable, labelled glyphs.  It is intentionally generated from
-    the same board crop that was used for tile detection.
-    """
-    if not coordinates:
-        raise ValueError("cannot create a contact sheet without tiles")
-
-    columns = 8
-    tile_size = 120
-    label_height = 22
-    gutter = 8
-    rows = (len(coordinates) + columns - 1) // columns
-    sheet = Image.new(
-        "RGB",
-        (columns * (tile_size + gutter) + gutter, rows * (tile_size + label_height + gutter) + gutter),
-        "white",
-    )
-    draw = ImageDraw.Draw(sheet)
-    width, height = board.size
-    for index, (row, col) in enumerate(coordinates):
-        left = int(col * width / 15)
-        top = int(row * height / 15)
-        right = max(left + 1, int((col + 1) * width / 15))
-        bottom = max(top + 1, int((row + 1) * height / 15))
-        tile = board.crop((left, top, right, bottom)).resize((tile_size, tile_size), Image.Resampling.LANCZOS)
-        x = gutter + (index % columns) * (tile_size + gutter)
-        y = gutter + (index // columns) * (tile_size + label_height + gutter)
-        sheet.paste(tile, (x, y))
-        draw.text((x, y + tile_size + 2), f"[{row},{col}]", fill="black")
-    return sheet
+    def __init__(self, count: int) -> None:
+        self.count = count
+        super().__init__(
+            f"Op deze screenshot liggen {count} tegel(s) los van de rest van het bord. "
+            "Zo'n stand kan Wordfeud niet accepteren, ook niet als het een bestaand woord vormt: "
+            "waarschijnlijk ligt er een zet klaar die nog niet gespeeld is. "
+            "Speel de zet of wis hem, en maak daarna een nieuwe screenshot."
+        )
 
 
-def _pixel_brightness(pixel: int | float | tuple[int, ...] | None) -> float:
-    if pixel is None:
-        raise TypeError("image pixel cannot be None")
-    if isinstance(pixel, tuple):
-        return sum(pixel[:3]) / 3
-    return float(pixel)
+class LowConfidenceError(VisionExtractionError):
+    """The model read the tiles but was not sure enough to trust it."""
+
+    def __init__(self, confidence: float) -> None:
+        self.confidence = confidence
+        super().__init__(
+            f"Het bord kon niet betrouwbaar worden uitgelezen: het vision-model is {confidence:.0f}% zeker "
+            f"en we gebruiken alleen resultaten vanaf {MINIMUM_CONFIDENCE:.0f}%. "
+            "Maak een scherpere, rechte screenshot van het volledige bord met rack en probeer opnieuw."
+        )
 
 
-def _rgb_pixel(image: Image.Image, coordinates: tuple[int, int]) -> tuple[int, int, int]:
-    pixel = image.getpixel(coordinates)
-    if not isinstance(pixel, tuple) or len(pixel) != 3:
+class BoardExtraction(NamedTuple):
+    """A trusted board plus the certainty the vision model reported for it."""
+
+    state: BoardState
+    confidence: float
+
+
+def _rgb_pixel(image: Image.Image, x: int, y: int) -> Rgb:
+    pixel = image.getpixel((min(x, image.size[0] - 1), min(y, image.size[1] - 1)))
+    if not isinstance(pixel, tuple) or len(pixel) < 3:
         raise TypeError("expected an RGB image")
-    return pixel
+    return (int(pixel[0]), int(pixel[1]), int(pixel[2]))
+
+
+def _brightness(pixel: Rgb) -> float:
+    return sum(pixel) / 3
 
 
 def _locate_board_top(image: Image.Image) -> int:
     """Locate the full-width square board from its repeating 15-column grid.
 
-    Wordfeud moves the board vertically when the phone aspect ratio, status bar,
-    or header changes.  A fixed percentage therefore shifts cells and bonuses
-    relative to each other.  Within the board, the 16 vertical grid boundaries
-    are consistently darker than the 15 cell centres, so a one-board-height
-    sliding window gives us a device-independent top coordinate.
+    Wordfeud moves the board vertically when the phone aspect ratio, status bar or
+    header changes, so a fixed percentage shifts cells and bonuses relative to each
+    other. Within the board the 16 vertical grid boundaries differ consistently from
+    the 15 cell centres — darker in the dark theme, lighter in the light one — so the
+    absolute difference gives a device- and theme-independent top coordinate.
     """
     width, height = image.size
     fallback = min(max(0, round(height * 0.296)), max(0, height - width))
     if height <= width or width < 200:
         return 0
 
+    boundary_x = [min(width - 1, round(index * width / BOARD_SIZE)) for index in range(BOARD_SIZE + 1)]
+    centre_x = [int((index + 0.5) * width / BOARD_SIZE) for index in range(BOARD_SIZE)]
     row_scores: list[float] = []
-    boundary_x = [min(width - 1, round(index * width / 15)) for index in range(16)]
-    centre_x = [int((index + 0.5) * width / 15) for index in range(15)]
     for y in range(height):
-        boundary_mean = sum(_pixel_brightness(image.getpixel((x, y))) for x in boundary_x) / len(boundary_x)
-        centre_mean = sum(_pixel_brightness(image.getpixel((x, y))) for x in centre_x) / len(centre_x)
-        row_scores.append(max(0.0, centre_mean - boundary_mean))
+        boundary = sum(_brightness(_rgb_pixel(image, x, y)) for x in boundary_x) / len(boundary_x)
+        centre = sum(_brightness(_rgb_pixel(image, x, y)) for x in centre_x) / len(centre_x)
+        row_scores.append(abs(centre - boundary))
 
     window_score = sum(row_scores[:width])
     best_score, best_top = window_score, 0
@@ -190,18 +202,14 @@ def _locate_board_top(image: Image.Image) -> int:
         if window_score > best_score:
             best_score, best_top = window_score, top
 
-    # Sparse synthetic images and unusual non-Wordfeud uploads do not contain
-    # enough repeated grid evidence; retain the previous safe fallback for them.
-    return best_top if best_score / width >= 8 else fallback
+    # Sparse synthetic images and unusual non-Wordfeud uploads do not contain enough
+    # repeated grid evidence; retain the safe fallback for them. Real screenshots
+    # score far above this in both themes.
+    return best_top if best_score / width >= 6 else fallback
 
 
 def _wordfeud_crop_images(image_path: str | Path) -> tuple[Image.Image, Image.Image]:
-    """Make the board and rack much larger and less ambiguous for the vision model.
-
-    Current Wordfeud portrait screenshots span the full screen width with a square
-    board, but its vertical position varies by device and header size. The original
-    image is used as a safe fallback for non-portrait images.
-    """
+    """Split a portrait screenshot into its square board and its rack band."""
     with Image.open(image_path) as source:
         image = source.convert("RGB")
     width, height = image.size
@@ -213,251 +221,283 @@ def _wordfeud_crop_images(image_path: str | Path) -> tuple[Image.Image, Image.Im
     return image.crop((0, board_top, width, board_bottom)), image.crop((0, rack_top, width, height))
 
 
-def wordfeud_crops(image_path: str | Path) -> tuple[str, str]:
-    """Return data URLs for the local board and rack crops used by the vision call."""
-    board, rack = _wordfeud_crop_images(image_path)
-    return _image_data_url(board), _image_data_url(rack)
+def _cell_colour(board: Image.Image, row: int, col: int) -> Rgb:
+    """The background colour of one cell, sampled away from its glyph and point value."""
+    width, height = board.size
+    samples = [
+        _rgb_pixel(board, int((col + x_fraction) * width / BOARD_SIZE), int((row + y_fraction) * height / BOARD_SIZE))
+        for y_fraction in (0.2, 0.8)
+        for x_fraction in (0.2, 0.8)
+    ]
+    return cast(Rgb, tuple(sorted(sample[channel] for sample in samples)[len(samples) // 2] for channel in range(3)))
 
 
-# RGB values sampled from the four Wordfeud bonus-square background colours.
-# We classify pixels near each cell's corners, where the label itself cannot obscure
-# the background. This reads the *visible* random layout; it never assumes a pattern.
-BONUS_BACKGROUND_RGB: dict[str, tuple[int, int, int]] = {
-    "DL": (106, 142, 78),
-    "TL": (29, 99, 150),
-    "DW": (206, 113, 10),
-    "TW": (152, 39, 45),
-}
+def _cell_colours(board: Image.Image) -> list[list[Rgb]]:
+    return [[_cell_colour(board, row, col) for col in range(BOARD_SIZE)] for row in range(BOARD_SIZE)]
+
+
+def _empty_cell_colour(colours: list[list[Rgb]]) -> Rgb:
+    """Learn this screenshot's own colour for a free square instead of assuming one.
+
+    Free squares carry a single flat colour and always outnumber every other kind of
+    square, so the most common cell colour identifies them in any theme. Calibrating
+    per screenshot is what makes the light and dark themes a single code path.
+    """
+    counter = Counter(tuple(channel // 8 for channel in colour) for row in colours for colour in row)
+    quantised, _ = counter.most_common(1)[0]
+    matches = [colour for row in colours for colour in row if tuple(c // 8 for c in colour) == quantised]
+    return cast(Rgb, tuple(sorted(colour[channel] for colour in matches)[len(matches) // 2] for channel in range(3)))
+
+
+def _colour_distance(first: Rgb, second: Rgb) -> float:
+    return sum((first[channel] - second[channel]) ** 2 for channel in range(3)) ** 0.5
+
+
+# A placed tile is always rendered as a near-white, cream or pastel square, so none of
+# its channels is dark. Every bonus colour has at least one substantially darker
+# channel. Measured across both themes the two groups sit far apart (tiles never below
+# 130, bonuses never above 80), which makes this a property of the app rather than a
+# value tuned to one board.
+TILE_MINIMUM_CHANNEL = 105
+# Ignore differences smaller than this: JPEG noise and the faint drop shadow along a
+# cell edge move a free square by a few units.
+EMPTY_COLOUR_TOLERANCE = 30.0
+
+
+def _is_tile_colour(colour: Rgb, empty_colour: Rgb) -> bool:
+    return min(colour) >= TILE_MINIMUM_CHANNEL and _colour_distance(colour, empty_colour) > EMPTY_COLOUR_TOLERANCE
+
+
+def detect_visible_tiles(image_path: str | Path) -> set[tuple[int, int]]:
+    """Find the coordinates of the tiles already on the board."""
+    board, _ = _wordfeud_crop_images(image_path)
+    colours = _cell_colours(board)
+    empty_colour = _empty_cell_colour(colours)
+    return {
+        (row, col)
+        for row in range(BOARD_SIZE)
+        for col in range(BOARD_SIZE)
+        if _is_tile_colour(colours[row][col], empty_colour)
+    }
+
+
+# Hue is what survives a theme change: the light theme brightens and saturates every
+# bonus colour but keeps its hue within a few degrees of the dark one.
+BONUS_HUES: dict[str, float] = {"DL": 95.0, "TL": 202.0, "DW": 33.0, "TW": 356.0}
+BONUS_MINIMUM_CHROMA = 45
+
+
+def _hue_degrees(colour: Rgb) -> float:
+    hue, _, _ = colorsys.rgb_to_hsv(*(channel / 255 for channel in colour))
+    return hue * 360
+
+
+def _hue_distance(first: float, second: float) -> float:
+    difference = abs(first - second) % 360
+    return min(difference, 360 - difference)
 
 
 def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
+    """Read the visible bonus squares by hue, without assuming a board layout."""
     board, _ = _wordfeud_crop_images(image_path)
-    width, height = board.size
+    colours = _cell_colours(board)
+    empty_colour = _empty_cell_colour(colours)
     bonuses: list[list[str]] = []
-    for row in range(15):
+    for row in range(BOARD_SIZE):
         result_row: list[str] = []
-        for col in range(15):
-            # Four interior-corner samples evade both bonus text and tile letters.
-            samples: list[tuple[int, int, int]] = []
-            for y_fraction in (0.15, 0.85):
-                for x_fraction in (0.15, 0.85):
-                    x = min(width - 1, int((col + x_fraction) * width / 15))
-                    y = min(height - 1, int((row + y_fraction) * height / 15))
-                    samples.append(_rgb_pixel(board, (x, y)))
-            channel_medians = [
-                sorted(sample[channel] for sample in samples)[len(samples) // 2]
-                for channel in range(3)
-            ]
-            rgb = (channel_medians[0], channel_medians[1], channel_medians[2])
+        for col in range(BOARD_SIZE):
+            colour = colours[row][col]
+            # A bonus hidden under a tile has already been consumed, and a free square
+            # is by definition not a bonus.
+            if max(colour) - min(colour) < BONUS_MINIMUM_CHROMA or _is_tile_colour(colour, empty_colour):
+                result_row.append("NORMAL")
+                continue
+            hue = _hue_degrees(colour)
             name, distance = min(
-                ((name, sum((rgb[channel] - reference[channel]) ** 2 for channel in range(3)))
-                 for name, reference in BONUS_BACKGROUND_RGB.items()),
+                ((name, _hue_distance(hue, reference)) for name, reference in BONUS_HUES.items()),
                 key=lambda item: item[1],
             )
-            # Unknown/white tile backgrounds are ordinary for scoring: bonuses under
-            # existing tiles have already been consumed.
-            result_row.append(name if distance < 4_500 else "NORMAL")
+            result_row.append(name if distance <= 25 else "NORMAL")
         bonuses.append(result_row)
     return bonuses
 
 
-def detect_visible_tiles(image_path: str | Path) -> set[tuple[int, int]]:
-    """Find the coordinates of the off-white tiles already on the board.
+# While a move is being composed, Wordfeud paints a saturated yellow score bubble on
+# the board. Its tiles are not submitted, so the words they form carry no approval —
+# a screenshot like that may neither be analysed nor learned from.
+#
+# Only the bubble counts: not the tiles lying next to it, not its position, and not
+# the number it shows. Both themes paint it in the same accent yellow (measured at
+# 254,221,23), while the pale yellow of a highlighted last move is far less saturated
+# and stays well clear of this.
+PENDING_HUE_RANGE = (40.0, 70.0)
+PENDING_MINIMUM_SATURATION = 0.85
+PENDING_MINIMUM_VALUE = 0.75
 
-    The language model is very good at reading the glyphs, but can occasionally
-    count a board row incorrectly.  Tile backgrounds are visually unambiguous,
-    so this inexpensive local check lets us align its transcription with the
-    actual 15 by 15 grid before any score is calculated.
+# While tiles are on the board but not submitted, Wordfeud replaces the neutral
+# Pas/Hussel buttons with a filled blue Speel button beside Wis. That accent blue
+# appears nowhere else below the rack, in either theme. It is the more reliable of the
+# two signals: an invalid placement shows no score bubble at all, but the buttons
+# always change.
+ACTION_BUTTON_HUE_RANGE = (195.0, 230.0)
+ACTION_BUTTON_MINIMUM_SATURATION = 0.6
+ACTION_BUTTON_MINIMUM_VALUE = 0.5
+BUTTON_BAND_TOP = 0.86
+
+
+def _matching_fraction(
+    image: Image.Image, hue_range: tuple[float, float], minimum_saturation: float, minimum_value: float, step: int
+) -> float:
+    """Which part of the sampled pixels sits in this hue range and is that vivid."""
+    width, height = image.size
+    pixels = image.load()
+    if pixels is None:
+        raise TypeError("could not read the image")
+    matches, total = 0, 0
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            total += 1
+            red, green, blue = cast(Rgb, pixels[x, y])[:3]
+            hue, saturation, value = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
+            if hue_range[0] <= hue * 360 <= hue_range[1] and saturation > minimum_saturation and value > minimum_value:
+                matches += 1
+    return matches / total if total else 0.0
+
+
+def detect_pending_move(image_path: str | Path) -> bool:
+    """Is a move being composed on this board, rather than played?
+
+    Either signal is enough: the blue action button below the rack, or the score
+    bubble on the board for a placement Wordfeud can already price. Neither depends on
+    where the tiles lie or on what the bubble says.
     """
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    width, height = image.size
+    step = max(1, width // 300)
+
+    band = image.crop((0, int(height * BUTTON_BAND_TOP), width, height))
+    button = _matching_fraction(
+        band, ACTION_BUTTON_HUE_RANGE, ACTION_BUTTON_MINIMUM_SATURATION, ACTION_BUTTON_MINIMUM_VALUE, step
+    )
+    if button > 0.005:
+        return True
+
     board, _ = _wordfeud_crop_images(image_path)
-    width, height = board.size
-    occupied: set[tuple[int, int]] = set()
-    for row in range(15):
-        for col in range(15):
-            # A spread of interior pixels avoids the letter and point glyphs.
-            # A placed tile can be off-white *or yellow* when Wordfeud marks a
-            # recent turn; all bonus colours have at least one substantially
-            # darker RGB channel. Six bright samples is deliberately
-            # conservative, so ordinary bonus squares never become tiles.
-            bright_samples = 0
-            for y_fraction in (0.18, 0.30, 0.70, 0.82):
-                for x_fraction in (0.18, 0.30, 0.70, 0.82):
-                    x = min(width - 1, int((col + x_fraction) * width / 15))
-                    y = min(height - 1, int((row + y_fraction) * height / 15))
-                    red, green, blue = _rgb_pixel(board, (x, y))
-                    if min(red, green, blue) > 120:
-                        bright_samples += 1
-            if bright_samples >= 6:
-                occupied.add((row, col))
-    return occupied
+    bubble = _matching_fraction(
+        board, PENDING_HUE_RANGE, PENDING_MINIMUM_SATURATION, PENDING_MINIMUM_VALUE, step
+    )
+    # An eighth of one cell, as a share of the whole board.
+    return bubble > 1 / (8 * BOARD_SIZE * BOARD_SIZE)
 
 
-def _align_compact_to_visible_tiles(
-    compact: CompactVisionState,
-    visible_tiles: set[tuple[int, int]],
-) -> CompactVisionState:
-    """Correct a small global row/column offset in a model transcription.
+def _disconnected_tiles(tiles: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Tiles that do not hang together with the centre square.
 
-    We only apply a shift when both the model's letters and the local tile
-    detector agree strongly. This prevents a sparse or partially obscured board
-    from being moved on weak evidence.
+    Wordfeud's opening move covers the centre and every later move must touch what is
+    already there, so a legal position is always one connected group. A second group
+    means tiles were dropped loose on the board — invalid even when they spell a real
+    word — or that we misread the screenshot. Neither may be analysed.
     """
-    model_tiles = {
-        (row, col)
-        for row, line in enumerate(compact.rows)
-        for col, char in enumerate(line)
-        if char != "."
-    }
-    if len(model_tiles) < 2 or len(visible_tiles) < 2:
-        return compact
-
-    def overlap(row_shift: int, col_shift: int) -> int:
-        return sum(
-            (row + row_shift, col + col_shift) in visible_tiles
-            for row, col in model_tiles
-            if 0 <= row + row_shift < 15 and 0 <= col + col_shift < 15
-        )
-
-    base_overlap = overlap(0, 0)
-    candidates = [
-        (overlap(row_shift, col_shift), row_shift, col_shift)
-        for row_shift in range(-2, 3)
-        for col_shift in range(-2, 3)
-    ]
-    best_overlap, row_shift, col_shift = max(candidates, key=lambda item: item[0])
-    enough_agreement = best_overlap >= 2 and best_overlap / len(model_tiles) >= 0.8
-    substantially_better = best_overlap >= base_overlap + 2
-    if (row_shift == 0 and col_shift == 0) or not enough_agreement or not substantially_better:
-        return compact
-
-    rows = [["."] * 15 for _ in range(15)]
-    for row, col in model_tiles:
-        new_row, new_col = row + row_shift, col + col_shift
-        if not (0 <= new_row < 15 and 0 <= new_col < 15):
-            return compact
-        rows[new_row][new_col] = compact.rows[row][col]
-    blanks = [(row + row_shift, col + col_shift) for row, col in compact.blanks]
-    return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=blanks)
+    if not tiles:
+        return set()
+    centre = (BOARD_SIZE // 2, BOARD_SIZE // 2)
+    if centre not in tiles:
+        return set(tiles)
+    connected = {centre}
+    frontier = [centre]
+    while frontier:
+        row, col = frontier.pop()
+        for neighbour in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if neighbour in tiles and neighbour not in connected:
+                connected.add(neighbour)
+                frontier.append(neighbour)
+    return tiles - connected
 
 
-def _model_tile_coordinates(compact: CompactVisionState) -> set[tuple[int, int]]:
+def _implausible_tiles(tiles: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Tiles without an orthogonal neighbour, which Wordfeud can never produce.
+
+    Every placed tile belongs to a word of at least two letters, so a lone square is
+    evidence that the detector misread the screenshot rather than a real position.
+    """
     return {
         (row, col)
-        for row, line in enumerate(compact.rows)
-        for col, char in enumerate(line)
-        if char != "."
+        for row, col in tiles
+        if not {(row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)} & tiles
     }
 
 
-def _repair_compact_with_visible_tiles(
-    compact: CompactVisionState,
-    visible_tiles: set[tuple[int, int]],
-    recovered_letters: str,
-) -> CompactVisionState:
-    """Replace only the locally proven missing tiles with isolated OCR results.
+TILE_STRIP_COLUMNS = 11
+TILE_STRIP_GAP = 6
 
-    The detector is deliberately used as a geometry oracle, never as OCR.  Model
-    letters at real coordinates are preserved, model hallucinations are discarded,
-    and the recovery response supplies exactly one glyph for each missing tile.
+
+def tile_strip(board: Image.Image, tiles: list[tuple[int, int]]) -> Image.Image:
+    """Lay every board tile out in one image, in the order we will read them back.
+
+    Imposing the order here is the whole point: the model never has to say *where* a
+    letter sits, so it can neither miscount a row nor return a coordinate that lands
+    on an empty square.
     """
-    model_tiles = _model_tile_coordinates(compact)
-    missing_tiles = sorted(visible_tiles - model_tiles)
-    if len(recovered_letters) != len(missing_tiles):
-        raise ValueError(
-            f"expected {len(missing_tiles)} recovered letters for visible tiles, got {len(recovered_letters)}"
+    width, height = board.size
+    cell_width, cell_height = width // BOARD_SIZE, height // BOARD_SIZE
+    columns = min(TILE_STRIP_COLUMNS, max(1, len(tiles)))
+    rows = (len(tiles) + columns - 1) // columns
+    strip = Image.new(
+        "RGB",
+        (columns * (cell_width + TILE_STRIP_GAP) + TILE_STRIP_GAP, rows * (cell_height + TILE_STRIP_GAP) + TILE_STRIP_GAP),
+        (16, 16, 16),
+    )
+    for index, (row, col) in enumerate(tiles):
+        left, top = int(col * width / BOARD_SIZE), int(row * height / BOARD_SIZE)
+        crop = board.crop((left, top, left + cell_width, top + cell_height))
+        strip.paste(
+            crop,
+            (
+                TILE_STRIP_GAP + (index % columns) * (cell_width + TILE_STRIP_GAP),
+                TILE_STRIP_GAP + (index // columns) * (cell_height + TILE_STRIP_GAP),
+            ),
         )
-    if any(len(letter) != 1 or not ("A" <= letter.upper() <= "Z") for letter in recovered_letters):
-        raise ValueError("recovered letters must be alphabetic")
-
-    rows = [["."] * 15 for _ in range(15)]
-    blanks: set[tuple[int, int]] = set()
-    old_blanks = set(compact.blanks)
-    for row, col in model_tiles & visible_tiles:
-        rows[row][col] = compact.rows[row][col]
-        if (row, col) in old_blanks:
-            blanks.add((row, col))
-    for (row, col), letter in zip(missing_tiles, recovered_letters):
-        rows[row][col] = letter.upper()
-        if letter.islower():
-            blanks.add((row, col))
-    return CompactVisionState(rows=["".join(row) for row in rows], rack=compact.rack, blanks=sorted(blanks))
+    return strip
 
 
-def _ordered_tiles_schema(letter_count: int, *, include_rack: bool) -> dict[str, JsonValue]:
-    """Build the small dynamic schema used when local geometry is known.
-
-    `minLength` plus `maxLength` makes the provider enforce the count before the
-    response reaches us.  This avoids the previous all-or-nothing failure mode in
-    which a 101-tile board was rejected because the model emitted 100 letters.
-    """
-    if letter_count < 0:
-        raise ValueError("letter_count cannot be negative")
-    properties: dict[str, JsonValue] = {
-        "letters": {
-            "type": "string",
-            "minLength": letter_count,
-            "maxLength": letter_count,
-            "pattern": f"^[A-Za-z]{{{letter_count}}}$" if letter_count else "^$",
-        },
-    }
-    required: list[JsonValue] = ["letters"]
-    if include_rack:
-        properties["rack"] = {
-            "type": "array",
-            "items": {"type": "string", "pattern": "^[A-Z?]$"},
-            "minItems": 1,
-            "maxItems": 7,
-        }
-        required.append("rack")
-    return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
-
-
-def _parse_ordered_tiles(content: object, letter_count: int, *, include_rack: bool) -> tuple[str, list[str] | None]:
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for part in cast(list[object], content):
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                text_parts.append(cast(str, part["text"]))
-        content = "".join(text_parts)
-    if not isinstance(content, str):
-        raise ValueError("model response had no JSON text")
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    payload = json.loads(content)
-    if not isinstance(payload, dict):
-        raise ValueError("ordered tile response was not a JSON object")
-    letters = payload.get("letters")
-    if (not isinstance(letters, str) or len(letters) != letter_count
-            or any(len(letter) != 1 or not ("A" <= letter.upper() <= "Z") for letter in letters)):
-        raise ValueError(f"expected exactly {letter_count} alphabetic recovered letters")
-    rack_value = payload.get("rack")
-    if include_rack:
-        try:
-            rack = CompactVisionState.model_validate({"rows": ["." * 15] * 15, "rack": rack_value}).rack
-        except ValidationError as exc:
-            raise ValueError(f"invalid recovered rack: {exc}") from exc
-        return letters, rack
-    return letters, None
+def tile_contact_sheet(board: Image.Image, tiles: list[tuple[int, int]]) -> Image.Image:
+    """Create an enlarged, numbered fallback image for dense-board OCR."""
+    if not tiles:
+        raise ValueError("a tile contact sheet needs at least one tile")
+    columns = 8
+    tile_size = max(120, board.size[0] // BOARD_SIZE * 3)
+    label_height = 24
+    gap = 8
+    rows = (len(tiles) + columns - 1) // columns
+    sheet = Image.new(
+        "RGB",
+        (columns * (tile_size + gap) + gap, rows * (tile_size + label_height + gap) + gap),
+        "white",
+    )
+    draw = ImageDraw.Draw(sheet)
+    width, height = board.size
+    for index, (row, col) in enumerate(tiles, start=1):
+        left = int(col * width / BOARD_SIZE)
+        top = int(row * height / BOARD_SIZE)
+        right = max(left + 1, int((col + 1) * width / BOARD_SIZE))
+        bottom = max(top + 1, int((row + 1) * height / BOARD_SIZE))
+        crop = board.crop((left, top, right, bottom)).resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+        x = gap + ((index - 1) % columns) * (tile_size + gap)
+        y = gap + ((index - 1) // columns) * (tile_size + label_height + gap)
+        sheet.paste(crop, (x, y))
+        draw.text((x, y + tile_size + 3), str(index), fill="black")
+    return sheet
 
 
-def _compact_from_ordered_tiles(
-    coordinates: list[tuple[int, int]],
-    letters: str,
-    rack: list[str],
-) -> CompactVisionState:
-    if len(coordinates) != len(letters):
-        raise ValueError("ordered tile coordinate and letter counts differ")
-    rows = [["."] * 15 for _ in range(15)]
-    blanks: list[tuple[int, int]] = []
-    for (row, col), letter in zip(coordinates, letters):
-        rows[row][col] = letter.upper()
-        if letter.islower():
-            blanks.append((row, col))
-    return CompactVisionState(rows=["".join(row) for row in rows], rack=rack, blanks=blanks)
+def _image_data_url(image: Image.Image) -> str:
+    """JPEG is substantially smaller than a PNG screenshot, without losing tile glyphs."""
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def _parse_content(content: object) -> CompactVisionState:
+def _parse_content(content: object) -> TileReading:
     if isinstance(content, list):
         text_parts: list[str] = []
         for part in cast(list[object], content):
@@ -472,7 +512,7 @@ def _parse_content(content: object) -> CompactVisionState:
     content = content.strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return CompactVisionState.model_validate(cast(object, json.loads(content)))
+    return TileReading.model_validate(cast(object, json.loads(content)))
 
 
 def _response_content(response: requests.Response) -> object:
@@ -494,49 +534,31 @@ def _response_content(response: requests.Response) -> object:
     return content
 
 
-def _vision_request(
-    *,
-    api_key: str,
-    model: str,
-    prompt: str,
-    images: list[str],
-    schema_name: str,
-    schema: dict[str, JsonValue],
-    timeout_seconds: int,
-) -> object:
-    payload: dict[str, JsonValue] = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": 2_000,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            *[{"type": "image_url", "image_url": {"url": image}} for image in images],
-        ]}],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-        },
-    }
-    response = requests.post(
-        OPENROUTER_URL,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=timeout_seconds,
-    )
-    response.raise_for_status()
-    return _response_content(response)
-
-
-def _to_board_state(compact: CompactVisionState, visible_bonuses: list[list[str]]) -> BoardState:
-    blanks = set(compact.blanks)
+def _to_board_state(
+    letters: list[str],
+    tiles: list[tuple[int, int]],
+    rack: list[str],
+    bonuses: list[list[str]],
+) -> BoardState:
+    """Put the letters back where we cut them from; a lowercase letter is a blank."""
+    placed = dict(zip(tiles, letters))
     return BoardState.model_validate({
         "grid": [[{
-            "letter": None if char == "." else char,
-            "bonus": "NORMAL" if char != "." else visible_bonuses[row][col],
-            "is_blank": (row, col) in blanks,
-        } for col, char in enumerate(line)] for row, line in enumerate(compact.rows)],
-        "rack": compact.rack,
+            "letter": placed[(row, col)].upper() if (row, col) in placed else None,
+            "bonus": "NORMAL" if (row, col) in placed else bonuses[row][col],
+            "is_blank": (row, col) in placed and placed[(row, col)].islower(),
+        } for col in range(BOARD_SIZE)] for row in range(BOARD_SIZE)],
+        "rack": rack,
     })
+
+
+def _short_reason(exc: Exception) -> str:
+    """Pydantic errors span several lines and repeat the payload; keep the gist."""
+    text = " ".join(str(exc).split())
+    marker = "Value error, "
+    if marker in text:
+        text = text.split(marker, 1)[1].split(" [type=", 1)[0]
+    return text if len(text) <= 300 else text[:299] + "…"
 
 
 def extract_board(
@@ -546,84 +568,90 @@ def extract_board(
     model: str | None = None,
     retries: int = 1,
     timeout_seconds: int = 45,
-) -> BoardState:
-    """Extract a board, using local tile geometry to recover count mistakes.
+) -> BoardExtraction:
+    """Extract and validate a board; retry answers that do not fit the tiles we cut.
 
-    The regular call remains cheap and compact.  If its layout disagrees with the
-    visible off-white tiles, only the missing tiles are re-read from an enlarged
-    contact sheet.  If a provider rejects the regular schema altogether, the final
-    fallback asks for a fixed-length sequence indexed by those same local tiles.
+    A reading the model itself rates below `MINIMUM_CONFIDENCE` is rejected instead of
+    retried: repeating the same unreadable screenshot only produces the same
+    uncertainty, so the user is asked for a better one.
     """
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
     model = model or os.environ.get("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
     if not api_key:
         raise VisionExtractionError("OPENROUTER_API_KEY ontbreekt. Zet hem in .env of Streamlit secrets.")
 
-    board, rack_crop = _wordfeud_crop_images(image_path)
-    board_image = _image_data_url(board)
-    rack_image = _image_data_url(rack_crop)
-    visible_bonuses = detect_visible_bonuses(image_path)
-    visible_tiles = detect_visible_tiles(image_path)
-    ordered_visible_tiles = sorted(visible_tiles)
+    if detect_pending_move(image_path):
+        raise PendingMoveError
+
+    board_image, rack_image = _wordfeud_crop_images(image_path)
+    tiles = sorted(detect_visible_tiles(image_path))
+    loose = _disconnected_tiles(set(tiles)) | _implausible_tiles(set(tiles))
+    if loose:
+        raise LooseTilesError(len(loose))
+    bonuses = detect_visible_bonuses(image_path)
+
+    images = [_image_data_url(rack_image)] if not tiles else [
+        _image_data_url(tile_strip(board_image, tiles)),
+        _image_data_url(rack_image),
+    ]
+    # The normal path is compact and economical.  A retry gets a materially clearer
+    # image instead of asking the model to count the same dense strip a second time.
+    recovery_images = images if not tiles else [
+        _image_data_url(tile_contact_sheet(board_image, tiles)),
+        _image_data_url(rack_image),
+    ]
+    base_prompt = RACK_ONLY_PROMPT if not tiles else EXTRACTION_PROMPT
+    prompt = base_prompt
     errors: list[str] = []
-    prompt = EXTRACTION_PROMPT
     for attempt in range(retries + 1):
         try:
-            compact = _parse_content(_vision_request(
-                api_key=api_key,
-                model=model,
-                prompt=prompt,
-                images=[board_image, rack_image],
-                schema_name="wordfeud_letters",
-                schema=COMPACT_BOARD_SCHEMA,
-                timeout_seconds=timeout_seconds,
-            ))
-            compact = _align_compact_to_visible_tiles(compact, visible_tiles)
-            missing_tiles = sorted(visible_tiles - _model_tile_coordinates(compact))
-            if missing_tiles:
-                coordinates = ", ".join(f"[{row},{col}]" for row, col in missing_tiles)
-                recovery_content = _vision_request(
-                    api_key=api_key,
-                    model=model,
-                    prompt=MISSING_TILES_PROMPT + f"\nCoordinates, in required order: {coordinates}",
-                    images=[board_image, _image_data_url(_tile_contact_sheet(board, missing_tiles))],
-                    schema_name="wordfeud_missing_tiles",
-                    schema=_ordered_tiles_schema(len(missing_tiles), include_rack=False),
-                    timeout_seconds=timeout_seconds,
+            payload: dict[str, JsonValue] = {
+                "model": model,
+                "temperature": 0,
+                "max_tokens": 2_000,
+                "messages": [{"role": "user", "content": cast(list[JsonValue], [
+                    {"type": "text", "text": prompt},
+                    *({"type": "image_url", "image_url": {"url": url}} for url in images),
+                ])}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "wordfeud_letters",
+                        "strict": True,
+                        "schema": _tile_reading_schema(len(tiles)),
+                    },
+                },
+            }
+            response = requests.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            reading = _parse_content(_response_content(response))
+            if len(reading.letters) != len(tiles):
+                raise ValueError(
+                    f"expected exactly {len(tiles)} letters, one per tile in the image, but received {len(reading.letters)}"
                 )
-                recovered_letters, _ = _parse_ordered_tiles(recovery_content, len(missing_tiles), include_rack=False)
-                compact = _repair_compact_with_visible_tiles(compact, visible_tiles, recovered_letters)
-            if _model_tile_coordinates(compact) != visible_tiles:
-                raise ValueError("model tile coordinates still disagree with the locally visible tiles")
-            return _to_board_state(compact, visible_bonuses)
+            if not reading.rack:
+                raise ValueError("the rack may not be empty")
+            if reading.confidence < MINIMUM_CONFIDENCE:
+                raise LowConfidenceError(reading.confidence)
+            return BoardExtraction(
+                _to_board_state(reading.letters, tiles, reading.rack, bonuses), reading.confidence
+            )
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
-            errors.append(f"poging {attempt + 1}: {exc}")
-            prompt = EXTRACTION_PROMPT + "\nYour previous answer was invalid. Return the full schema-valid JSON only."
-
-    # Provider-side schema rejection can leave us without a partial board to
-    # repair.  Fall back to a locally indexed sequence, so every detected tile
-    # has a required response slot and a 100/101 mismatch cannot strand the user.
-    try:
-        coordinates = ", ".join(f"[{row},{col}]" for row, col in ordered_visible_tiles)
-        fallback_images = [board_image, rack_image]
-        if ordered_visible_tiles:
-            fallback_images.append(_image_data_url(_tile_contact_sheet(board, ordered_visible_tiles)))
-        content = _vision_request(
-            api_key=api_key,
-            model=model,
-            prompt=ORDERED_TILES_PROMPT + f"\nCoordinates, in required order: {coordinates}",
-            images=fallback_images,
-            schema_name="wordfeud_ordered_tiles",
-            schema=_ordered_tiles_schema(len(ordered_visible_tiles), include_rack=True),
-            timeout_seconds=timeout_seconds,
-        )
-        letters, recovered_rack = _parse_ordered_tiles(content, len(ordered_visible_tiles), include_rack=True)
-        if recovered_rack is None:  # Defensive: include_rack above guarantees this.
-            raise ValueError("ordered tile recovery omitted the rack")
-        return _to_board_state(
-            _compact_from_ordered_tiles(ordered_visible_tiles, letters, recovered_rack),
-            visible_bonuses,
-        )
-    except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
-        errors.append(f"herstelpoging: {exc}")
-    raise VisionExtractionError("Vision-extractie faalde na retries: " + " | ".join(errors))
+            reason = _short_reason(exc)
+            errors.append(f"poging {attempt + 1}: {reason}")
+            # Naming the actual defect lets the model repair its answer. For a dense
+            # board the retry also swaps in enlarged, numbered tiles, so a repeated
+            # count failure does not simply re-run the same weak visual input.
+            retry_prompt = RACK_ONLY_PROMPT if not tiles else RECOVERY_PROMPT
+            prompt = f"{retry_prompt}\nYour previous answer was rejected: {reason}\nReturn schema-valid JSON only."
+            images = recovery_images
+    raise VisionExtractionError(
+        "Het bord kon niet worden uitgelezen; het vision-model gaf geen bruikbaar antwoord. "
+        "Probeer het opnieuw met een scherpe screenshot van het volledige bord. "
+        "(technisch: " + " | ".join(errors) + ")"
+    )

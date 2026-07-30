@@ -9,7 +9,14 @@ import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from wordfeud_analyzer.models import BoardState, Move
-from wordfeud_analyzer.move_generator import Gaddag, generate_moves, load_wordlist
+from wordfeud_analyzer.move_generator import (
+    DEFAULT_LEARNED_WORDS_PATH,
+    Gaddag,
+    board_words,
+    generate_moves,
+    learn_words,
+    load_wordlist,
+)
 from wordfeud_analyzer.vision import VisionExtractionError, extract_board
 
 st.set_page_config(page_title="Wordfeud Analyzer", page_icon="🔤", layout="wide")
@@ -19,6 +26,9 @@ BONUS_LABEL = {"NORMAL": "", "DL": "2L", "TL": "3L", "DW": "2W", "TW": "3W"}
 configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
 MAX_UPLOAD_BYTES = 1 * 1024 * 1024
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
+# Words seen on real boards are appended here. It lives outside the repository, next
+# to the word list on the server, and survives a deploy.
+LEARNED_WORDS = Path(os.getenv("WORDFEUD_LEARNED_WORDS_PATH", str(DEFAULT_LEARNED_WORDS_PATH)))
 
 
 def secret_or_env(name: str, default: str = "") -> str:
@@ -33,9 +43,43 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def get_lexicon(path: str) -> Gaddag:
-    """A minimized GADDAG is expensive to build once, but safe to reuse."""
-    return load_wordlist(path)
+def get_lexicon(path: str, learned_path: str, learned_signature: tuple[int, int]) -> Gaddag:
+    """A minimized GADDAG is expensive to build once, but safe to reuse.
+
+    `learned_signature` is part of the cache key on purpose: learning a word has to
+    produce a new lexicon, and leaving it out would silently serve the old one.
+    """
+    _ = learned_signature
+    return load_wordlist(path, learned_path)
+
+
+def learned_signature() -> tuple[int, int]:
+    try:
+        stat = LEARNED_WORDS.stat()
+    except OSError:
+        return (0, 0)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]]:
+    """Learn the words lying on this board, then return a lexicon that knows them.
+
+    Wordfeud only accepts a move its own dictionary allows, so whatever lies on the
+    board is legal by definition — even when OpenTaal does not list it.
+    """
+    lexicon = get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), learned_signature())
+    unknown = [word for word in board_words(state) if not lexicon.contains(word)]
+    if not unknown:
+        return lexicon, []
+    try:
+        added = learn_words(unknown, LEARNED_WORDS)
+    except OSError as error:
+        _ = st.warning(f"Nieuwe woorden konden niet worden bewaard ({error}). De suggesties kloppen wel.")
+        return lexicon, []
+    if not added:
+        return lexicon, []
+    with st.spinner(f"{len(added)} nieuw woord(en) geleerd; woordenlijst wordt opnieuw opgebouwd…"):
+        return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), learned_signature()), added
 
 
 def render_board(state: BoardState, move: Move | None = None) -> None:
@@ -73,6 +117,8 @@ _ = st.markdown("""
 """, unsafe_allow_html=True)
 
 _ = st.title("Wordfeud Analyzer")
+_ = st.caption("Vision leest alleen de letters van de tegels; positie, bonusvakken, woordvalidatie en scores zijn lokaal en deterministisch.")
+_ = st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
 api_key = secret_or_env("OPENROUTER_API_KEY")
 model = secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
@@ -82,7 +128,7 @@ if image and image.size > MAX_UPLOAD_BYTES:
     _ = st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
 elif image:
     _ = st.image(image, caption="Ingelezen screenshot", width=420)
-    if st.button("1. Lees bord uit", type="primary"):
+    if st.button("Lees bord uit en bereken top 6 zetten", type="primary"):
         if not api_key:
             _ = st.error("De OpenRouter API key is niet op de server geconfigureerd.")
         else:
@@ -90,39 +136,37 @@ elif image:
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
                 _ = temporary.write(image.getvalue())
                 image_path = temporary.name
+            st.session_state.pop("board_state", None)
+            st.session_state.pop("moves", None)
+            st.session_state.pop("confidence", None)
+            st.session_state.pop("learned", None)
             try:
                 with st.spinner("Bord en bonusvakken worden uitgelezen…"):
-                    state = extract_board(image_path, api_key=api_key, model=model)
-                st.session_state.board_json = state.model_dump_json(indent=2)
-                st.session_state.pop("board_state", None)
-                st.session_state.pop("moves", None)
-                st.session_state.wordlist_path = str(DEFAULT_WORDLIST)
+                    extraction = extract_board(image_path, api_key=api_key, model=model)
+                lexicon, learned = lexicon_including_played_words(extraction.state)
+                with st.spinner("Legale zetten worden volledig doorgerekend…"):
+                    moves = generate_moves(extraction.state, lexicon, limit=6)
+                st.session_state.board_state = extraction.state.model_dump()
+                st.session_state.moves = [move.model_dump() for move in moves]
+                st.session_state.confidence = extraction.confidence
+                st.session_state.learned = learned
             except VisionExtractionError as error:
                 _ = st.error(str(error))
+            except Exception as error:
+                _ = st.error(f"De zetten konden niet worden berekend: {error}")
             finally:
                 Path(image_path).unlink(missing_ok=True)
-
-if "board_json" in st.session_state:
-    _ = st.subheader("Controleer de extractie")
-    _ = st.caption("Vooral bij een random bord: controleer of ieder zichtbaar 2L/3L/2W/3W-vak op de juiste plek staat. Pas JSON zo nodig aan vóór de scoreberekening.")
-    _ = st.text_area("Gevalideerde borddata", key="board_json", height=340)
-    if st.button("2. Valideer en bereken top 6 zetten", type="primary"):
-        try:
-            state = BoardState.model_validate_json(st.session_state.board_json)
-            wordlist_path = str(cast(object, st.session_state.get("wordlist_path", str(DEFAULT_WORDLIST))))
-            with st.spinner("Legale zetten worden volledig doorgerekend…"):
-                lexicon = get_lexicon(wordlist_path)
-                st.session_state.board_state = state.model_dump()
-                st.session_state.moves = [move.model_dump() for move in generate_moves(state, lexicon, limit=6)]
-        except Exception as error:
-            _ = st.error(f"Borddata is niet geldig: {error}")
 
 if "board_state" in st.session_state:
     state = BoardState.model_validate(st.session_state.board_state)
     stored_moves = cast(list[object], st.session_state.get("moves", []))
     moves = [Move.model_validate(item) for item in stored_moves]
+    confidence = cast(float, st.session_state.get("confidence", 0.0))
     _ = st.subheader("Uitgelezen bord")
-    _ = st.caption("Rack: " + " ".join(state.rack))
+    _ = st.caption(f"Rack: {' '.join(state.rack)} · vision-model {confidence:.0f}% zeker van deze uitlezing")
+    learned = cast(list[str], st.session_state.get("learned", []))
+    if learned:
+        _ = st.caption("Nieuw geleerd van dit bord: " + ", ".join(sorted(learned)))
     render_board(state)
     _ = st.subheader("Suggesties")
     if not moves:
@@ -138,3 +182,5 @@ if "board_state" in st.session_state:
                     detail += " · bingo +40"
                 st.write(detail)
                 render_board(state, move)
+else:
+    _ = st.info("Upload een screenshot en voeg voor volledige resultaten de OpenTaal-woordenlijst toe.")
