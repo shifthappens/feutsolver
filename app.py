@@ -31,6 +31,12 @@ DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path
 LEARNED_WORDS = Path(os.getenv("WORDFEUD_LEARNED_WORDS_PATH", str(DEFAULT_LEARNED_WORDS_PATH)))
 
 
+def clear_analysis_state() -> None:
+    """Clear results when the step-1 upload changes or is removed."""
+    for key in ("board_state", "moves", "confidence", "learned", "processed_image_signature"):
+        st.session_state.pop(key, None)
+
+
 def secret_or_env(name: str, default: str = "") -> str:
     """Prefer an environment variable, then Streamlit's gitignored secrets.toml."""
     environment_value = os.getenv(name)
@@ -128,23 +134,27 @@ _ = st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if 
 api_key = secret_or_env("OPENROUTER_API_KEY")
 model = secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
 
-image = st.file_uploader("Upload een Wordfeud-screenshot", type=["png", "jpg", "jpeg", "webp"])
+image = st.file_uploader(
+    "Stap 1 — upload één Wordfeud-screenshot",
+    type=["png", "jpg", "jpeg", "webp"],
+    accept_multiple_files=False,
+    key="step1_image",
+    on_change=clear_analysis_state,
+)
 if image and image.size > MAX_UPLOAD_BYTES:
     _ = st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
 elif image:
     _ = st.image(image, caption="Ingelezen screenshot", width=420)
-    if st.button("Lees bord uit en bereken top 6 zetten", type="primary"):
+    image_signature = (str(image.name), image.size, str(getattr(image, "file_id", "")))
+    if st.session_state.get("processed_image_signature") != image_signature:
         if not api_key:
             _ = st.error("De OpenRouter API key is niet op de server geconfigureerd.")
         else:
+            st.session_state.processed_image_signature = image_signature
             suffix = Path(cast(str, image.name)).suffix or ".png"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
                 _ = temporary.write(image.getvalue())
                 image_path = temporary.name
-            st.session_state.pop("board_state", None)
-            st.session_state.pop("moves", None)
-            st.session_state.pop("confidence", None)
-            st.session_state.pop("learned", None)
             try:
                 with st.spinner("Bord en bonusvakken worden uitgelezen…"):
                     extraction = extract_board(image_path, api_key=api_key, model=model)
