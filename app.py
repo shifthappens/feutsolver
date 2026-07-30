@@ -78,7 +78,12 @@ def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]
         return lexicon, []
     if not added:
         return lexicon, []
-    with st.spinner(f"{len(added)} nieuw woord(en) geleerd; woordenlijst wordt opnieuw opgebouwd…"):
+    learned_message = (
+        f"{len(added)} nieuw woord geleerd"
+        if len(added) == 1
+        else f"{len(added)} nieuwe woorden geleerd"
+    )
+    with st.spinner(f"{learned_message}; woordenlijst wordt opnieuw opgebouwd…"):
         return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), learned_signature()), added
 
 
