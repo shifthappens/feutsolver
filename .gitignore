@@ -6,3 +6,4 @@ __pycache__/
 data/*.txt
 data/*.gaddag-cache-*
 !data/voorbeeld_woorden.txt
+!data/opentaal-wordlist.txt
