@@ -2,7 +2,7 @@
 
 Een Nederlandse Wordfeud-oplosser met twee strikt gescheiden onderdelen:
 
-1. `wordfeud_analyzer/vision.py` lost de geometrie lokaal en deterministisch op: waar het bord staat, welke vakken een tegel dragen en welke bonus elk vrij vak heeft. Die tegels worden uitgesneden en in een vaste volgorde in één afbeelding gezet; het beeldmodel krijgt precies één vraag, namelijk welke letter op elke tegel staat. Het hoeft dus nooit rijen te tellen, een raster op te vullen of een coördinaat terug te geven, waardoor positiefouten per constructie niet kunnen ontstaan.
+1. `wordfeud_analyzer/vision.py` lost de geometrie lokaal en deterministisch op: waar het bord staat, welke vakken een tegel dragen en welke bonus elk vrij vak heeft. Iedere uitgesneden tegel krijgt een stabiel nummer dat rechtstreeks aan zijn lokaal gevonden bordvak gekoppeld is. Het beeldmodel leest alleen de grote letter en de kleine puntwaarde. Een bezet bord wordt onafhankelijk in normale én omgekeerde tegelvolgorde gelezen; verschillen krijgen een derde, vergrote beslissende lezing. Daardoor kan een overgeslagen glyph niet meer alle volgende letters ongemerkt naar een ander vak schuiven.
 
    Tegel- en bonusherkenning ijken zichzelf per schermafbeelding op de meest voorkomende celkleur, en bonusvakken worden op tint geclassificeerd. Daardoor werken het donkere en het lichte thema via hetzelfde codepad, en zit er nergens een vaste bordindeling in.
 2. `wordfeud_analyzer/move_generator.py` gebruikt een compacte, geminimaliseerde GADDAG met anker-vakken en kruiswoordchecks. Hij genereert legale zetten en berekent punten, bonussen, blanco's en de 40-punten-bingo lokaal.
@@ -37,7 +37,7 @@ Onder de suggesties kun je een voorgesteld woord of bijbehorend kruiswoord instu
 
 Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Geef oplossingen weer`. Het beeldmodel geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere schermafbeelding. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
 
-Omdat wij de tegels zelf uitsnijden en op volgorde zetten, blijft er nog één foutmodus over: het model geeft een ander aantal letters terug dan er tegels zijn. Dat is één controle, en de retry noemt het verwachte aantal. Losse tegels zonder buur kan Wordfeud niet produceren; die worden als herkenningsfout gemeld vóór er een model aan te pas komt.
+De uitlezing controleert vier onafhankelijke eigenschappen voordat een bord wordt vervangen: alle lokaal gevonden tegel-ID's zijn exact eenmaal aanwezig, de letter past bij de afgedrukte Nederlandse Wordfeud-puntwaarde, de normale en omgekeerde lezing zijn gelijk en iedere gebruikte lezing haalt de zekerheidsgrens. Bij een verschil leest het model alleen de betwiste tegels opnieuw op groter formaat en geldt een tweederdemeerderheid. Blijft er onenigheid, dan wordt de upload geweigerd in plaats van een mogelijk verschoven bord te tonen. Losse tegels zonder buur kan Wordfeud niet produceren; die worden als herkenningsfout gemeld vóór er een model aan te pas komt.
 
 ## Starten
 
@@ -76,7 +76,7 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 
 - De schermafbeelding gaat alleen naar het gekozen beeldmodel. Bord, woordvalidatie en scores gaan niet naar een model.
 - Zet de sleutel in een omgevingsvariabele of Streamlit secrets, nooit in Git. `.env` staat in `.gitignore`.
-- De app vertrouwt op de uitlezing van het beeldmodel zodra dat zelf minstens 90% zeker is. Blijf het getoonde bord vergelijken met je schermafbeelding voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerd puntenaantal.
+- De app gebruikt een bezet bord pas wanneer twee onafhankelijke tegelvolgordes overeenkomen (of een derde lezing het verschil beslist) en iedere gebruikte lezing minstens 90% zekerheid meldt. Blijf het getoonde bord vergelijken met je schermafbeelding voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerd puntenaantal.
 
 ## Testen
 

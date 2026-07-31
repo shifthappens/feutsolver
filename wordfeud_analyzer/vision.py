@@ -30,16 +30,15 @@ JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dic
 BOARD_SIZE = 15
 Rgb: TypeAlias = tuple[int, int, int]
 
-EXTRACTION_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
+EXTRACTION_PROMPT = """You read letters from Wordfeud tile crops. Do not solve the game.
 
-The first image is a numbered contact sheet containing every tile that lies on the
-board. Each tile is in a fixed reading order: left to right, then on to the next
-line. Return one object for every tile, with its 1-based position in that contact
-sheet as `index` and its large printed glyph as `letter`. Never omit, merge,
-duplicate, or invent a tile. Before returning, check that the index set is exactly
-1, 2, 3, ... up to the number of tiles in the image. A missing index shifts every
-following letter onto the wrong board square, so an uncertain glyph must still keep
-its tile's index instead of being skipped.
+The first image is a contact sheet containing every tile that lies on the board.
+Each crop has a printed `#ID` directly above it. The ID, not the crop's position in
+the sheet, is the tile's identity. Return one object for every printed ID. Copy that
+ID into `index`, the large glyph into `letter`, and the small point value in the
+upper-right corner into `points`. A board blank has no printed point value: return
+its assigned glyph in lowercase and `points: 0`. Never renumber from reading
+order and never let an unclear crop move the following glyphs to different IDs.
 
 The second image is the player's rack. Return its letters from left to right.
 
@@ -63,16 +62,29 @@ left to right, leaving `tiles` empty.
 
 RECOVERY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
-The first image is a contact sheet of every placed board tile. The tiles are enlarged
-and numbered in reading order. Return one object per tile with the printed tile
-number as `index` and the large glyph as `letter`. Do not skip, merge, duplicate, or
-invent a tile; the indexes must be exactly the numbers shown in the image. Check the
-complete index set before returning. The second image is the player's rack; return
-its letters from left to right.
+The first image contains enlarged board-tile crops. Each crop has a printed `#ID`.
+Return one object per crop with that exact ID as `index`, its large glyph as `letter`,
+and its small upper-right point value as `points`. IDs can be non-contiguous and the
+crops may be deliberately shuffled, so never renumber them from their image order.
+Do not skip, merge, duplicate, or invent a crop. The second image is the player's
+rack; return its letters from left to right.
 
 - Read only the large glyph; a small number is its point value.
 - Return a blank tile's assigned letter in lowercase, and an unassigned rack blank as `?`.
+- A board blank has no point value; return `points: 0` for it.
 - `confidence` is your honest certainty, 0-100, that every returned letter matches.
+"""
+
+VERIFICATION_PROMPT = """Independently verify Wordfeud tile OCR. Do not solve the game and do not rely on
+an earlier reading. The board crops in the first image are deliberately shuffled.
+Use only the printed `#ID` above each crop as its identity. For every crop return that
+ID as `index`, its large glyph as `letter`, and its small upper-right value as
+`points`. A board blank has no value: use a lowercase glyph and `points: 0`.
+Return the rack in the second image from left to right. Never renumber by image order.
+"""
+
+RACK_RECOVERY_PROMPT = """Independently read only the seven-or-fewer Wordfeud rack tiles in this image,
+from left to right. Leave `tiles` empty. Use `?` for an unassigned blank.
 """
 
 JSON_OUTPUT_INSTRUCTION = """Return compact JSON only: no markdown fences, explanation, or comments. Keep each
@@ -86,6 +98,7 @@ class IndexedTileReading(BaseModel):
 
     index: int = Field(..., ge=1, le=BOARD_SIZE * BOARD_SIZE)
     letter: str = Field(..., min_length=1, max_length=1, pattern=r"^[A-Za-z]$")
+    points: int = Field(..., ge=0, le=10)
 
     @field_validator("letter", mode="before")
     @classmethod
@@ -144,6 +157,16 @@ def _tile_reading_schema(expected_tiles: int) -> dict[str, JsonValue]:
 # misread board produces confident but wrong scores, which is worse than telling
 # the user to upload a better screenshot.
 MINIMUM_CONFIDENCE = 90.0
+
+# Dutch Wordfeud values are printed on every non-blank tile. They are a second,
+# independent OCR invariant: a shifted `W` (5) can never silently occupy a crop that
+# visibly carries the 2 belonging to `U`.
+DUTCH_TILE_POINTS: dict[str, int] = {
+    "A": 1, "B": 4, "C": 5, "D": 2, "E": 1, "F": 4, "G": 3,
+    "H": 4, "I": 2, "J": 4, "K": 3, "L": 3, "M": 3, "N": 1,
+    "O": 1, "P": 4, "Q": 10, "R": 2, "S": 2, "T": 2, "U": 2,
+    "V": 4, "W": 5, "X": 8, "Y": 8, "Z": 5,
+}
 
 
 class VisionExtractionError(RuntimeError):
@@ -496,12 +519,17 @@ def tile_contact_sheet(
     board: Image.Image,
     tiles: list[tuple[int, int]],
     *,
+    indexes: list[int] | None = None,
     columns: int = 8,
     scale: int = 3,
 ) -> Image.Image:
-    """Create an enlarged, clearly numbered image for indexed-board OCR."""
+    """Create an enlarged sheet whose labels remain stable when crops are shuffled."""
     if not tiles:
         raise ValueError("a tile contact sheet needs at least one tile")
+    if indexes is None:
+        indexes = list(range(1, len(tiles) + 1))
+    if len(indexes) != len(tiles) or len(set(indexes)) != len(indexes):
+        raise ValueError("tile contact-sheet indexes must be unique and match the tiles")
     columns = max(1, columns)
     tile_size = max(120, board.size[0] // BOARD_SIZE * scale)
     label_height = max(36, tile_size // 6)
@@ -518,15 +546,15 @@ def tile_contact_sheet(
     except OSError:
         label_font = ImageFont.load_default()
     width, height = board.size
-    for index, (row, col) in enumerate(tiles, start=1):
+    for position, ((row, col), tile_index) in enumerate(zip(tiles, indexes), start=1):
         left = int(col * width / BOARD_SIZE)
         top = int(row * height / BOARD_SIZE)
         right = max(left + 1, int((col + 1) * width / BOARD_SIZE))
         bottom = max(top + 1, int((row + 1) * height / BOARD_SIZE))
         crop = board.crop((left, top, right, bottom)).resize((tile_size, tile_size), Image.Resampling.LANCZOS)
-        x = gap + ((index - 1) % columns) * (tile_size + gap)
-        y = gap + ((index - 1) // columns) * (tile_size + label_height + gap)
-        draw.text((x + 6, y + 3), f"#{index}", fill="black", font=label_font)
+        x = gap + ((position - 1) % columns) * (tile_size + gap)
+        y = gap + ((position - 1) // columns) * (tile_size + label_height + gap)
+        draw.text((x + 6, y + 3), f"#{tile_index}", fill="black", font=label_font)
         sheet.paste(crop, (x, y + label_height))
     return sheet
 
@@ -675,16 +703,16 @@ def _response_content(response: requests.Response) -> object:
     return content
 
 
-def _ordered_tile_letters(reading: TileReading, expected_tiles: int) -> list[str]:
-    """Reject omissions and duplicates before any letter can shift position."""
+def _tile_letters_by_index(reading: TileReading, expected_indexes: list[int]) -> dict[int, str]:
+    """Validate stable IDs and printed values before any glyph reaches the board."""
     indexes = [tile.index for tile in reading.tiles]
     counts = Counter(indexes)
-    expected = set(range(1, expected_tiles + 1))
+    expected = set(expected_indexes)
     actual = set(indexes)
     duplicates = sorted(index for index, count in counts.items() if count > 1)
     missing = sorted(expected - actual)
     unexpected = sorted(actual - expected)
-    if len(indexes) != expected_tiles or duplicates or missing or unexpected:
+    if len(indexes) != len(expected_indexes) or duplicates or missing or unexpected:
         details: list[str] = []
         if missing:
             details.append("missing " + ", ".join(map(str, missing)))
@@ -693,10 +721,36 @@ def _ordered_tile_letters(reading: TileReading, expected_tiles: int) -> list[str
         if unexpected:
             details.append("unexpected " + ", ".join(map(str, unexpected)))
         suffix = "; " + "; ".join(details) if details else ""
-        raise ValueError(
-            f"expected exactly {expected_tiles} indexed tile readings with indexes 1..{expected_tiles}{suffix}"
+        description = (
+            f"1..{len(expected_indexes)}"
+            if expected_indexes == list(range(1, len(expected_indexes) + 1))
+            else ",".join(map(str, expected_indexes))
         )
-    return [next(tile.letter for tile in reading.tiles if tile.index == index) for index in range(1, expected_tiles + 1)]
+        raise ValueError(
+            f"expected exactly {len(expected_indexes)} indexed tile readings with indexes {description}{suffix}"
+        )
+
+    letters: dict[int, str] = {}
+    for tile in reading.tiles:
+        if tile.letter.islower():
+            if tile.points != 0:
+                raise ValueError(f"tile {tile.index} is a blank but returned printed points {tile.points}")
+        else:
+            expected_points = DUTCH_TILE_POINTS[tile.letter.upper()]
+            if tile.points != expected_points:
+                raise ValueError(
+                    f"tile {tile.index} returned {tile.letter} with {tile.points} points; "
+                    f"Dutch Wordfeud prints {expected_points}"
+                )
+        letters[tile.index] = tile.letter
+    return letters
+
+
+def _ordered_tile_letters(reading: TileReading, expected_tiles: int) -> list[str]:
+    """Compatibility view for a normal 1..N contact sheet."""
+    expected_indexes = list(range(1, expected_tiles + 1))
+    letters = _tile_letters_by_index(reading, expected_indexes)
+    return [letters[index] for index in expected_indexes]
 
 
 def _to_board_state(
@@ -733,6 +787,69 @@ def _short_reason(exc: Exception) -> str:
     return text if len(text) <= 300 else text[:299] + "…"
 
 
+def _request_reading(
+    *,
+    api_key: str,
+    model: str,
+    prompt: str,
+    images: list[str],
+    expected_indexes: list[int],
+    timeout_seconds: int,
+) -> tuple[TileReading, dict[int, str]]:
+    """Run one OCR pass and validate identities, count, values, and confidence."""
+    payload: dict[str, JsonValue] = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": _max_response_tokens(len(expected_indexes)),
+        "messages": [{"role": "user", "content": cast(list[JsonValue], [
+            {"type": "text", "text": prompt},
+            *({"type": "image_url", "image_url": {"url": url}} for url in images),
+        ])}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "wordfeud_letters",
+                "strict": True,
+                "schema": _tile_reading_schema(len(expected_indexes)),
+            },
+        },
+    }
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    reading = _parse_content(_response_content(response))
+    letters = _tile_letters_by_index(reading, expected_indexes)
+    if reading.confidence < MINIMUM_CONFIDENCE:
+        raise LowConfidenceError(reading.confidence)
+    return reading, letters
+
+
+def _majority(left: object, right: object, deciding: object) -> object:
+    """Return a two-out-of-three value, refusing an unresolved disagreement."""
+    if left == right or left == deciding:
+        return left
+    if right == deciding:
+        return right
+    raise ValueError("three independent OCR readings disagree")
+
+
+def _outside_in(values: list[int]) -> list[int]:
+    """A deterministic third order that is neither forward nor reverse."""
+    result: list[int] = []
+    left, right = 0, len(values) - 1
+    while left <= right:
+        result.append(values[left])
+        if left != right:
+            result.append(values[right])
+        left += 1
+        right -= 1
+    return result
+
+
 def extract_board(
     image_path: str | Path,
     *,
@@ -762,71 +879,129 @@ def extract_board(
         raise LooseTilesError(len(loose))
     bonuses = detect_visible_bonuses(image_path)
 
-    images = [_image_data_url(rack_image)] if not tiles else [
-        _image_data_url(tile_contact_sheet(board_image, tiles)),
-        _image_data_url(rack_image),
-    ]
-    # The normal path uses numbered crops. A retry gets a materially clearer, larger
-    # image instead of asking the model to count the same dense contact sheet again.
-    recovery_images = images if not tiles else [
-        _image_data_url(tile_contact_sheet(board_image, tiles, columns=6, scale=4)),
-        _image_data_url(rack_image),
-    ]
+    rack_url = _image_data_url(rack_image)
+    indexes = list(range(1, len(tiles) + 1))
     base_prompt = RACK_ONLY_PROMPT if not tiles else EXTRACTION_PROMPT
-    prompt = (
-        f"{base_prompt}\nThere are exactly {len(tiles)} placed board tiles in the first image.\n"
-        f"{JSON_OUTPUT_INSTRUCTION}"
-    )
+    prompt = f"{base_prompt}\nThere are exactly {len(tiles)} board tiles.\n{JSON_OUTPUT_INSTRUCTION}"
     errors: list[str] = []
-    for attempt in range(retries + 1):
+
+    # An empty board has no positional mapping to verify; retain the single cheap rack
+    # pass. Occupied boards are read twice from opposite crop orders. A sequence shift
+    # therefore attaches to different stable IDs and becomes observable.
+    if not tiles:
         try:
-            # A full board can contain 225 indexed objects. 2,000 output tokens is
-            # enough for a small test board but can truncate a real screenshot before
-            # the closing braces, which then looks like a JSON syntax error.
-            max_tokens = _max_response_tokens(len(tiles))
-            payload: dict[str, JsonValue] = {
-                "model": model,
-                "temperature": 0,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": cast(list[JsonValue], [
-                    {"type": "text", "text": prompt},
-                    *({"type": "image_url", "image_url": {"url": url}} for url in images),
-                ])}],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "wordfeud_letters",
-                        "strict": True,
-                        "schema": _tile_reading_schema(len(tiles)),
-                    },
-                },
-            }
-            response = requests.post(
-                OPENROUTER_URL,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=timeout_seconds,
+            reading, _ = _request_reading(
+                api_key=api_key, model=model, prompt=prompt, images=[rack_url],
+                expected_indexes=[], timeout_seconds=timeout_seconds,
             )
-            response.raise_for_status()
-            reading = _parse_content(_response_content(response))
-            letters = _ordered_tile_letters(reading, len(tiles))
-            if reading.confidence < MINIMUM_CONFIDENCE:
-                raise LowConfidenceError(reading.confidence)
-            return BoardExtraction(
-                _to_board_state(letters, tiles, reading.rack, bonuses), reading.confidence
-            )
+            return BoardExtraction(_to_board_state([], [], reading.rack, bonuses), reading.confidence)
+        except LowConfidenceError:
+            raise
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
-            reason = _short_reason(exc)
-            errors.append(f"poging {attempt + 1}: {reason}")
-            # Naming the actual defect lets the model repair its answer. For a dense
-            # board the retry also swaps in enlarged, numbered tiles, so a repeated
-            # count failure does not simply re-run the same weak visual input.
-            retry_prompt = RACK_ONLY_PROMPT if not tiles else RECOVERY_PROMPT
-            prompt = (
-                f"{retry_prompt}\nYour previous answer was rejected: {reason}\n"
-                f"Return schema-valid JSON only.\n{JSON_OUTPUT_INSTRUCTION}"
+            errors.append("rek: " + _short_reason(exc))
+            raise VisionExtractionError(
+                "Het bord kon niet worden uitgelezen; het beeldmodel gaf geen bruikbaar antwoord. "
+                "Probeer het opnieuw met een scherpe schermafbeelding van het volledige bord. "
+                "(technisch: " + " | ".join(errors) + ")"
+            ) from exc
+
+    primary_images = [_image_data_url(tile_contact_sheet(board_image, tiles, indexes=indexes)), rack_url]
+    reversed_tiles = list(reversed(tiles))
+    reversed_indexes = list(reversed(indexes))
+    verification_images = [
+        _image_data_url(tile_contact_sheet(board_image, reversed_tiles, indexes=reversed_indexes)),
+        rack_url,
+    ]
+    passes: list[tuple[TileReading, dict[int, str]] | None] = []
+    for pass_name, pass_prompt, pass_images in (
+        ("eerste lezing", prompt, primary_images),
+        (
+            "controlelezing",
+            f"{VERIFICATION_PROMPT}\nThe printed IDs are exactly 1 through {len(tiles)}.\n{JSON_OUTPUT_INSTRUCTION}",
+            verification_images,
+        ),
+    ):
+        try:
+            passes.append(_request_reading(
+                api_key=api_key, model=model, prompt=pass_prompt, images=pass_images,
+                expected_indexes=indexes, timeout_seconds=timeout_seconds,
+            ))
+        except LowConfidenceError:
+            raise
+        except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+            errors.append(f"{pass_name}: {_short_reason(exc)}")
+            passes.append(None)
+
+    primary, verification = passes
+    if primary is not None and verification is not None:
+        first_reading, first_letters = primary
+        second_reading, second_letters = verification
+        mismatches = [index for index in indexes if first_letters[index] != second_letters[index]]
+        rack_mismatch = first_reading.rack != second_reading.rack
+        if not mismatches and not rack_mismatch:
+            letters = [first_letters[index] for index in indexes]
+            confidence = min(first_reading.confidence, second_reading.confidence)
+            return BoardExtraction(_to_board_state(letters, tiles, first_reading.rack, bonuses), confidence)
+    else:
+        mismatches = indexes
+        rack_mismatch = True
+
+    if retries > 0 and (primary is not None or verification is not None):
+        target_indexes = mismatches
+        if target_indexes:
+            deciding_order = _outside_in(target_indexes)
+            target_tiles = [tiles[index - 1] for index in deciding_order]
+            recovery_images = [
+                _image_data_url(tile_contact_sheet(
+                    board_image, target_tiles, indexes=deciding_order, columns=6, scale=4
+                )),
+                rack_url,
+            ]
+            recovery_prompt = (
+                f"{RECOVERY_PROMPT}\nThe exact printed IDs to return are: "
+                f"{', '.join(map(str, target_indexes))}.\n{JSON_OUTPUT_INSTRUCTION}"
             )
-            images = recovery_images
+        else:
+            recovery_images = [rack_url]
+            recovery_prompt = f"{RACK_RECOVERY_PROMPT}\n{JSON_OUTPUT_INSTRUCTION}"
+        try:
+            deciding_reading, deciding_letters = _request_reading(
+                api_key=api_key, model=model, prompt=recovery_prompt, images=recovery_images,
+                expected_indexes=target_indexes, timeout_seconds=timeout_seconds,
+            )
+            known = primary if primary is not None else verification
+            assert known is not None
+            known_reading, known_letters = known
+            if primary is None or verification is None:
+                if any(known_letters[index] != deciding_letters[index] for index in indexes):
+                    raise ValueError("the full recovery reading disagrees with the only valid OCR pass")
+                if known_reading.rack != deciding_reading.rack:
+                    raise ValueError("the rack recovery disagrees with the only valid OCR pass")
+                confidence = min(known_reading.confidence, deciding_reading.confidence)
+                letters = [known_letters[index] for index in indexes]
+                return BoardExtraction(_to_board_state(letters, tiles, known_reading.rack, bonuses), confidence)
+
+            first_reading, first_letters = primary
+            second_reading, second_letters = verification
+            resolved = dict(first_letters)
+            for index in mismatches:
+                resolved[index] = cast(str, _majority(
+                    first_letters[index], second_letters[index], deciding_letters[index]
+                ))
+            rack = cast(list[str], _majority(first_reading.rack, second_reading.rack, deciding_reading.rack))
+            confidence = min(first_reading.confidence, second_reading.confidence, deciding_reading.confidence)
+            letters = [resolved[index] for index in indexes]
+            return BoardExtraction(_to_board_state(letters, tiles, rack, bonuses), confidence)
+        except LowConfidenceError:
+            raise
+        except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+            errors.append("beslissende lezing: " + _short_reason(exc))
+
+    if primary is not None and verification is not None:
+        errors.append(
+            f"de twee onafhankelijke lezingen verschillen op {len(mismatches)} tegel(s)"
+            + (" en op het rek" if rack_mismatch else "")
+        )
     raise VisionExtractionError(
         "Het bord kon niet worden uitgelezen; het beeldmodel gaf geen bruikbaar antwoord. "
         "Probeer het opnieuw met een scherpe schermafbeelding van het volledige bord. "

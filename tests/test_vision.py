@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
     BOARD_SIZE,
+    DUTCH_TILE_POINTS,
     MINIMUM_CONFIDENCE,
     LooseTilesError,
     LowConfidenceError,
@@ -18,6 +19,7 @@ from wordfeud_analyzer.vision import (
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _max_response_tokens,  # pyright: ignore[reportPrivateUsage]
+    _outside_in,  # pyright: ignore[reportPrivateUsage]
     _parse_content,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     _wordfeud_crop_images,  # pyright: ignore[reportPrivateUsage]
@@ -150,6 +152,10 @@ def test_recovery_sheet_enlarges_and_numbers_a_dense_tile_sequence(tmp_path: Pat
     assert sheet.height > 140
 
 
+def test_deciding_crop_order_is_neither_forward_nor_reverse() -> None:
+    assert _outside_in([1, 2, 3, 4, 5, 6]) == [1, 6, 2, 5, 3, 4]
+
+
 def test_letters_are_written_back_to_the_squares_they_were_cut_from() -> None:
     tiles = [(7, 7), (7, 8), (8, 8)]
     bonuses = [["NORMAL"] * BOARD_SIZE for _ in range(BOARD_SIZE)]
@@ -177,15 +183,18 @@ def test_a_short_letter_list_cannot_silently_shift_the_rest_of_the_board() -> No
 def test_indexed_tile_readings_must_hold_single_letters() -> None:
     with pytest.raises(ValidationError):
         _ = TileReading.model_validate(
-            {"tiles": [{"index": 1, "letter": "AB"}], "rack": ["A"], "confidence": 95}
+            {"tiles": [{"index": 1, "letter": "AB", "points": 1}], "rack": ["A"], "confidence": 95}
         )
     with pytest.raises(ValidationError):
         _ = TileReading.model_validate(
-            {"tiles": [{"index": 1, "letter": "4"}], "rack": ["A"], "confidence": 95}
+            {"tiles": [{"index": 1, "letter": "4", "points": 1}], "rack": ["A"], "confidence": 95}
         )
     reading = TileReading.model_validate(
         {
-            "tiles": [{"index": 1, "letter": "A"}, {"index": 2, "letter": "b"}],
+            "tiles": [
+                {"index": 1, "letter": "A", "points": 1},
+                {"index": 2, "letter": "b", "points": 0},
+            ],
             "rack": ["a", "?"],
             "confidence": 95,
         }
@@ -198,9 +207,9 @@ def test_indexed_tile_readings_are_sorted_by_their_printed_index() -> None:
     reading = TileReading.model_validate(
         {
             "tiles": [
-                {"index": 2, "letter": "A"},
-                {"index": 1, "letter": "K"},
-                {"index": 3, "letter": "T"},
+                {"index": 2, "letter": "A", "points": 1},
+                {"index": 1, "letter": "K", "points": 3},
+                {"index": 3, "letter": "T", "points": 2},
             ],
             "rack": [],
             "confidence": 95,
@@ -213,7 +222,7 @@ def test_model_json_with_fences_and_trailing_commas_is_recovered() -> None:
     reading = _parse_content(
         """Here is the result:
 ```json
-{"tiles": [{"index": 1, "letter": "K",},], "rack": ["R",], "confidence": 95,}
+{"tiles": [{"index": 1, "letter": "K", "points": 3,},], "rack": ["R",], "confidence": 95,}
 ```
 """
     )
@@ -260,11 +269,21 @@ def _sent_images(call: dict[str, Any]) -> int:
     return sum(1 for part in call["json"]["messages"][0]["content"] if part["type"] == "image_url")
 
 
-def _tile_payload(letters: str | list[str], rack: list[str], confidence: float) -> dict[str, Any]:
+def _tile_payload(
+    letters: str | list[str],
+    rack: list[str],
+    confidence: float,
+    indexes: list[int] | None = None,
+) -> dict[str, Any]:
+    indexes = indexes or list(range(1, len(letters) + 1))
     return {
         "tiles": [
-            {"index": index, "letter": letter}
-            for index, letter in enumerate(letters, start=1)
+            {
+                "index": index,
+                "letter": letter,
+                "points": 0 if letter.islower() else DUTCH_TILE_POINTS[letter.upper()],
+            }
+            for index, letter in zip(indexes, letters)
         ],
         "rack": rack,
         "confidence": confidence,
@@ -281,8 +300,8 @@ def test_a_confident_reading_becomes_a_board(tmp_path: Path, monkeypatch: pytest
     assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "A", "T"]
     assert extraction.state.grid[7][9].is_blank
     assert extraction.state.rack == ["R", "E"]
-    assert len(calls) == 1
-    assert _sent_images(calls[0]) == 2
+    assert len(calls) == 2
+    assert all(_sent_images(call) == 2 for call in calls)
 
 
 def test_an_uncertain_reading_is_rejected_instead_of_retried(
@@ -313,10 +332,9 @@ def test_a_wrong_number_of_letters_is_retried_with_the_expected_count(
     extraction = extract_board(path, api_key="test-key")
 
     assert extraction.state.grid[7][9].letter == "T"
-    assert len(calls) == 2
-    assert "rejected" not in _sent_prompt(calls[0])
-    assert "expected exactly 3 indexed tile readings" in _sent_prompt(calls[1])
-    assert "contact sheet" in _sent_prompt(calls[1])
+    assert len(calls) == 3
+    assert "deliberately shuffled" in _sent_prompt(calls[1])
+    assert "exact printed IDs" in _sent_prompt(calls[2])
     for call in calls:
         tiles_schema = call["json"]["response_format"]["json_schema"]["schema"]["properties"]["tiles"]
         assert tiles_schema["minItems"] == tiles_schema["maxItems"] == 3
@@ -330,9 +348,9 @@ def test_a_missing_tile_index_is_retried_instead_of_shifting_following_letters(
         monkeypatch,
         {
             "tiles": [
-                {"index": 1, "letter": "K"},
-                {"index": 2, "letter": "A"},
-                {"index": 4, "letter": "T"},
+                {"index": 1, "letter": "K", "points": 3},
+                {"index": 2, "letter": "A", "points": 1},
+                {"index": 4, "letter": "T", "points": 2},
             ],
             "rack": ["R"],
             "confidence": 96,
@@ -343,8 +361,67 @@ def test_a_missing_tile_index_is_retried_instead_of_shifting_following_letters(
     extraction = extract_board(path, api_key="test-key")
 
     assert extraction.state.grid[7][9].letter == "T"
-    assert len(calls) == 2
-    assert "missing 3" in _sent_prompt(calls[1])
+    assert len(calls) == 3
+    assert "1, 2, 3" in _sent_prompt(calls[2])
+
+
+def test_disagreeing_crop_orders_are_resolved_without_shifting_the_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full, confidently numbered but shifted answer was the production regression."""
+    path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
+    calls = _stub_openrouter(
+        monkeypatch,
+        _tile_payload("ATK", ["R"], 97),  # every index exists, but glyphs sit on the wrong IDs
+        _tile_payload("KAT", ["R"], 96),  # independent reverse-order reading
+        _tile_payload("KAT", ["R"], 98),  # enlarged deciding crops
+    )
+
+    extraction = extract_board(path, api_key="test-key")
+
+    assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "A", "T"]
+    assert extraction.confidence == 96
+    assert len(calls) == 3
+    assert "exact printed IDs" in _sent_prompt(calls[2])
+
+
+def test_only_disputed_non_contiguous_ids_are_read_a_third_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
+    calls = _stub_openrouter(
+        monkeypatch,
+        _tile_payload("KET", ["R"], 97),
+        _tile_payload("KAT", ["R"], 96),
+        _tile_payload("A", ["R"], 98, indexes=[2]),
+    )
+
+    extraction = extract_board(path, api_key="test-key")
+
+    assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "A", "T"]
+    assert "exact printed IDs to return are: 2" in _sent_prompt(calls[2])
+    tiles_schema = calls[2]["json"]["response_format"]["json_schema"]["schema"]["properties"]["tiles"]
+    assert tiles_schema["minItems"] == tiles_schema["maxItems"] == 1
+
+
+def test_a_letter_that_conflicts_with_its_printed_points_never_reaches_the_board(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8)})
+    invalid = _tile_payload("KA", ["R"], 99)
+    invalid["tiles"][0]["points"] = 5  # K is 3 in Dutch Wordfeud.
+    calls = _stub_openrouter(
+        monkeypatch,
+        invalid,
+        _tile_payload("KA", ["R"], 97),
+        _tile_payload("KA", ["R"], 98),
+    )
+
+    extraction = extract_board(path, api_key="test-key")
+
+    assert extraction.state.grid[7][7].letter == "K"
+    assert len(calls) == 3
+    assert _sent_images(calls[2]) == 2
 
 
 def test_a_persistent_mismatch_reports_a_readable_message(
