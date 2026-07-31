@@ -49,6 +49,10 @@ jobs:
           rsync -rlptDz --delete --chmod=Du=rwx,Dg=rxs,Do=,Fu=rw,Fg=r,Fo= \
             --include='/.streamlit/' \
             --include='/.streamlit/config.toml' \
+            --include='/frontend/' \
+            --include='/frontend/index.html' \
+            --include='/frontend/board.js' \
+            --include='/frontend/streamlit-bridge.js' \
             --include='/wordfeud_analyzer/' \
             --include='/wordfeud_analyzer/**' \
             --include='/data/' \
