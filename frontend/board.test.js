@@ -159,3 +159,20 @@ test("linked autosave distinguishes a saved board from a failed active-link upda
   assert.equal(linked.ok, true);
   assert.equal(WF.readActiveSaveId(storage).id, first.record.id);
 });
+
+test("autosave of an existing game does nothing without an active save", () => {
+  const storage = memoryStorage();
+  const result = WF.autosaveExistingSnapshot(storage, snapshot(["A"]), null);
+  assert.deepEqual(result, { ok:true, saved:false, skipped:true });
+  assert.equal(storage.getItem(WF.STORAGE_KEY), null);
+});
+
+test("autosave of an existing game updates only the linked save", () => {
+  const storage = memoryStorage();
+  const first = WF.saveSnapshot(storage, "Partij", snapshot(["A"]));
+  const other = WF.saveSnapshot(storage, "Andere", snapshot(["B"]));
+  const result = WF.autosaveExistingSnapshot(storage, snapshot(["?"]), first.record.id);
+  assert.equal(result.ok, true);
+  assert.deepEqual(WF.snapshotFromRecord(WF.readSaves(storage).records.find(record => record.id === first.record.id)).rack, ["?"]);
+  assert.deepEqual(WF.snapshotFromRecord(WF.readSaves(storage).records.find(record => record.id === other.record.id)).rack, ["B"]);
+});

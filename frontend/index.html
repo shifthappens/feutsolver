@@ -69,6 +69,8 @@
     let initialized = false;
     let lastMessage = 0;
     let lastSolveToken = null;
+    let autosaveTimer = null;
+    let autosaveDirty = false;
 
     function storage() { try { return window.localStorage; } catch (_error) { return null; } }
     function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
@@ -83,6 +85,48 @@
       saveName = name || "";
       saveNameDirty = false;
       return result;
+    }
+    function resetAutosave() {
+      if (autosaveTimer !== null) {
+        window.clearTimeout(autosaveTimer);
+        autosaveTimer = null;
+      }
+      autosaveDirty = false;
+    }
+    function showAutosaveSuccess(record) {
+      notice = { message:`Spel “${record.name}” is automatisch opgeslagen.`, kind:"success" };
+    }
+    function runAutosave() {
+      autosaveTimer = null;
+      if (!autosaveDirty || !editor || !WF.isSnapshot(editor.snapshot)) return;
+      const saved = WF.autosaveExistingSnapshot(storage(), editor.snapshot, activeSaveId);
+      if (saved.skipped) {
+        autosaveDirty = false;
+        return;
+      }
+      if (saved.ok) {
+        autosaveDirty = false;
+        activeSaveName = saved.record.name;
+        saveName = saved.record.name;
+        saveNameDirty = false;
+        showAutosaveSuccess(saved.record);
+      } else if (saved.saved) {
+        autosaveDirty = false;
+        notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
+      } else {
+        notice = { message:`Automatisch opslaan mislukt: ${saved.error}`, kind:"error" };
+      }
+      render();
+    }
+    function scheduleAutosave() {
+      if (autosaveTimer !== null) window.clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+      if (!autosaveDirty || !activeSaveId || !editor || !WF.isSnapshot(editor.snapshot)) return;
+      autosaveTimer = window.setTimeout(runAutosave, 3000);
+    }
+    function markAutosaveDirty() {
+      if (activeSaveId) autosaveDirty = true;
+      scheduleAutosave();
     }
     function restoreActive() {
       const stored = WF.readActiveSaveId(storage());
@@ -127,7 +171,10 @@
       editor = WF.reduceEditor(editor, action);
       render();
       if (["set_board", "clear_board", "backspace", "set_rack", "remove_rack"].includes(action.type)) {
+        markAutosaveDirty();
         emit("board_change", { snapshot: editor.snapshot, clientRevision: editor.revision });
+      } else if (autosaveDirty) {
+        scheduleAutosave();
       }
       focusKeyboard();
     }
@@ -204,10 +251,11 @@
       Streamlit.setFrameHeight(document.body.scrollHeight + 16);
     }
     function bindEvents() {
-      document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); render(); focusKeyboard(); }));
-      document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); render(); focusKeyboard(); }));
+      document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); render(); scheduleAutosave(); focusKeyboard(); }));
+      document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); render(); scheduleAutosave(); focusKeyboard(); }));
       document.querySelectorAll("[data-suggestion]").forEach(button => button.addEventListener("click", () => { selectedSuggestion = Number(button.dataset.suggestion); render(); }));
       document.getElementById("new-button")?.addEventListener("click", () => {
+        resetAutosave();
         const link = setActive(null, "");
         if (!link.ok) return showNotice(`Nieuw bord kon niet worden geopend omdat de actieve save-link niet kon worden gewist: ${link.error}`, "error");
         emit("new_board");
@@ -224,6 +272,7 @@
         const name = (nameInput?.value || saveName || "").trim();
         const result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId);
         if (!result.ok) return showNotice(result.error, "error");
+        resetAutosave();
         const link = setActive(result.record.id, result.record.name);
         if (!link.ok) return showNotice(`Opgeslagen als “${result.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${link.error}`, "error");
         showNotice(`Opgeslagen als “${result.record.name}”.`, "success");
@@ -233,6 +282,7 @@
         const record = saves().find(item => item.id === id);
         const snapshot = record && WF.snapshotFromRecord(record);
         if (!snapshot) return showNotice("Deze save is ongeldig of niet meer beschikbaar.", "error");
+        resetAutosave();
         const link = setActive(record.id, record.name);
         if (!link.ok) return showNotice(`Save kon niet worden geladen omdat de actieve save-link niet kon worden opgeslagen: ${link.error}`, "error");
         editor = WF.createEditor(snapshot);
@@ -242,12 +292,14 @@
         const name = (nameInput?.value || "").trim();
         const result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId);
         if (!result.ok) return showNotice(result.error, "error");
+        resetAutosave();
         const link = setActive(result.record.id, result.record.name);
         if (!link.ok) return showNotice(`Hernoemd naar “${result.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${link.error}`, "error");
         showNotice(`Hernoemd naar “${result.record.name}”.`, "success");
       });
       document.getElementById("delete-button")?.addEventListener("click", () => {
         if (!activeSaveId || !window.confirm(`Save “${activeSaveName}” verwijderen?`)) return;
+        resetAutosave();
         const result = WF.deleteSave(storage(), activeSaveId);
         if (!result.ok) return showNotice(result.error, "error");
         const link = setActive(null, "");
@@ -274,7 +326,11 @@
         props = event.detail.args || {};
         let restoredActive = false;
         if (!initialized) { restoredActive = restoreActive(); initialized = true; }
-        if (!editor || (!restoredActive && !same(editor.snapshot, props.snapshot))) editor = WF.createEditor(props.snapshot);
+        const incomingSnapshotChanged = Boolean(editor) && !same(editor.snapshot, props.snapshot);
+        if (!editor || (!restoredActive && incomingSnapshotChanged)) {
+          editor = WF.createEditor(props.snapshot);
+          if (incomingSnapshotChanged && !restoredActive) markAutosaveDirty();
+        }
         const solveToken = props.mode === "preview" ? (props.solve_result?.token || null) : null;
         if (props.mode === "preview") selectedSuggestion = WF.suggestionSelection(lastSolveToken, solveToken, selectedSuggestion, props.solve_result?.moves?.length || 0);
         lastSolveToken = solveToken;
@@ -282,9 +338,10 @@
         const response = props.response;
         if (response.kind === "place_result" && response.ok) {
           editor = WF.createEditor(response.snapshot); props.mode = "edit";
+          resetAutosave();
           if (activeSaveId) {
             const saved = WF.autosaveSnapshot(storage(), activeSaveName, response.snapshot, activeSaveId);
-            if (saved.ok) notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”.`, kind:"success" };
+            if (saved.ok) showAutosaveSuccess(saved.record);
             else if (saved.saved) notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
             else notice = { message:`Plaatsing gelukt, maar automatisch opslaan mislukte: ${saved.error}`, kind:"error" };
           } else notice = { message:"Zet geplaatst.", kind:"success" };

@@ -319,11 +319,21 @@
     return { ok:true, saved:true, record:saved.record };
   }
 
+  function autosaveExistingSnapshot(storage, snapshot, activeId) {
+    if (!activeId) return { ok:true, saved:false, skipped:true };
+    const loaded = readSaves(storage);
+    if (!loaded.ok) return { ok:false, saved:false, error:loaded.error || "Opgeslagen spellen konden niet veilig worden gelezen." };
+    const active = loaded.records.find(record => record.id === activeId);
+    if (!active) return { ok:true, saved:false, skipped:true };
+    return autosaveSnapshot(storage, active.name, snapshot, activeId);
+  }
+
   return {
     SIZE, MAX_RACK, SCHEMA_VERSION, STORAGE_KEY, ACTIVE_STORAGE_KEY, BONUSES,
     clone, effectiveBonus, isSnapshot, createEditor, setBoardCell, clearBoardCell,
     setRackTile, removeRackTile, selectBoard, selectRack, suggestionSelection, moveSelection, reduceEditor,
     gridPlacement, recordFromSnapshot, snapshotFromRecord, isValidRecord, readSaves,
     writeSaves, readActiveSaveId, setActiveSaveId, saveSnapshot, deleteSave, autosaveSnapshot,
+    autosaveExistingSnapshot,
   };
 });
