@@ -32,11 +32,26 @@ test("rack accepts blanks, compacts after deletion, and rejects gaps", () => {
   editor = WF.reduceEditor(editor, { type:"select_rack", index:5 });
   editor = WF.reduceEditor(editor, { type:"set_rack", tile:"?" });
   assert.deepEqual(editor.snapshot.rack, ["?"]);
+  assert.equal(editor.selection.index, 1);
   editor = WF.reduceEditor(editor, { type:"select_rack", index:0 });
   editor = WF.reduceEditor(editor, { type:"set_rack", tile:"A" });
   assert.deepEqual(editor.snapshot.rack, ["A"]);
+  assert.equal(editor.selection.index, 1);
+  editor = WF.reduceEditor(editor, { type:"select_rack", index:0 });
   editor = WF.reduceEditor(editor, { type:"remove_rack" });
   assert.deepEqual(editor.snapshot.rack, []);
+});
+
+test("rack typing advances through the slots and stops at the last slot", () => {
+  let editor = WF.createEditor(snapshot());
+  editor = WF.reduceEditor(editor, { type:"select_rack", index:0 });
+
+  for (const tile of ["A", "B", "C", "D", "E", "F", "G"]) {
+    editor = WF.reduceEditor(editor, { type:"set_rack", tile });
+  }
+
+  assert.deepEqual(editor.snapshot.rack, ["A", "B", "C", "D", "E", "F", "G"]);
+  assert.equal(editor.selection.index, 6);
 });
 
 test("preview mode locks reducer edits", () => {

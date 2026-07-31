@@ -87,6 +87,13 @@
     return next;
   }
 
+  function advanceRackSelection(editor, index) {
+    if (!editor || editor.selection.kind !== "rack") return editor;
+    const next = clone(editor);
+    next.selection.index = Math.min(index + 1, MAX_RACK - 1);
+    return next;
+  }
+
   function selectBoard(editor, row, col) {
     if (!editor || row < 0 || row >= SIZE || col < 0 || col >= SIZE) return editor;
     const next = clone(editor);
@@ -136,7 +143,13 @@
       return advanceSelection(placed);
     }
     if (action.type === "clear_board") return clearBoardCell(editor, editor.selection.row, editor.selection.col);
-    if (action.type === "set_rack") return setRackTile(editor, editor.selection.index, action.tile);
+    if (action.type === "set_rack") {
+      const previousLength = editor.snapshot.rack.length;
+      const placed = setRackTile(editor, editor.selection.index, action.tile);
+      if (placed === editor) return editor;
+      const placedIndex = Math.min(editor.selection.index, previousLength);
+      return advanceRackSelection(placed, placedIndex);
+    }
     if (action.type === "remove_rack") return removeRackTile(editor, editor.selection.index);
     if (action.type === "backspace") {
       if (editor.selection.kind === "rack") return removeRackTile(editor, editor.selection.index);
