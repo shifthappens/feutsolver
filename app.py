@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -26,6 +27,7 @@ from wordfeud_analyzer.state import (
     InvalidSolveRequest,
     StaleSolveRequest,
     apply_place_request,
+    is_current_board_version,
     make_solve_result,
     replaceable_words,
     replace_from_upload,
@@ -33,7 +35,7 @@ from wordfeud_analyzer.state import (
 )
 from wordfeud_analyzer.vision import VisionExtractionError, extract_board
 
-st.set_page_config(page_title="Wordfeud Analyzer", page_icon="🔤", layout="wide")
+st.set_page_config(page_title="Wordfeud-oplosser", page_icon="🔤", layout="wide")
 
 configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
@@ -99,6 +101,7 @@ def initialise_session() -> None:
     st.session_state.setdefault("upload_key", 0)
     st.session_state.setdefault("component_response", None)
     st.session_state.setdefault("last_component_event_signature", None)
+    st.session_state.setdefault("board_version", 0)
 
 
 def current_state() -> BoardState:
@@ -134,6 +137,9 @@ def handle_component_event(event: object) -> None:
     payload = message.get("payload")
     if not isinstance(payload, dict):
         payload = {}
+    event_version = payload.get("boardVersion")
+    if not is_current_board_version(event_version, st.session_state.board_version):
+        return
     state = current_state()
 
     if kind == "new_board":
@@ -166,7 +172,7 @@ def handle_component_event(event: object) -> None:
         st.session_state.confidence = None
         try:
             if not state.rack:
-                response("solve_error", error="Vul minstens één letter of blanco in het rek in voordat je Solve kiest.")
+                response("solve_error", error="Vul minstens één letter of blanco in het rek in voordat je oplossingen laat weergeven.")
                 st.session_state.solve_result = None
                 st.rerun()
             moves, learned = solve_state(state)
@@ -190,7 +196,7 @@ def handle_component_event(event: object) -> None:
         try:
             loaded = validate_snapshot(payload.get("snapshot"))
         except Exception:
-            response("solve_error", error="Deze save is ongeldig; de huidige stand is behouden.")
+            response("solve_error", error="Dit opgeslagen spel is ongeldig; de huidige stand is behouden.")
             st.rerun()
         set_state(loaded)
         st.session_state.solve_result = None
@@ -226,23 +232,29 @@ def process_upload() -> None:
     upload = st.session_state.get("current_upload")
     if upload is None:
         return
-    signature = (str(upload.name), int(upload.size), str(getattr(upload, "file_id", "")))
+    upload_bytes = upload.getvalue()
+    signature = (
+        str(upload.name),
+        int(upload.size),
+        str(getattr(upload, "file_id", "")),
+        hashlib.sha256(upload_bytes).hexdigest(),
+    )
     if signature in {st.session_state.upload_signature, st.session_state.upload_error_signature}:
         return
     if upload.size > MAX_UPLOAD_BYTES:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = "Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw."
+        st.session_state.upload_feedback = "Deze schermafbeelding is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw."
         return
     api_key = secret_or_env("OPENROUTER_API_KEY")
     if not api_key:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = "De OpenRouter API key is niet op de server geconfigureerd."
+        st.session_state.upload_feedback = "De OpenRouter API-sleutel is niet op de server geconfigureerd."
         return
     suffix = Path(cast(str, upload.name)).suffix or ".png"
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
-            temporary.write(upload.getvalue())
+            temporary.write(upload_bytes)
             temporary_path = Path(temporary.name)
         extraction = extract_board(
             temporary_path,
@@ -251,18 +263,22 @@ def process_upload() -> None:
         )
         # Replace the complete working state only after extraction succeeds.
         set_state(replace_from_upload(current_state(), extraction))
+        st.session_state.board_version += 1
         st.session_state.confidence = extraction.confidence
         st.session_state.learned = []
         st.session_state.solve_result = None
+        # A response belonging to the previous board must not overwrite this
+        # upload when the component receives the next render.
+        st.session_state.component_response = None
         st.session_state.upload_signature = signature
         st.session_state.upload_error_signature = None
-        st.session_state.upload_feedback = "Screenshot geladen; controleer het bord en vul zo nodig handmatig aan."
+        st.session_state.upload_feedback = "Schermafbeelding geladen; controleer het bord en vul zo nodig handmatig aan."
     except VisionExtractionError as error:
         st.session_state.upload_error_signature = signature
         st.session_state.upload_feedback = str(error)
     except Exception as error:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = f"De screenshot kon niet worden verwerkt: {error}"
+        st.session_state.upload_feedback = f"De schermafbeelding kon niet worden verwerkt: {error}"
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -313,12 +329,12 @@ def render_replacement_form() -> None:
 
 
 initialise_session()
-st.title("Wordfeud Analyzer")
-st.caption("Een responsive, interactief bord: bewerk lokaal, laat Python de screenshot, zetten en score controleren.")
+st.title("Wordfeud-oplosser")
+st.caption("Een meeschalend, interactief bord: bewerk lokaal en laat Python de schermafbeelding, zetten en punten controleren.")
 st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
 upload = st.file_uploader(
-    "Upload Screenshot",
+    "Schermafbeelding uploaden",
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=False,
     key=f"current_upload_{st.session_state.upload_key}",
@@ -329,7 +345,7 @@ process_upload()
 state = current_state()
 confidence = st.session_state.get("confidence")
 if confidence is not None:
-    st.caption(f"Screenshot-confidence: {float(confidence):.0f}%. Controleer de zichtbare letters en bonussen.")
+    st.caption(f"Zekerheid van schermafbeelding: {float(confidence):.0f}%. Controleer de zichtbare letters en bonussen.")
 if st.session_state.get("learned"):
     st.caption("Nieuw geleerd: " + ", ".join(sorted(st.session_state.learned)))
 if st.session_state.get("upload_feedback"):
@@ -339,6 +355,7 @@ component_response = st.session_state.component_response
 st.session_state.component_response = None
 event = wordfeud_board(
     snapshot=state.model_dump(mode="json"),
+    board_version=st.session_state.board_version,
     mode="preview" if st.session_state.solve_result else "edit",
     solve_result=st.session_state.solve_result,
     response=component_response,

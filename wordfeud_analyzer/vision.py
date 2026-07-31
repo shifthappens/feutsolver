@@ -155,9 +155,9 @@ class PendingMoveError(VisionExtractionError):
 
     def __init__(self) -> None:
         super().__init__(
-            "Op deze screenshot ligt een zet klaar die nog niet gespeeld is (het gele scorebolletje). "
+            "Op deze schermafbeelding ligt een zet klaar die nog niet gespeeld is (het gele scorebolletje). "
             "Wordfeud heeft die woorden dus nog niet goedgekeurd. Speel de zet of wis hem, "
-            "en maak daarna een nieuwe screenshot."
+            "en maak daarna een nieuwe schermafbeelding."
         )
 
 
@@ -167,10 +167,10 @@ class LooseTilesError(VisionExtractionError):
     def __init__(self, count: int) -> None:
         self.count = count
         super().__init__(
-            f"Op deze screenshot liggen {count} tegel(s) los van de rest van het bord. "
+            f"Op deze schermafbeelding liggen {count} tegel(s) los van de rest van het bord. "
             "Zo'n stand kan Wordfeud niet accepteren, ook niet als het een bestaand woord vormt: "
             "waarschijnlijk ligt er een zet klaar die nog niet gespeeld is. "
-            "Speel de zet of wis hem, en maak daarna een nieuwe screenshot."
+            "Speel de zet of wis hem, en maak daarna een nieuwe schermafbeelding."
         )
 
 
@@ -180,9 +180,9 @@ class LowConfidenceError(VisionExtractionError):
     def __init__(self, confidence: float) -> None:
         self.confidence = confidence
         super().__init__(
-            f"Het bord kon niet betrouwbaar worden uitgelezen: het vision-model is {confidence:.0f}% zeker "
+            f"Het bord kon niet betrouwbaar worden uitgelezen: het beeldmodel is {confidence:.0f}% zeker "
             f"en we gebruiken alleen resultaten vanaf {MINIMUM_CONFIDENCE:.0f}%. "
-            "Maak een scherpere, rechte screenshot van het volledige bord met rack en probeer opnieuw."
+            "Maak een scherpere, rechte schermafbeelding van het volledige bord met rek en probeer opnieuw."
         )
 
 
@@ -828,7 +828,7 @@ def extract_board(
             )
             images = recovery_images
     raise VisionExtractionError(
-        "Het bord kon niet worden uitgelezen; het vision-model gaf geen bruikbaar antwoord. "
-        "Probeer het opnieuw met een scherpe screenshot van het volledige bord. "
+        "Het bord kon niet worden uitgelezen; het beeldmodel gaf geen bruikbaar antwoord. "
+        "Probeer het opnieuw met een scherpe schermafbeelding van het volledige bord. "
         "(technisch: " + " | ".join(errors) + ")"
     )

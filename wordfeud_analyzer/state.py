@@ -16,6 +16,20 @@ class InvalidSolveRequest(ValueError):
     """The browser selected a move that was not returned by this solve."""
 
 
+def is_current_board_version(event_version: object, current_version: object) -> bool:
+    """Reject browser events that belong to a board replaced by an upload."""
+    try:
+        current = int(current_version)
+    except (TypeError, ValueError):
+        return False
+    if event_version is None:
+        return current == 0
+    try:
+        return int(event_version) == current
+    except (TypeError, ValueError):
+        return False
+
+
 def validate_snapshot(snapshot: object) -> BoardState:
     """Validate an untrusted browser snapshot before it reaches the solver."""
     return BoardState.model_validate(snapshot)
@@ -164,14 +178,14 @@ def apply_place_request(
 ) -> BoardState:
     """Validate token/hash and selected move before committing a placement."""
     if not isinstance(solve_result, dict):
-        raise StaleSolveRequest("Deze suggestie is verouderd. Kies opnieuw voor Solve.")
+        raise StaleSolveRequest("Deze suggestie is verouderd. Kies opnieuw voor ‘Geef oplossingen weer’.")
     requested_hash = str(payload.get("stateHash", ""))
     requested_token = str(payload.get("solveToken", ""))
     if (
         not is_current_solve_result(requested_token, requested_hash, solve_result.get("token"), state)
         or requested_hash != solve_result.get("state_hash")
     ):
-        raise StaleSolveRequest("Deze suggestie is verouderd. Kies opnieuw voor Solve.")
+        raise StaleSolveRequest("Deze suggestie is verouderd. Kies opnieuw voor ‘Geef oplossingen weer’.")
     move = selected_move(solve_result, payload.get("selectedMove"))
     if move is None:
         raise InvalidSolveRequest("De geselecteerde suggestie was ongeldig.")

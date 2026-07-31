@@ -68,6 +68,7 @@
     let notice = null;
     let initialized = false;
     let lastMessage = 0;
+    let boardVersion = 0;
     let lastSolveToken = null;
     let autosaveTimer = null;
     let autosaveDirty = false;
@@ -85,6 +86,15 @@
       saveName = name || "";
       saveNameDirty = false;
       return result;
+    }
+    function closeActiveSave() {
+      resetAutosave();
+      notice = null;
+      const link = setActive(null, "");
+      if (link.ok) return true;
+      activeSaveId = null; activeSaveName = ""; saveName = ""; saveNameDirty = false;
+      notice = { message:`De actieve spelopslag kon niet worden gesloten: ${link.error}`, kind:"error" };
+      return false;
     }
     function resetAutosave() {
       if (autosaveTimer !== null) {
@@ -112,7 +122,7 @@
         showAutosaveSuccess(saved.record);
       } else if (saved.saved) {
         autosaveDirty = false;
-        notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
+        notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
       } else {
         notice = { message:`Automatisch opslaan mislukt: ${saved.error}`, kind:"error" };
       }
@@ -149,7 +159,11 @@
     }
     function emit(type, payload) {
       lastMessage += 1;
-      Streamlit.setComponentValue({ id: lastMessage, type, payload: payload || {} });
+      Streamlit.setComponentValue({
+        id: lastMessage,
+        type,
+        payload: { ...(payload || {}), boardVersion },
+      });
     }
     function showNotice(message, kind) { notice = message ? { message, kind: kind || "" } : null; render(); }
     function focusKeyboard() {
@@ -227,9 +241,9 @@
       const options = records.map(record => `<option value="${escapeHtml(record.id)}" ${record.id === activeSaveId ? "selected" : ""}>${escapeHtml(record.name)}</option>`).join("");
       return `<section class="panel" aria-label="Opgeslagen spellen">
         <span class="save-label">Opgeslagen spellen${currentName ? ` · ${escapeHtml(currentName)}` : ""}</span>
-        <div class="save-row"><input id="save-name" value="${escapeHtml(currentName)}" placeholder="Naam van dit spel" ${!editing ? "disabled" : ""}><button id="save-button" ${!editing ? "disabled" : ""}>${active ? "Save" : "Save als…"}</button></div>
-        <div class="save-row"><select id="save-select" aria-label="Opgeslagen spel" ${!editing || !records.length ? "disabled" : ""}><option value="">Kies een save…</option>${options}</select><button id="load-button" ${!editing || !records.length ? "disabled" : ""}>Load</button></div>
-        <div class="save-actions"><button id="rename-button" ${!editing || !active ? "disabled" : ""}>Rename</button><button id="delete-button" class="danger" ${!editing || !active ? "disabled" : ""}>Delete</button></div>
+        <div class="save-row"><input id="save-name" value="${escapeHtml(currentName)}" placeholder="Naam van dit spel" ${!editing ? "disabled" : ""}><button id="save-button" ${!editing ? "disabled" : ""}>${active ? "Opslaan" : "Opslaan als…"}</button></div>
+        <div class="save-row"><select id="save-select" aria-label="Opgeslagen spel" ${!editing || !records.length ? "disabled" : ""}><option value="">Kies een opgeslagen spel…</option>${options}</select><button id="load-button" ${!editing || !records.length ? "disabled" : ""}>Laden</button></div>
+        <div class="save-actions"><button id="rename-button" ${!editing || !active ? "disabled" : ""}>Naam wijzigen</button><button id="delete-button" class="danger" ${!editing || !active ? "disabled" : ""}>Verwijderen</button></div>
         ${loaded.warnings.map(warning => `<p class="hint">${escapeHtml(warning)}</p>`).join("")}
       </section>`;
     }
@@ -241,12 +255,12 @@
       const notification = notice ? `<div class="notice ${escapeHtml(notice.kind)}" role="status" aria-live="polite">${escapeHtml(notice.message)}</div>` : "";
       const solveDisabled = !editor.snapshot.rack.length || !editing;
       app.innerHTML = `<section class="panel"><div class="board-tools"><span>${editing ? "Bord bewerken" : "Voorbeeld van geselecteerde zet"}</span><span>${editing ? `Richting: ${editor.direction === "H" ? "horizontaal" : "verticaal"}` : "Bewerken vergrendeld"}</span></div>
-        <div class="actions"><button id="new-button" class="danger" ${!editing ? "disabled" : ""}>Nieuw bord</button><button id="solve-button" class="primary" ${solveDisabled ? "disabled" : ""}>Solve</button>${!editor.snapshot.rack.length ? '<span class="hint">Vul minstens één rekletter in om te kunnen zoeken.</span>' : ""}${!editing ? `<button id="cancel-button">Cancel</button>${hasSuggestions ? '<button id="place-button" class="primary">Place</button>' : '<span class="hint">Er is geen zet om te plaatsen.</span>'}` : ""}</div>
+        <div class="actions"><button id="new-button" class="danger" ${!editing ? "disabled" : ""}>Nieuw bord</button><button id="solve-button" class="primary" ${solveDisabled ? "disabled" : ""}>Geef oplossingen weer</button>${!editor.snapshot.rack.length ? '<span class="hint">Vul minstens één rekletter in om te kunnen zoeken.</span>' : ""}${!editing ? `<button id="cancel-button">Annuleren</button>${hasSuggestions ? '<button id="place-button" class="primary">Zet plaatsen</button>' : '<span class="hint">Er is geen zet om te plaatsen.</span>'}` : ""}</div>
         ${renderBoard(editor.snapshot, preview)}
-        <div class="hint">Klik een vakje; klik nogmaals om de richting te wisselen. Typ A–Z, Delete of Backspace. Pijltjes verplaatsen de selectie.</div>
+        <div class="hint">Klik een vakje; klik nogmaals om de richting te wisselen. Typ A–Z. Gebruik Wissen of Terug om te wissen. Pijltjes verplaatsen de selectie.</div>
         ${renderRack(editor.snapshot)}
         ${notification}</section>
-        <section><section class="panel"><h3>Suggesties</h3>${props.mode === "preview" ? renderSuggestions(props.solve_result) : '<p class="empty">Bewerk het bord en kies Solve voor maximaal zes suggesties.</p>'}</section>${renderSaves(editing)}</section>`;
+        <section><section class="panel"><h3>Suggesties</h3>${props.mode === "preview" ? renderSuggestions(props.solve_result) : '<p class="empty">Bewerk het bord en kies Geef oplossingen weer voor maximaal zes suggesties.</p>'}</section>${renderSaves(editing)}</section>`;
       bindEvents();
       Streamlit.setFrameHeight(document.body.scrollHeight + 16);
     }
@@ -257,7 +271,7 @@
       document.getElementById("new-button")?.addEventListener("click", () => {
         resetAutosave();
         const link = setActive(null, "");
-        if (!link.ok) return showNotice(`Nieuw bord kon niet worden geopend omdat de actieve save-link niet kon worden gewist: ${link.error}`, "error");
+        if (!link.ok) return showNotice(`Nieuw bord kon niet worden geopend omdat de actieve spelopslag niet kon worden gewist: ${link.error}`, "error");
         emit("new_board");
       });
       document.getElementById("solve-button")?.addEventListener("click", () => emit("solve_request", { snapshot: editor.snapshot, clientRevision: editor.revision }));
@@ -274,17 +288,17 @@
         if (!result.ok) return showNotice(result.error, "error");
         resetAutosave();
         const link = setActive(result.record.id, result.record.name);
-        if (!link.ok) return showNotice(`Opgeslagen als “${result.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${link.error}`, "error");
+        if (!link.ok) return showNotice(`Opgeslagen als “${result.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${link.error}`, "error");
         showNotice(`Opgeslagen als “${result.record.name}”.`, "success");
       });
       document.getElementById("load-button")?.addEventListener("click", () => {
         const id = document.getElementById("save-select")?.value;
         const record = saves().find(item => item.id === id);
         const snapshot = record && WF.snapshotFromRecord(record);
-        if (!snapshot) return showNotice("Deze save is ongeldig of niet meer beschikbaar.", "error");
+        if (!snapshot) return showNotice("Dit opgeslagen spel is ongeldig of niet meer beschikbaar.", "error");
         resetAutosave();
         const link = setActive(record.id, record.name);
-        if (!link.ok) return showNotice(`Save kon niet worden geladen omdat de actieve save-link niet kon worden opgeslagen: ${link.error}`, "error");
+        if (!link.ok) return showNotice(`Opgeslagen spel kon niet worden geladen omdat de actieve spelopslag niet kon worden opgeslagen: ${link.error}`, "error");
         editor = WF.createEditor(snapshot);
         render(); emit("load", { snapshot, saveId: record.id });
       });
@@ -294,20 +308,20 @@
         if (!result.ok) return showNotice(result.error, "error");
         resetAutosave();
         const link = setActive(result.record.id, result.record.name);
-        if (!link.ok) return showNotice(`Hernoemd naar “${result.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${link.error}`, "error");
-        showNotice(`Hernoemd naar “${result.record.name}”.`, "success");
+        if (!link.ok) return showNotice(`Naam gewijzigd naar “${result.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${link.error}`, "error");
+        showNotice(`Naam gewijzigd naar “${result.record.name}”.`, "success");
       });
       document.getElementById("delete-button")?.addEventListener("click", () => {
-        if (!activeSaveId || !window.confirm(`Save “${activeSaveName}” verwijderen?`)) return;
+        if (!activeSaveId || !window.confirm(`Opgeslagen spel “${activeSaveName}” verwijderen?`)) return;
         resetAutosave();
         const result = WF.deleteSave(storage(), activeSaveId);
         if (!result.ok) return showNotice(result.error, "error");
         const link = setActive(null, "");
         if (!link.ok) {
           activeSaveId = null; activeSaveName = ""; saveName = ""; saveNameDirty = false;
-          return showNotice(`Save verwijderd, maar de actieve save-link kon niet worden gewist: ${link.error}`, "error");
+          return showNotice(`Opgeslagen spel verwijderd, maar de actieve spelopslag kon niet worden gewist: ${link.error}`, "error");
         }
-        showNotice("Save verwijderd; het huidige bord blijft open als onopgeslagen bord.", "success");
+        showNotice("Opgeslagen spel verwijderd; het huidige bord blijft open als onopgeslagen bord.", "success");
       });
     }
     keyboard.addEventListener("keydown", event => {
@@ -324,12 +338,16 @@
       });
       Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, event => {
         props = event.detail.args || {};
+        const incomingBoardVersion = Number(props.board_version);
+        const boardWasReplaced = Number.isFinite(incomingBoardVersion) && incomingBoardVersion !== boardVersion;
+        if (Number.isFinite(incomingBoardVersion)) boardVersion = incomingBoardVersion;
+        if (boardWasReplaced) closeActiveSave();
         let restoredActive = false;
         if (!initialized) { restoredActive = restoreActive(); initialized = true; }
         const incomingSnapshotChanged = Boolean(editor) && !same(editor.snapshot, props.snapshot);
         if (!editor || (!restoredActive && incomingSnapshotChanged)) {
           editor = WF.createEditor(props.snapshot);
-          if (incomingSnapshotChanged && !restoredActive) markAutosaveDirty();
+          if (incomingSnapshotChanged && !restoredActive && !boardWasReplaced) markAutosaveDirty();
         }
         const solveToken = props.mode === "preview" ? (props.solve_result?.token || null) : null;
         if (props.mode === "preview") selectedSuggestion = WF.suggestionSelection(lastSolveToken, solveToken, selectedSuggestion, props.solve_result?.moves?.length || 0);
@@ -342,7 +360,7 @@
           if (activeSaveId) {
             const saved = WF.autosaveSnapshot(storage(), activeSaveName, response.snapshot, activeSaveId);
             if (saved.ok) showAutosaveSuccess(saved.record);
-            else if (saved.saved) notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve save-link kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
+            else if (saved.saved) notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
             else notice = { message:`Plaatsing gelukt, maar automatisch opslaan mislukte: ${saved.error}`, kind:"error" };
           } else notice = { message:"Zet geplaatst.", kind:"success" };
         } else if (response.kind === "place_result") { props.mode = "edit"; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }

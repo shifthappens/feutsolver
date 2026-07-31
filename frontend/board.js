@@ -247,7 +247,7 @@
       }
       return {
         records,
-        warnings: skipped ? [`${skipped} corrupte of niet-ondersteunde save overgeslagen.`] : [],
+        warnings: skipped ? [`${skipped} corrupte of niet-ondersteunde opgeslagen spellen overgeslagen.`] : [],
         ok: true,
       };
     } catch (_error) {
@@ -273,7 +273,7 @@
     try {
       return { ok: true, id: source.getItem(ACTIVE_STORAGE_KEY) };
     } catch (_error) {
-      return { ok: false, id: null, error: "De actieve save kon niet worden gelezen." };
+      return { ok: false, id: null, error: "De actieve spelopslag kon niet worden gelezen." };
     }
   }
 
@@ -285,7 +285,7 @@
       else source.removeItem(ACTIVE_STORAGE_KEY);
       return { ok: true };
     } catch (_error) {
-      return { ok: false, error: "De koppeling met de actieve save kon niet worden opgeslagen." };
+      return { ok: false, error: "De koppeling met de actieve spelopslag kon niet worden opgeslagen." };
     }
   }
 
@@ -307,7 +307,7 @@
     const loaded = readSaves(storage);
     if (!loaded.ok) return { ok: false, error: loaded.error || "Opgeslagen spellen konden niet veilig worden gewijzigd." };
     const records = loaded.records.filter(record => record.id !== id);
-    if (records.length === loaded.records.length) return { ok: false, error: "Save niet gevonden." };
+    if (records.length === loaded.records.length) return { ok: false, error: "Opgeslagen spel niet gevonden." };
     return writeSaves(storage, records);
   }
 

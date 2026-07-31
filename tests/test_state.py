@@ -11,6 +11,7 @@ from wordfeud_analyzer.state import (
     apply_move,
     apply_place_request,
     consume_rack,
+    is_current_board_version,
     make_solve_result,
     replaceable_words,
     replace_from_upload,
@@ -38,6 +39,15 @@ def test_standard_board_has_the_complete_symmetric_layout() -> None:
 
 def test_empty_rack_is_valid() -> None:
     assert standard_board().model_validate(standard_board().model_dump()).rack == []
+
+
+def test_component_events_from_an_older_board_version_are_ignored() -> None:
+    assert is_current_board_version(0, 0)
+    assert is_current_board_version(None, 0)
+    assert is_current_board_version(2, 2)
+    assert not is_current_board_version(1, 2)
+    assert not is_current_board_version(None, 2)
+    assert not is_current_board_version("invalid", 2)
 
 
 def test_consume_rack_uses_each_blank_once_and_preserves_order() -> None:
