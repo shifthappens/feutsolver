@@ -12624,6 +12624,7 @@ alzijdig
 alzijdige
 alzijdigheid
 alzo
+am
 ama
 amah
 amahs
@@ -53760,6 +53761,7 @@ damklokken
 damlengte
 damlijn
 damlijnen
+damme
 dammen
 dammend
 dammende
@@ -59189,6 +59191,7 @@ diminutief
 diminutieven
 dimlicht
 dimlichten
+dimme
 dimmen
 dimmend
 dimmer
@@ -161058,6 +161061,7 @@ miepte
 mier
 mierde
 mierden
+miere
 mieren
 mierenegel
 mierenegels
@@ -162426,6 +162430,7 @@ minziek
 minzieke
 mioceen
 miocene
+mir
 mirabel
 mirabellen
 miraculeus
@@ -204462,6 +204467,7 @@ ramkoers
 ramkraak
 ramkraken
 ramkrakers
+ramme
 rammei
 rammeide
 rammeien
@@ -209742,6 +209748,7 @@ rexist
 rexisten
 rezen
 rhinovirus
+ri
 ria
 rial
 rials
