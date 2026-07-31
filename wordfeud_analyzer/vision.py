@@ -4,9 +4,10 @@ The geometry of a Wordfeud screenshot is solved locally and deterministically: w
 the board is, which squares hold a tile, and which bonus each free square carries.
 The language model is asked one thing only that affects the board — which letter is
 printed on a tile — and never has to count rows, pad a grid or return a coordinate.
-The tiny printed point value is returned as supporting OCR metadata, but is too small
-to be a hard acceptance condition. That keeps positional mistakes out of the pipeline
-without rejecting a correct large glyph over a misread superscript.
+The tiny printed point value is intentionally not sent to the model. It is irrelevant
+to a board's state, costs output tokens for every tile, and is too small to improve
+letter recognition. Stable crop IDs and agreement between independent letter readings
+are the positional safeguards.
 """
 from __future__ import annotations
 
@@ -37,20 +38,16 @@ EXTRACTION_PROMPT = """You read letters from Wordfeud tile crops. Do not solve t
 The first image is a contact sheet containing every tile that lies on the board.
 Each crop has a printed `#ID` directly above it. The ID, not the crop's position in
 the sheet, is the tile's identity. Return one object for every printed ID. Copy that
-ID into `index`, the large glyph into `letter`, and the small point value in the
-upper-right corner into `points`. A board blank has no printed point value: return
-its assigned glyph in lowercase and `points: 0`. Never renumber from reading
-order and never let an unclear crop move the following glyphs to different IDs.
+ID into `index` and the large glyph into `letter`. A board blank has its assigned
+glyph in lowercase. Never renumber from reading order and never let an unclear crop
+move the following glyphs to different IDs.
 
 The second image is the player's rack. Return its letters from left to right.
 
-- Read the large glyph on a tile; the small number beside it is the tile's point value.
-- The large glyph is authoritative. Never change or omit it merely because the much
-  smaller point value is unclear or appears inconsistent.
 - A blank tile carries no point value. Return the letter it represents in lowercase.
 - An unassigned blank on the rack is `?`.
-- `confidence` is your honest certainty, 0-100, that every letter you return matches
-  the image. Score well below 90 when glyphs are unclear; do not inflate it.
+- `confidence` is an absolute percentage from 0 through 100 that every letter matches
+  the image: return `97` for 97% certainty, never `0.97` or `1` to mean 100%.
 """
 
 RACK_ONLY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
@@ -58,39 +55,38 @@ RACK_ONLY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve 
 The board is empty, so only the player's rack matters. Return the rack letters from
 left to right, leaving `tiles` empty.
 
-- Read the large glyph on a tile; the small number beside it is the tile's point value.
 - An unassigned blank on the rack is `?`.
-- `confidence` is your honest certainty, 0-100, that every letter you return matches
-  the image. Score well below 90 when glyphs are unclear; do not inflate it.
+- `confidence` is an absolute percentage from 0 through 100: return `97` for 97%
+  certainty, never `0.97` or `1` to mean 100%.
 """
 
 RECOVERY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
 The first image contains enlarged board-tile crops. Each crop has a printed `#ID`.
-Return one object per crop with that exact ID as `index`, its large glyph as `letter`,
-and its small upper-right point value as `points`. IDs can be non-contiguous and the
-crops may be deliberately shuffled, so never renumber them from their image order.
+Return one object per crop with that exact ID as `index` and its large glyph as
+`letter`. IDs can be non-contiguous and the crops may be deliberately shuffled, so
+never renumber them from their image order.
 Do not skip, merge, duplicate, or invent a crop. The second image is the player's
 rack; return its letters from left to right.
 
-- Read only the large glyph; a small number is its point value.
-- The large glyph is authoritative; a doubtful tiny point value must not change it.
 - Return a blank tile's assigned letter in lowercase, and an unassigned rack blank as `?`.
-- A board blank has no point value; return `points: 0` for it.
-- `confidence` is your honest certainty, 0-100, that every returned letter matches.
+- `confidence` is an absolute percentage from 0 through 100: return `97` for 97%
+  certainty, never `0.97` or `1` to mean 100%.
 """
 
 VERIFICATION_PROMPT = """Independently verify Wordfeud tile OCR. Do not solve the game and do not rely on
 an earlier reading. The board crops in the first image are deliberately shuffled.
 Use only the printed `#ID` above each crop as its identity. For every crop return that
-ID as `index`, its large glyph as `letter`, and its small upper-right value as
-`points`. A board blank has no value: use a lowercase glyph and `points: 0`.
+ID as `index` and its large glyph as `letter`. A board blank has a lowercase glyph.
 Return the rack in the second image from left to right. Never renumber by image order.
-The large glyph is authoritative; a doubtful tiny point value must not change it.
+`confidence` is an absolute percentage from 0 through 100: return `97` for 97%
+certainty, never `0.97` or `1` to mean 100%.
 """
 
 RACK_RECOVERY_PROMPT = """Independently read only the seven-or-fewer Wordfeud rack tiles in this image,
-from left to right. Leave `tiles` empty. Use `?` for an unassigned blank.
+from left to right. Leave `tiles` empty. Use `?` for an unassigned blank. `confidence`
+is an absolute percentage from 0 through 100: return `97` for 97% certainty, never
+`0.97` or `1` to mean 100%.
 """
 
 JSON_OUTPUT_INSTRUCTION = """Return compact JSON only: no markdown fences, explanation, or comments. Keep each
@@ -104,7 +100,6 @@ class IndexedTileReading(BaseModel):
 
     index: int = Field(..., ge=1, le=BOARD_SIZE * BOARD_SIZE)
     letter: str = Field(..., min_length=1, max_length=1, pattern=r"^[A-Za-z]$")
-    points: int = Field(..., ge=0, le=10)
 
     @field_validator("letter", mode="before")
     @classmethod
@@ -163,19 +158,6 @@ def _tile_reading_schema(expected_tiles: int) -> dict[str, JsonValue]:
 # misread board produces confident but wrong scores, which is worse than telling
 # the user to upload a better screenshot.
 MINIMUM_CONFIDENCE = 90.0
-
-# Dutch Wordfeud values are printed on every non-blank tile. They remain useful
-# supporting metadata in fixtures and diagnostics, but the superscripts are much
-# smaller than the glyphs. They must not invalidate an otherwise complete OCR pass:
-# stable crop IDs plus agreement between independent letter readings are the hard
-# positional invariants.
-DUTCH_TILE_POINTS: dict[str, int] = {
-    "A": 1, "B": 4, "C": 5, "D": 2, "E": 1, "F": 4, "G": 3,
-    "H": 4, "I": 2, "J": 4, "K": 3, "L": 3, "M": 3, "N": 1,
-    "O": 1, "P": 4, "Q": 10, "R": 2, "S": 2, "T": 2, "U": 2,
-    "V": 4, "W": 5, "X": 8, "Y": 8, "Z": 5,
-}
-
 
 class VisionExtractionError(RuntimeError):
     pass
@@ -673,8 +655,8 @@ def _json_payload(content: str) -> object:
 
 
 def _max_response_tokens(expected_tiles: int) -> int:
-    """Leave enough output room for every indexed tile on a dense board."""
-    return min(8_000, max(2_000, 1_000 + expected_tiles * 48))
+    """Leave room for compact letter JSON while bounding accidental over-generation."""
+    return min(4_000, max(1_024, 256 + expected_tiles * 16))
 
 
 def _parse_content(content: object) -> TileReading:
@@ -714,10 +696,9 @@ def _response_content(response: requests.Response) -> object:
 def _tile_letters_by_index(reading: TileReading, expected_indexes: list[int]) -> dict[int, str]:
     """Validate stable IDs before any glyph reaches the board.
 
-    Point values are deliberately not validated here. On real phone screenshots the
-    large glyph can be unambiguous while its tiny superscript is read incorrectly
-    (notably I/T with 2 points being returned as 1). Letter agreement across the
-    normal, reversed and if necessary enlarged passes is the reliable invariant.
+    Letter agreement across the normal, reversed and if necessary enlarged passes is
+    the reliable invariant. Point values are omitted entirely: they do not affect the
+    board and would make every dense response longer for no validation benefit.
     """
     indexes = [tile.index for tile in reading.tiles]
     counts = Counter(indexes)
@@ -866,7 +847,7 @@ def extract_board(
     uncertainty, so the user is asked for a better one.
     """
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-    model = model or os.environ.get("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
+    model = model or os.environ.get("OPENROUTER_VISION_MODEL", "openai/gpt-4.1-mini")
     if not api_key:
         raise VisionExtractionError("OPENROUTER_API_KEY ontbreekt. Zet hem in .env of Streamlit secrets.")
 

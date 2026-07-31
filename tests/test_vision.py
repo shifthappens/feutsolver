@@ -8,7 +8,6 @@ from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
     BOARD_SIZE,
-    DUTCH_TILE_POINTS,
     MINIMUM_CONFIDENCE,
     LooseTilesError,
     LowConfidenceError,
@@ -183,17 +182,17 @@ def test_a_short_letter_list_cannot_silently_shift_the_rest_of_the_board() -> No
 def test_indexed_tile_readings_must_hold_single_letters() -> None:
     with pytest.raises(ValidationError):
         _ = TileReading.model_validate(
-            {"tiles": [{"index": 1, "letter": "AB", "points": 1}], "rack": ["A"], "confidence": 95}
+            {"tiles": [{"index": 1, "letter": "AB"}], "rack": ["A"], "confidence": 95}
         )
     with pytest.raises(ValidationError):
         _ = TileReading.model_validate(
-            {"tiles": [{"index": 1, "letter": "4", "points": 1}], "rack": ["A"], "confidence": 95}
+            {"tiles": [{"index": 1, "letter": "4"}], "rack": ["A"], "confidence": 95}
         )
     reading = TileReading.model_validate(
         {
             "tiles": [
-                {"index": 1, "letter": "A", "points": 1},
-                {"index": 2, "letter": "b", "points": 0},
+                {"index": 1, "letter": "A"},
+                {"index": 2, "letter": "b"},
             ],
             "rack": ["a", "?"],
             "confidence": 95,
@@ -207,9 +206,9 @@ def test_indexed_tile_readings_are_sorted_by_their_printed_index() -> None:
     reading = TileReading.model_validate(
         {
             "tiles": [
-                {"index": 2, "letter": "A", "points": 1},
-                {"index": 1, "letter": "K", "points": 3},
-                {"index": 3, "letter": "T", "points": 2},
+                {"index": 2, "letter": "A"},
+                {"index": 1, "letter": "K"},
+                {"index": 3, "letter": "T"},
             ],
             "rack": [],
             "confidence": 95,
@@ -222,7 +221,7 @@ def test_model_json_with_fences_and_trailing_commas_is_recovered() -> None:
     reading = _parse_content(
         """Here is the result:
 ```json
-{"tiles": [{"index": 1, "letter": "K", "points": 3,},], "rack": ["R",], "confidence": 95,}
+{"tiles": [{"index": 1, "letter": "K",},], "rack": ["R",], "confidence": 95,}
 ```
 """
     )
@@ -233,9 +232,9 @@ def test_model_json_with_fences_and_trailing_commas_is_recovered() -> None:
 
 
 def test_response_budget_grows_for_a_full_board() -> None:
-    assert _max_response_tokens(3) == 2_000
-    assert _max_response_tokens(85) > 2_000
-    assert _max_response_tokens(225) <= 8_000
+    assert _max_response_tokens(3) == 1_024
+    assert _max_response_tokens(96) == 1_792
+    assert _max_response_tokens(225) <= 4_000
 
 
 class _FakeResponse:
@@ -278,11 +277,7 @@ def _tile_payload(
     indexes = indexes or list(range(1, len(letters) + 1))
     return {
         "tiles": [
-            {
-                "index": index,
-                "letter": letter,
-                "points": 0 if letter.islower() else DUTCH_TILE_POINTS[letter.upper()],
-            }
+            {"index": index, "letter": letter}
             for index, letter in zip(indexes, letters)
         ],
         "rack": rack,
@@ -302,6 +297,7 @@ def test_a_confident_reading_becomes_a_board(tmp_path: Path, monkeypatch: pytest
     assert extraction.state.rack == ["R", "E"]
     assert len(calls) == 2
     assert all(_sent_images(call) == 2 for call in calls)
+    assert all("never `0.97` or `1` to mean 100%" in _sent_prompt(call) for call in calls)
 
 
 def test_an_uncertain_reading_is_rejected_instead_of_retried(
@@ -348,9 +344,9 @@ def test_a_missing_tile_index_is_retried_instead_of_shifting_following_letters(
         monkeypatch,
         {
             "tiles": [
-                {"index": 1, "letter": "K", "points": 3},
-                {"index": 2, "letter": "A", "points": 1},
-                {"index": 4, "letter": "T", "points": 2},
+                {"index": 1, "letter": "K"},
+                {"index": 2, "letter": "A"},
+                {"index": 4, "letter": "T"},
             ],
             "rack": ["R"],
             "confidence": 96,
@@ -404,15 +400,13 @@ def test_only_disputed_non_contiguous_ids_are_read_a_third_time(
     assert tiles_schema["minItems"] == tiles_schema["maxItems"] == 1
 
 
-def test_wrong_tiny_point_values_do_not_reject_matching_large_letters(
+def test_tile_point_values_are_not_requested_or_required(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: production read T2 and I2 as T1/I1 while their glyphs were right."""
+    """Point OCR is not board state and is deliberately absent from the API contract."""
     path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
     first = _tile_payload("KIT", ["R"], 99)
     second = _tile_payload("KIT", ["R"], 98)
-    first["tiles"][2]["points"] = 1  # T is 2, but the superscript is tiny.
-    second["tiles"][1]["points"] = 1  # I is 2, same real-world OCR failure.
     calls = _stub_openrouter(
         monkeypatch,
         first,
@@ -424,6 +418,7 @@ def test_wrong_tiny_point_values_do_not_reject_matching_large_letters(
     assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "I", "T"]
     assert extraction.confidence == 98
     assert len(calls) == 2
+    assert all("points" not in _sent_prompt(call) for call in calls)
 
 
 def test_a_persistent_mismatch_reports_a_readable_message(

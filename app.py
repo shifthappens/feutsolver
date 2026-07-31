@@ -259,7 +259,7 @@ def process_upload() -> None:
         extraction = extract_board(
             temporary_path,
             api_key=api_key,
-            model=secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash"),
+            model=secret_or_env("OPENROUTER_VISION_MODEL", "openai/gpt-4.1-mini"),
         )
         # Replace the complete working state only after extraction succeeds.
         set_state(replace_from_upload(current_state(), extraction))

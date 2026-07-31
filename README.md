@@ -53,12 +53,12 @@ Een blijvende, lokale optie is `.streamlit/secrets.toml` (dit bestand staat in `
 
 ```toml
 OPENROUTER_API_KEY = "jouw-sleutel"
-OPENROUTER_VISION_MODEL = "google/gemini-2.5-flash"
+OPENROUTER_VISION_MODEL = "openai/gpt-4.1-mini"
 ```
 
 De app leest eerst `OPENROUTER_API_KEY` uit de omgeving en daarna dit secrets-bestand. Deel de sleutel niet in chat, commit hem niet en plak hem alleen eventueel in het afgeschermde wachtwoordveld van je lokaal draaiende app.
 
-Gebruik in de zijbalk `google/gemini-2.5-flash` (standaard) of een ander beeldmodel dat het OpenAI-compatibele chat-eindpunt van OpenRouter en JSON-schema-uitvoer ondersteunt.
+Gebruik in de zijbalk `openai/gpt-4.1-mini` (standaard) of een ander beeldmodel dat het OpenAI-compatibele chat-eindpunt van OpenRouter en JSON-schema-uitvoer ondersteunt.
 
 ## Productie-uitrol
 
