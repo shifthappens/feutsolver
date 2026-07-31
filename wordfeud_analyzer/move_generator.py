@@ -470,8 +470,9 @@ def _score_move(state: BoardState, word: str, row: int, col: int, direction: Dir
         tile = newly.get((r, c))
         if tile:
             value = 0 if tile.is_blank else LETTER_VALUES[char]
-            main_sum += value * LETTER_MULTIPLIER[existing.bonus]
-            main_multiplier *= WORD_MULTIPLIER[existing.bonus]
+            bonus = state.effective_bonus(r, c)
+            main_sum += value * LETTER_MULTIPLIER[bonus]
+            main_multiplier *= WORD_MULTIPLIER[bonus]
         else:
             main_sum += 0 if existing.is_blank else LETTER_VALUES[char]
     score = main_sum * main_multiplier
@@ -481,14 +482,14 @@ def _score_move(state: BoardState, word: str, row: int, col: int, direction: Dir
         cross = _word_at(state, tile.row, tile.col, pr, pc, tile.letter)
         if len(cross) > 1:
             cross_words.append(cross)
-            cell = state.grid[tile.row][tile.col]
+            bonus = state.effective_bonus(tile.row, tile.col)
             # Existing cross letters were previously placed, so their bonuses never apply.
             old_sum = sum(
                 0 if state.grid[r][c].is_blank else LETTER_VALUES[state.grid[r][c].letter or "A"]
                 for r, c in _cross_existing_positions(state, tile.row, tile.col, pr, pc)
             )
-            new_value = 0 if tile.is_blank else LETTER_VALUES[tile.letter] * LETTER_MULTIPLIER[cell.bonus]
-            score += (old_sum + new_value) * WORD_MULTIPLIER[cell.bonus]
+            new_value = 0 if tile.is_blank else LETTER_VALUES[tile.letter] * LETTER_MULTIPLIER[bonus]
+            score += (old_sum + new_value) * WORD_MULTIPLIER[bonus]
     if len(tiles) == 7:
         score += 40
     return score, cross_words

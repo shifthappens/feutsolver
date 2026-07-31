@@ -9,6 +9,18 @@ Een Nederlandse Wordfeud-analyzer met twee strikt gescheiden onderdelen:
 
 ## Woorden die op het bord liggen, worden geleerd
 
+## Interactief werken
+
+De startpagina opent met een leeg standaard-Wordfeudbord van 15×15 vakken. Je kunt het bord en het rek handmatig invullen, of een screenshot uploaden. Een succesvolle upload vervangt in één keer het bord, de effectieve bonusvakken, de rekletters, blanco-toewijzingen en de confidence-metadata. Bij een afgewezen upload blijft de huidige stand behouden.
+
+Klik op `Solve` om maximaal zes zetten te laten berekenen. De Python-solver blijft daarbij leidend voor geldigheid, kruiswoorden en score. De eerste suggestie wordt groen als voorbeeld op het bord gelegd; kies een andere suggestie om de preview te wisselen. `Cancel` verlaat de preview zonder de stand te wijzigen. `Place` past uitsluitend een nog geldige suggestie toe en verbruikt de gebruikte rekletters precies één keer, inclusief blanco's.
+
+Het rek mag leeg zijn, maar `Solve` blijft dan uitgeschakeld met een uitleg. Handmatig ingevoerde letters zijn gewone tegels; blanco's die uit een screenshot komen behouden hun blank-status. Tijdens een preview zijn bord, rek en state-changing save-acties vergrendeld. De verborgen invoer houdt typen en mobiele schermtoetsenborden bruikbaar; pijltjes verplaatsen de selectie, een tweede klik wisselt horizontaal/verticaal en `Backspace` gaat terug en wist.
+
+Saves worden versie `v1` in de browser-localStorage bewaard. De eerste `Save als…` vereist een niet-lege, hoofdletterongevoelig unieke naam; daarna werkt `Save` de gekoppelde save bij en maakt `Rename` de naamswijziging direct blijvend. `Load` herstelt de volledige stand. Corruptie of een onbekende opslagversie wordt overgeslagen met een waarschuwing. Handmatige edits en uploads slaan niets automatisch op: alleen een succesvolle `Place` werkt een gekoppelde save automatisch bij.
+
+De bestaande screenshot-afwijzingen, confidencecontrole, geleerde woorden, woordenlijstbeheer en suggestievervanging blijven beschikbaar. Een nieuw bord wist de actieve save-link; een upload behoudt die link, zodat een volgende succesvolle plaatsing nog steeds automatisch naar dezelfde save kan schrijven.
+
 Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden toegevoegd aan `data/geleerde-woorden.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
 
 Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n screenshot wordt geweigerd vóór er een model aan te pas komt, zodat er ook niets van geleerd wordt.
@@ -19,11 +31,11 @@ Los daarvan geldt een stelling over het bord zelf: in een geldige stand hangen a
 
 OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `façade` wordt `FACADE`, `abituriënt` wordt `ABITURIENT`. Dat scheelt ruim drieduizend woorden die eerder volledig ontbraken.
 
-De app toont naast de beste zet vijf alternatieven. Iedere suggestie krijgt een eigen bordweergave; alleen de nieuwe stenen zijn groen gemarkeerd.
+De app toont naast de beste zet vijf alternatieven. Selecteer een suggestie om de preview op het interactieve bord te wisselen; alleen de nieuwe stenen zijn groen gemarkeerd.
 
 Onder de suggesties kun je een voorgesteld woord insturen om het permanent uit de geconfigureerde woordenlijst te verwijderen. De app bouwt de woordenlijstcache opnieuw op en vult de suggesties daarna aan met de eerstvolgende legale zet. Staat het woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
 
-Eén klik volstaat: na de vision-extractie rekent de app direct door en toont hij de top 6. Er is geen JSON-controlestap meer. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
+Na een screenshot-upload wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Solve`. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
 
 Omdat wij de tegels zelf uitsnijden en op volgorde zetten, blijft er nog één foutmodus over: het model geeft een ander aantal letters terug dan er tegels zijn. Dat is één controle, en de retry noemt het verwachte aantal. Losse tegels zonder buur kan Wordfeud niet produceren; die worden als herkenningsfout gemeld vóór er een model aan te pas komt.
 
@@ -70,4 +82,7 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 
 ```bash
 python -m pytest -q
+node --test frontend/board.test.js
 ```
+
+De Python-tests controleren onder andere de standaardbonusindeling, lege rekken, zettoepassing, rackverbruik, blanco's, stale solve-resultaten en atomische uploadvervanging. De Node-tests controleren de bord- en rack-reducer, richting, wissen, preview-locks en localStorage CRUD.

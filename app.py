@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+from uuid import uuid4
 
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from wordfeud_analyzer.models import BoardState, Move
+from wordfeud_analyzer.models import BoardState, Move, standard_board
 from wordfeud_analyzer.move_generator import (
     DEFAULT_LEARNED_WORDS_PATH,
     Gaddag,
@@ -19,28 +22,27 @@ from wordfeud_analyzer.move_generator import (
     normalise_word,
     remove_word_from_wordlist,
 )
+from wordfeud_analyzer.state import (
+    InvalidSolveRequest,
+    StaleSolveRequest,
+    apply_place_request,
+    make_solve_result,
+    replace_from_upload,
+    validate_snapshot,
+)
 from wordfeud_analyzer.vision import VisionExtractionError, extract_board
 
 st.set_page_config(page_title="Wordfeud Analyzer", page_icon="🔤", layout="wide")
 
-BONUS_CLASS = {"NORMAL": "normal", "DL": "dl", "TL": "tl", "DW": "dw", "TW": "tw"}
-BONUS_LABEL = {"NORMAL": "", "DL": "2L", "TL": "3L", "DW": "2W", "TW": "3W"}
 configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
-MAX_UPLOAD_BYTES = 1 * 1024 * 1024
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
-# Words seen on real boards are appended here. It lives outside the repository, next
-# to the word list on the server, and survives a deploy.
 LEARNED_WORDS = Path(os.getenv("WORDFEUD_LEARNED_WORDS_PATH", str(DEFAULT_LEARNED_WORDS_PATH)))
-
-
-def clear_analysis_state() -> None:
-    """Clear results when the step-1 upload changes or is removed."""
-    for key in ("board_state", "moves", "confidence", "learned", "processed_image_signature"):
-        st.session_state.pop(key, None)
+MAX_UPLOAD_BYTES = 1 * 1024 * 1024
+FRONTEND = Path(__file__).parent / "frontend"
+wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
 
 
 def secret_or_env(name: str, default: str = "") -> str:
-    """Prefer an environment variable, then Streamlit's gitignored secrets.toml."""
     environment_value = os.getenv(name)
     if environment_value:
         return environment_value
@@ -52,12 +54,6 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_lexicon(path: str, learned_path: str, source_signature: tuple[int, ...]) -> Gaddag:
-    """A minimized GADDAG is expensive to build once, but safe to reuse.
-
-    Both source signatures are part of the cache key: learning or removing a word
-    has to produce a new lexicon, and leaving either one out would silently serve
-    the old one.
-    """
     _ = source_signature
     return load_wordlist(path, learned_path)
 
@@ -75,11 +71,7 @@ def lexicon_signature() -> tuple[int, ...]:
 
 
 def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]]:
-    """Learn the words lying on this board, then return a lexicon that knows them.
-
-    Wordfeud only accepts a move its own dictionary allows, so whatever lies on the
-    board is legal by definition — even when OpenTaal does not list it.
-    """
+    """Keep the existing learned-word behavior for screenshots and manual boards."""
     lexicon = get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature())
     unknown = [word for word in board_words(state) if not lexicon.contains(word)]
     if not unknown:
@@ -87,154 +79,267 @@ def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]
     try:
         added = learn_words(unknown, LEARNED_WORDS)
     except OSError as error:
-        _ = st.warning(f"Nieuwe woorden konden niet worden bewaard ({error}). De suggesties kloppen wel.")
+        st.warning(f"Nieuwe woorden konden niet worden bewaard ({error}). De suggesties kloppen wel.")
         return lexicon, []
     if not added:
         return lexicon, []
-    learned_message = (
-        f"{len(added)} nieuw woord geleerd"
-        if len(added) == 1
-        else f"{len(added)} nieuwe woorden geleerd"
-    )
-    with st.spinner(f"{learned_message}; woordenlijst wordt opnieuw opgebouwd…"):
-        return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature()), added
+    return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature()), added
 
 
-def render_board(state: BoardState, move: Move | None = None) -> None:
-    added = {(tile.row, tile.col): tile for tile in (move.tiles if move else [])}
-    cells: list[str] = []
-    for r, row in enumerate(state.grid):
-        for c, cell in enumerate(row):
-            tile = added.get((r, c))
-            if tile:
-                label = tile.letter
-                classes = "new blank" if tile.is_blank else "new"
-            elif cell.letter:
-                label = cell.letter.lower() if cell.is_blank else cell.letter
-                classes = "existing"
-            else:
-                label = BONUS_LABEL[cell.bonus]
-                classes = BONUS_CLASS[cell.bonus]
-            cells.append(f'<div class="cell {classes}" title="rij {r + 1}, kolom {c + 1}">{label}</div>')
-    title = "Huidig bord" if move is None else f"{move.word} — {move.score} punten"
-    _ = st.markdown(f"<div class='board-title'>{title}</div><div class='board'>{''.join(cells)}</div>", unsafe_allow_html=True)
+def initialise_session() -> None:
+    if "working_state" not in st.session_state:
+        st.session_state.working_state = standard_board().model_dump(mode="json")
+    st.session_state.setdefault("solve_result", None)
+    st.session_state.setdefault("confidence", None)
+    st.session_state.setdefault("learned", [])
+    st.session_state.setdefault("upload_signature", None)
+    st.session_state.setdefault("upload_error_signature", None)
+    st.session_state.setdefault("upload_feedback", None)
+    st.session_state.setdefault("upload_key", 0)
+    st.session_state.setdefault("component_response", None)
+    st.session_state.setdefault("last_component_event_signature", None)
 
 
-_ = st.markdown("""
-<style>
-.board { display:grid; grid-template-columns:repeat(15,minmax(20px,1fr)); max-width:750px; aspect-ratio:1;
-  border:3px solid #513724; background:#513724; gap:1px; margin:8px 0 24px; }
-.cell { min-width:0; display:flex; justify-content:center; align-items:center; font-size:clamp(8px,1.35vw,16px); font-weight:800;
-  background:#efe2bd; color:#5c4431; aspect-ratio:1; }
-.cell.dl { background:#79c9e2; color:#123a49; } .cell.tl { background:#2186ae; color:white; }
-.cell.dw { background:#ee9bab; color:#5c1b28; } .cell.tw { background:#d74e56; color:white; }
-.cell.existing { background:#f7d47e; box-shadow:inset 0 0 0 1px #c09a3f; }
-.cell.new { background:#a9e4a3; color:#173a1b; box-shadow:inset 0 0 0 3px #238636; transform:scale(.96); }
-.cell.blank { font-style:italic; }.board-title { font-weight:700; margin-top:8px; }
-</style>
-""", unsafe_allow_html=True)
+def current_state() -> BoardState:
+    return BoardState.model_validate(st.session_state.working_state)
 
-_ = st.title("Wordfeud Analyzer")
-_ = st.caption("Vision leest alleen de letters van de tegels; positie, bonusvakken, woordvalidatie en scores zijn lokaal en deterministisch.")
-_ = st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
-api_key = secret_or_env("OPENROUTER_API_KEY")
-model = secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash")
+def set_state(state: BoardState) -> None:
+    st.session_state.working_state = state.model_dump(mode="json")
 
-image = st.file_uploader(
-    "Stap 1 — upload één Wordfeud-screenshot",
+
+def response(kind: str, **payload: Any) -> None:
+    st.session_state.component_response = {"kind": kind, **payload}
+
+
+def solve_state(state: BoardState) -> tuple[list[Move], list[str]]:
+    lexicon, learned = lexicon_including_played_words(state)
+    return generate_moves(state, lexicon, limit=6), learned
+
+
+def handle_component_event(event: object) -> None:
+    if not isinstance(event, dict):
+        return
+    message = cast(dict[str, object], event)
+    # Streamlit can replay the last component value after a rerun. Deduplicate
+    # the complete message rather than only the client id: a remounted iframe
+    # may restart its local counter, while a new event can legitimately reuse
+    # that number.
+    event_signature = json.dumps(message, sort_keys=True, separators=(",", ":"))
+    if event_signature == st.session_state.last_component_event_signature:
+        return
+    st.session_state.last_component_event_signature = event_signature
+    kind = message.get("type")
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    state = current_state()
+
+    if kind == "new_board":
+        set_state(standard_board())
+        st.session_state.solve_result = None
+        st.session_state.confidence = None
+        st.session_state.learned = []
+        st.session_state.upload_feedback = None
+        st.session_state.upload_signature = None
+        st.session_state.upload_error_signature = None
+        st.session_state.upload_key += 1
+        st.rerun()
+
+    if kind in {"board_change", "solve_request"}:
+        try:
+            incoming = validate_snapshot(payload.get("snapshot"))
+        except Exception:
+            response("solve_error", error="Het bordbericht was ongeldig; de huidige stand is behouden.")
+            st.rerun()
+        if kind == "board_change":
+            if st.session_state.solve_result is not None:
+                return
+            set_state(incoming)
+            st.session_state.confidence = None
+            st.session_state.learned = []
+            st.session_state.upload_feedback = None
+            st.rerun()
+        state = incoming
+        set_state(state)
+        st.session_state.confidence = None
+        try:
+            if not state.rack:
+                response("solve_error", error="Vul minstens één letter of blanco in het rek in voordat je Solve kiest.")
+                st.session_state.solve_result = None
+                st.rerun()
+            moves, learned = solve_state(state)
+            st.session_state.learned = learned
+        except Exception as error:
+            st.session_state.solve_result = None
+            response("solve_error", error=f"De zetten konden niet worden berekend: {error}")
+            st.rerun()
+        if not moves:
+            st.session_state.solve_result = None
+            response("solve_error", error="Geen legale zet gevonden in de gekozen woordenlijst.")
+            st.rerun()
+        st.session_state.solve_result = make_solve_result(state, moves, uuid4().hex)
+        st.rerun()
+
+    if kind == "cancel":
+        st.session_state.solve_result = None
+        st.rerun()
+
+    if kind == "load":
+        try:
+            loaded = validate_snapshot(payload.get("snapshot"))
+        except Exception:
+            response("solve_error", error="Deze save is ongeldig; de huidige stand is behouden.")
+            st.rerun()
+        set_state(loaded)
+        st.session_state.solve_result = None
+        st.session_state.confidence = None
+        st.session_state.learned = []
+        st.session_state.upload_feedback = None
+        st.rerun()
+
+    if kind == "place_request":
+        solve_result = st.session_state.solve_result
+        try:
+            committed = apply_place_request(state, solve_result, payload)
+        except StaleSolveRequest as error:
+            st.session_state.solve_result = None
+            response("place_result", ok=False, error=str(error))
+            st.rerun()
+        except InvalidSolveRequest as error:
+            st.session_state.solve_result = None
+            response("place_result", ok=False, error=str(error))
+            st.rerun()
+        except ValueError as error:
+            st.session_state.solve_result = None
+            response("place_result", ok=False, error=f"De zet kon niet worden geplaatst: {error}")
+            st.rerun()
+        set_state(committed)
+        st.session_state.solve_result = None
+        st.session_state.confidence = None
+        response("place_result", ok=True, snapshot=committed.model_dump(mode="json"))
+        st.rerun()
+
+
+def process_upload() -> None:
+    upload = st.session_state.get("current_upload")
+    if upload is None:
+        return
+    signature = (str(upload.name), int(upload.size), str(getattr(upload, "file_id", "")))
+    if signature in {st.session_state.upload_signature, st.session_state.upload_error_signature}:
+        return
+    if upload.size > MAX_UPLOAD_BYTES:
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = "Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw."
+        return
+    api_key = secret_or_env("OPENROUTER_API_KEY")
+    if not api_key:
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = "De OpenRouter API key is niet op de server geconfigureerd."
+        return
+    suffix = Path(cast(str, upload.name)).suffix or ".png"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
+            temporary.write(upload.getvalue())
+            temporary_path = Path(temporary.name)
+        extraction = extract_board(
+            temporary_path,
+            api_key=api_key,
+            model=secret_or_env("OPENROUTER_VISION_MODEL", "google/gemini-2.5-flash"),
+        )
+        # Replace the complete working state only after extraction succeeds.
+        set_state(replace_from_upload(current_state(), extraction))
+        st.session_state.confidence = extraction.confidence
+        st.session_state.learned = []
+        st.session_state.solve_result = None
+        st.session_state.upload_signature = signature
+        st.session_state.upload_error_signature = None
+        st.session_state.upload_feedback = "Screenshot geladen; controleer het bord en vul zo nodig handmatig aan."
+    except VisionExtractionError as error:
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = str(error)
+    except Exception as error:
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = f"De screenshot kon niet worden verwerkt: {error}"
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def render_replacement_form() -> None:
+    solve_result = st.session_state.get("solve_result")
+    if not isinstance(solve_result, dict) or not solve_result.get("moves"):
+        return
+    with st.form("replace_suggestion", clear_on_submit=True):
+        word_to_replace = st.text_input("Een suggestie vervangen", placeholder="Typ een voorgesteld woord")
+        submitted = st.form_submit_button("Vervang suggestie")
+    if not submitted:
+        return
+    state = current_state()
+    entered_word = normalise_word(word_to_replace)
+    suggested_words = {Move.model_validate(item).word for item in solve_result["moves"]}
+    if not entered_word:
+        st.warning("Vul een geldig woord in.")
+        return
+    if entered_word not in suggested_words:
+        st.warning("Dat woord staat niet tussen de huidige suggesties.")
+        return
+    try:
+        removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)
+        removed_from_learned = remove_word_from_wordlist(entered_word, LEARNED_WORDS)
+    except OSError as error:
+        st.error(f"Het woord kon niet uit de woordenlijst worden verwijderd ({error}).")
+        return
+    if not (removed_from_wordlist or removed_from_learned):
+        st.error("Het woord staat niet in de geconfigureerde woordenlijsten.")
+        return
+    try:
+        moves, learned = solve_state(state)
+    except Exception as error:
+        st.error(f"De vervangende suggestie kon niet worden berekend: {error}")
+        return
+    st.session_state.learned = learned
+    if not moves:
+        st.session_state.solve_result = None
+        response("solve_error", error="Geen vervangende legale zet gevonden in de gekozen woordenlijst.")
+        st.rerun()
+    st.session_state.solve_result = make_solve_result(state, moves, uuid4().hex)
+    st.rerun()
+
+
+initialise_session()
+st.title("Wordfeud Analyzer")
+st.caption("Een responsive, interactief bord: bewerk lokaal, laat Python de screenshot, zetten en score controleren.")
+st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
+
+upload = st.file_uploader(
+    "Upload Screenshot",
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=False,
-    key="step1_image",
-    on_change=clear_analysis_state,
+    key=f"current_upload_{st.session_state.upload_key}",
 )
-if image and image.size > MAX_UPLOAD_BYTES:
-    _ = st.error("Deze screenshot is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw.")
-elif image:
-    _ = st.image(image, caption="Ingelezen screenshot", width=420)
-    image_signature = (str(image.name), image.size, str(getattr(image, "file_id", "")))
-    if st.session_state.get("processed_image_signature") != image_signature:
-        if not api_key:
-            _ = st.error("De OpenRouter API key is niet op de server geconfigureerd.")
-        else:
-            st.session_state.processed_image_signature = image_signature
-            suffix = Path(cast(str, image.name)).suffix or ".png"
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
-                _ = temporary.write(image.getvalue())
-                image_path = temporary.name
-            try:
-                with st.spinner("Bord en bonusvakken worden uitgelezen…"):
-                    extraction = extract_board(image_path, api_key=api_key, model=model)
-                lexicon, learned = lexicon_including_played_words(extraction.state)
-                with st.spinner("Legale zetten worden volledig doorgerekend…"):
-                    moves = generate_moves(extraction.state, lexicon, limit=6)
-                st.session_state.board_state = extraction.state.model_dump()
-                st.session_state.moves = [move.model_dump() for move in moves]
-                st.session_state.confidence = extraction.confidence
-                st.session_state.learned = learned
-            except VisionExtractionError as error:
-                _ = st.error(str(error))
-            except Exception as error:
-                _ = st.error(f"De zetten konden niet worden berekend: {error}")
-            finally:
-                Path(image_path).unlink(missing_ok=True)
+st.session_state.current_upload = upload
+process_upload()
 
-if "board_state" in st.session_state:
-    state = BoardState.model_validate(st.session_state.board_state)
-    stored_moves = cast(list[object], st.session_state.get("moves", []))
-    moves = [Move.model_validate(item) for item in stored_moves]
-    confidence = cast(float, st.session_state.get("confidence", 0.0))
-    _ = st.subheader("Uitgelezen bord")
-    _ = st.caption(f"Rack: {' '.join(state.rack)} · vision-model {confidence:.0f}% zeker van deze uitlezing")
-    learned = cast(list[str], st.session_state.get("learned", []))
-    if learned:
-        _ = st.caption("Nieuw geleerd van dit bord: " + ", ".join(sorted(learned)))
-    render_board(state)
-    _ = st.subheader("Suggesties")
-    if moves:
-        with st.form("replace_suggestion", clear_on_submit=True):
-            word_to_replace = st.text_input("Een suggestie vervangen", placeholder="Typ een voorgesteld woord")
-            replace_submitted = st.form_submit_button("Vervang suggestie")
-        if replace_submitted:
-            entered_word = normalise_word(word_to_replace)
-            suggested_words = {move.word for move in moves}
-            if not entered_word:
-                _ = st.warning("Vul een geldig woord in.")
-            elif entered_word not in suggested_words:
-                _ = st.warning("Dat woord staat niet tussen de huidige suggesties.")
-            else:
-                try:
-                    removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)
-                    # A board-learned copy must also be removed, otherwise it would
-                    # immediately put the word back into the rebuilt lexicon.
-                    removed_from_learned = remove_word_from_wordlist(entered_word, LEARNED_WORDS)
-                except OSError as error:
-                    _ = st.error(f"Het woord kon niet uit de woordenlijst worden verwijderd ({error}).")
-                else:
-                    if not (removed_from_wordlist or removed_from_learned):
-                        _ = st.error("Het woord staat niet in de geconfigureerde woordenlijsten.")
-                    else:
-                        with st.spinner("Woordenlijst wordt bijgewerkt en nieuwe suggestie wordt berekend…"):
-                            updated_lexicon = get_lexicon(
-                                str(DEFAULT_WORDLIST),
-                                str(LEARNED_WORDS),
-                                lexicon_signature(),
-                            )
-                            replacement_moves = generate_moves(state, updated_lexicon, limit=6)
-                        st.session_state.moves = [move.model_dump() for move in replacement_moves]
-                        st.rerun()
-    if not moves:
-        _ = st.warning("Geen legale zet in de gekozen woordenlijst gevonden.")
-    else:
-        tabs = st.tabs([f"{index + 1}. {move.word} · {move.score}" for index, move in enumerate(moves)])
-        for tab, move in zip(tabs, moves):
-            with tab:
-                detail = f"Start: rij {move.row + 1}, kolom {move.col + 1}; {'horizontaal' if move.direction == 'H' else 'verticaal'}"
-                if move.cross_words:
-                    detail += " · kruiswoorden: " + ", ".join(move.cross_words)
-                if move.bingo:
-                    detail += " · bingo +40"
-                st.write(detail)
-                render_board(state, move)
-else:
-    _ = st.info("Upload een screenshot en voeg voor volledige resultaten de OpenTaal-woordenlijst toe.")
+state = current_state()
+confidence = st.session_state.get("confidence")
+if confidence is not None:
+    st.caption(f"Screenshot-confidence: {float(confidence):.0f}%. Controleer de zichtbare letters en bonussen.")
+if st.session_state.get("learned"):
+    st.caption("Nieuw geleerd: " + ", ".join(sorted(st.session_state.learned)))
+if st.session_state.get("upload_feedback"):
+    st.info(st.session_state.upload_feedback)
+
+component_response = st.session_state.component_response
+st.session_state.component_response = None
+event = wordfeud_board(
+    snapshot=state.model_dump(mode="json"),
+    mode="preview" if st.session_state.solve_result else "edit",
+    solve_result=st.session_state.solve_result,
+    response=component_response,
+    default=None,
+    key="wordfeud-board",
+)
+handle_component_event(event)
+render_replacement_form()

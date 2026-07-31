@@ -5,6 +5,28 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 Bonus = Literal["NORMAL", "DL", "TL", "DW", "TW"]
 
+BOARD_SIZE = 15
+
+# Wordfeud's standard board is symmetric, but unlike the Scrabble board its
+# corners are TL and the centre star is a normal square.
+STANDARD_BONUS_LAYOUT: tuple[tuple[Bonus, ...], ...] = (
+    ("TL", "NORMAL", "NORMAL", "NORMAL", "TW", "NORMAL", "NORMAL", "DL", "NORMAL", "NORMAL", "TW", "NORMAL", "NORMAL", "NORMAL", "TL"),
+    ("NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL"),
+    ("NORMAL", "NORMAL", "DW", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "DW", "NORMAL", "NORMAL"),
+    ("NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL"),
+    ("TW", "NORMAL", "NORMAL", "NORMAL", "DW", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "DW", "NORMAL", "NORMAL", "NORMAL", "TW"),
+    ("NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL"),
+    ("NORMAL", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "NORMAL"),
+    ("DL", "NORMAL", "NORMAL", "DW", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "DW", "NORMAL", "NORMAL", "DL"),
+    ("NORMAL", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "NORMAL"),
+    ("NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL"),
+    ("TW", "NORMAL", "NORMAL", "NORMAL", "DW", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "DW", "NORMAL", "NORMAL", "NORMAL", "TW"),
+    ("NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL"),
+    ("NORMAL", "NORMAL", "DW", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "DW", "NORMAL", "NORMAL"),
+    ("NORMAL", "DL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "TL", "NORMAL", "NORMAL", "NORMAL", "DL", "NORMAL"),
+    ("TL", "NORMAL", "NORMAL", "NORMAL", "TW", "NORMAL", "NORMAL", "DL", "NORMAL", "NORMAL", "TW", "NORMAL", "NORMAL", "NORMAL", "TL"),
+)
+
 
 class Cell(BaseModel):
     """Een screenshot-cel. Een bonus blijft aanwezig, ook onder een gelegde tegel."""
@@ -34,7 +56,11 @@ class Cell(BaseModel):
 
 class BoardState(BaseModel):
     grid: list[list[Cell]] = Field(..., min_length=15, max_length=15)
-    rack: list[str] = Field(..., min_length=1, max_length=7)
+    rack: list[str] = Field(..., min_length=0, max_length=7)
+    # The grid's cell bonus is the effective bonus currently available to the
+    # solver.  This second matrix preserves the board layout when an editor
+    # places and later removes a tile.
+    effective_bonuses: list[list[Bonus]] | None = None
 
     @field_validator("rack", mode="before")
     @classmethod
@@ -50,7 +76,31 @@ class BoardState(BaseModel):
     def fifteen_rows_of_fifteen(self) -> "BoardState":
         if any(len(row) != 15 for row in self.grid):
             raise ValueError("grid must contain exactly 15 cells per row")
+        if self.effective_bonuses is not None and (
+            len(self.effective_bonuses) != BOARD_SIZE
+            or any(len(row) != BOARD_SIZE for row in self.effective_bonuses)
+        ):
+            raise ValueError("effective_bonuses must contain exactly 15 cells per row")
         return self
+
+    def effective_bonus(self, row: int, col: int) -> Bonus:
+        """Return the bonus that applies when a new tile covers a square."""
+        if self.effective_bonuses is not None:
+            return self.effective_bonuses[row][col]
+        return self.grid[row][col].bonus
+
+
+def standard_board() -> BoardState:
+    """Create a fresh, empty standard Wordfeud board."""
+    bonuses = [list(row) for row in STANDARD_BONUS_LAYOUT]
+    return BoardState(
+        grid=[
+            [{"letter": None, "bonus": bonuses[row][col], "is_blank": False} for col in range(BOARD_SIZE)]
+            for row in range(BOARD_SIZE)
+        ],
+        rack=[],
+        effective_bonuses=bonuses,
+    )
 
 
 class PlacedTile(BaseModel):

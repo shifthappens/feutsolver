@@ -73,7 +73,7 @@ class TileReading(BaseModel):
     """The only thing the model returns: glyphs, in an order we imposed ourselves."""
 
     letters: list[str] = Field(..., max_length=BOARD_SIZE * BOARD_SIZE)
-    rack: list[str] = Field(..., max_length=7)
+    rack: list[str] = Field(..., min_length=0, max_length=7)
     confidence: float = Field(..., ge=0, le=100)
 
     @field_validator("letters", mode="before")
@@ -549,6 +549,7 @@ def _to_board_state(
             "is_blank": (row, col) in placed and placed[(row, col)].islower(),
         } for col in range(BOARD_SIZE)] for row in range(BOARD_SIZE)],
         "rack": rack,
+        "effective_bonuses": bonuses,
     })
 
 
@@ -634,8 +635,6 @@ def extract_board(
                 raise ValueError(
                     f"expected exactly {len(tiles)} letters, one per tile in the image, but received {len(reading.letters)}"
                 )
-            if not reading.rack:
-                raise ValueError("the rack may not be empty")
             if reading.confidence < MINIMUM_CONFIDENCE:
                 raise LowConfidenceError(reading.confidence)
             return BoardExtraction(
