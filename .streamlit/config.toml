@@ -4,3 +4,8 @@ maxUploadSize = 1
 maxMessageSize = 5
 # Keep a mobile browser session available while its app is briefly backgrounded.
 disconnectedSessionTTL = 600
+# Rerun the app as soon as Python or component files change on disk.
+runOnSave = true
+# The environment does not bundle watchdog on macOS; polling is the reliable
+# fallback and keeps reloads working without a manual process restart.
+fileWatcherType = "poll"

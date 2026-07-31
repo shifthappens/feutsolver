@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import NamedTuple, TypeAlias, cast
 
 import requests
-from PIL import Image, ImageDraw
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from PIL import Image, ImageDraw, ImageFont
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .models import BoardState
 
@@ -32,9 +32,14 @@ Rgb: TypeAlias = tuple[int, int, int]
 
 EXTRACTION_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
-The first image contains every tile that lies on the board, cut out of the screenshot
-and laid out in a fixed order: left to right, then on to the next line. Return one
-letter for each of those tiles, in exactly that order.
+The first image is a numbered contact sheet containing every tile that lies on the
+board. Each tile is in a fixed reading order: left to right, then on to the next
+line. Return one object for every tile, with its 1-based position in that contact
+sheet as `index` and its large printed glyph as `letter`. Never omit, merge,
+duplicate, or invent a tile. Before returning, check that the index set is exactly
+1, 2, 3, ... up to the number of tiles in the image. A missing index shifts every
+following letter onto the wrong board square, so an uncertain glyph must still keep
+its tile's index instead of being skipped.
 
 The second image is the player's rack. Return its letters from left to right.
 
@@ -48,7 +53,7 @@ The second image is the player's rack. Return its letters from left to right.
 RACK_ONLY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
 The board is empty, so only the player's rack matters. Return the rack letters from
-left to right, leaving `letters` empty.
+left to right, leaving `tiles` empty.
 
 - Read the large glyph on a tile; the small number beside it is the tile's point value.
 - An unassigned blank on the rack is `?`.
@@ -59,32 +64,58 @@ left to right, leaving `letters` empty.
 RECOVERY_PROMPT = """You read letters from a Wordfeud screenshot. Do not solve the game.
 
 The first image is a contact sheet of every placed board tile. The tiles are enlarged
-and numbered in reading order; return the large glyph of tile 1, then tile 2, and so
-on, with no missing entries. The second image is the player's rack; return its
-letters from left to right.
+and numbered in reading order. Return one object per tile with the printed tile
+number as `index` and the large glyph as `letter`. Do not skip, merge, duplicate, or
+invent a tile; the indexes must be exactly the numbers shown in the image. Check the
+complete index set before returning. The second image is the player's rack; return
+its letters from left to right.
 
 - Read only the large glyph; a small number is its point value.
 - Return a blank tile's assigned letter in lowercase, and an unassigned rack blank as `?`.
 - `confidence` is your honest certainty, 0-100, that every returned letter matches.
 """
 
+JSON_OUTPUT_INSTRUCTION = """Return compact JSON only: no markdown fences, explanation, or comments. Keep each
+tile object on one line so a full board fits comfortably in the response limit."""
+
+
+class IndexedTileReading(BaseModel):
+    """One OCR result tied to the number printed next to its source tile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(..., ge=1, le=BOARD_SIZE * BOARD_SIZE)
+    letter: str = Field(..., min_length=1, max_length=1, pattern=r"^[A-Za-z]$")
+
+    @field_validator("letter", mode="before")
+    @classmethod
+    def validate_letter(cls, value: object) -> str:
+        letter = str(value).strip()
+        if len(letter) != 1 or not letter.isalpha() or not letter.isascii():
+            raise ValueError("every tile letter must be a single A-Z or a-z character")
+        return letter
+
 
 class TileReading(BaseModel):
-    """The only thing the model returns: glyphs, in an order we imposed ourselves."""
+    """OCR results with an explicit identity for every board tile."""
 
-    letters: list[str] = Field(..., max_length=BOARD_SIZE * BOARD_SIZE)
+    model_config = ConfigDict(extra="forbid")
+
+    tiles: list[IndexedTileReading] = Field(..., max_length=BOARD_SIZE * BOARD_SIZE)
     rack: list[str] = Field(..., min_length=0, max_length=7)
     confidence: float = Field(..., ge=0, le=100)
 
-    @field_validator("letters", mode="before")
+    @property
+    def letters(self) -> list[str]:
+        """Compatibility view in image order; validation uses the tile indexes."""
+        return [tile.letter for tile in sorted(self.tiles, key=lambda tile: tile.index)]
+
+    @field_validator("tiles", mode="before")
     @classmethod
-    def validate_letters(cls, value: object) -> list[str]:
+    def validate_tiles(cls, value: object) -> list[object]:
         if not isinstance(value, list):
-            raise ValueError("letters must be a list")
-        letters = [str(letter).strip() for letter in cast(list[object], value)]
-        if any(len(letter) != 1 or not letter.isalpha() or not letter.isascii() for letter in letters):
-            raise ValueError("every entry in letters must be a single A-Z or a-z character")
-        return letters
+            raise ValueError("tiles must be a list")
+        return cast(list[object], value)
 
     @field_validator("rack", mode="before")
     @classmethod
@@ -100,13 +131,13 @@ class TileReading(BaseModel):
 TILE_READING_SCHEMA: dict[str, JsonValue] = cast(dict[str, JsonValue], TileReading.model_json_schema())
 
 
-def _tile_reading_schema(expected_letters: int) -> dict[str, JsonValue]:
+def _tile_reading_schema(expected_tiles: int) -> dict[str, JsonValue]:
     """Make the model/provider enforce the count derived from local tile geometry."""
     schema = deepcopy(TILE_READING_SCHEMA)
     properties = cast(dict[str, JsonValue], schema["properties"])
-    letters = cast(dict[str, JsonValue], properties["letters"])
-    letters["minItems"] = expected_letters
-    letters["maxItems"] = expected_letters
+    tiles = cast(dict[str, JsonValue], properties["tiles"])
+    tiles["minItems"] = expected_tiles
+    tiles["maxItems"] = expected_tiles
     return schema
 
 # Below this self-reported certainty we discard the reading entirely: a silently
@@ -461,13 +492,19 @@ def tile_strip(board: Image.Image, tiles: list[tuple[int, int]]) -> Image.Image:
     return strip
 
 
-def tile_contact_sheet(board: Image.Image, tiles: list[tuple[int, int]]) -> Image.Image:
-    """Create an enlarged, numbered fallback image for dense-board OCR."""
+def tile_contact_sheet(
+    board: Image.Image,
+    tiles: list[tuple[int, int]],
+    *,
+    columns: int = 8,
+    scale: int = 3,
+) -> Image.Image:
+    """Create an enlarged, clearly numbered image for indexed-board OCR."""
     if not tiles:
         raise ValueError("a tile contact sheet needs at least one tile")
-    columns = 8
-    tile_size = max(120, board.size[0] // BOARD_SIZE * 3)
-    label_height = 24
+    columns = max(1, columns)
+    tile_size = max(120, board.size[0] // BOARD_SIZE * scale)
+    label_height = max(36, tile_size // 6)
     gap = 8
     rows = (len(tiles) + columns - 1) // columns
     sheet = Image.new(
@@ -476,6 +513,10 @@ def tile_contact_sheet(board: Image.Image, tiles: list[tuple[int, int]]) -> Imag
         "white",
     )
     draw = ImageDraw.Draw(sheet)
+    try:
+        label_font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(24, tile_size // 7))
+    except OSError:
+        label_font = ImageFont.load_default()
     width, height = board.size
     for index, (row, col) in enumerate(tiles, start=1):
         left = int(col * width / BOARD_SIZE)
@@ -485,8 +526,8 @@ def tile_contact_sheet(board: Image.Image, tiles: list[tuple[int, int]]) -> Imag
         crop = board.crop((left, top, right, bottom)).resize((tile_size, tile_size), Image.Resampling.LANCZOS)
         x = gap + ((index - 1) % columns) * (tile_size + gap)
         y = gap + ((index - 1) // columns) * (tile_size + label_height + gap)
-        sheet.paste(crop, (x, y))
-        draw.text((x, y + tile_size + 3), str(index), fill="black")
+        draw.text((x + 6, y + 3), f"#{index}", fill="black", font=label_font)
+        sheet.paste(crop, (x, y + label_height))
     return sheet
 
 
@@ -495,6 +536,109 @@ def _image_data_url(image: Image.Image) -> str:
     output = BytesIO()
     image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
     return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _remove_trailing_commas(text: str) -> str:
+    """Remove commas immediately before a JSON object/array terminator.
+
+    Some vision models occasionally add a trailing comma even when a JSON schema
+    response was requested. This scanner deliberately ignores commas inside quoted
+    strings, so it only repairs that harmless formatting mistake.
+    """
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if in_string:
+            result.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+            result.append(character)
+            index += 1
+            continue
+        if character == ",":
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "]}":
+                index += 1
+                continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def _balanced_json_candidates(text: str) -> list[str]:
+    """Find complete object/array fragments inside a fenced or chatty response."""
+    candidates: list[str] = []
+    stack: list[str] = []
+    start: int | None = None
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for index, character in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            if not stack:
+                start = index
+            stack.append(character)
+        elif character in "]}":
+            if not stack or stack[-1] != pairs[character]:
+                stack.clear()
+                start = None
+                continue
+            stack.pop()
+            if not stack and start is not None:
+                candidates.append(text[start : index + 1])
+                start = None
+    return candidates
+
+
+def _json_payload(content: str) -> object:
+    """Decode JSON despite harmless fences, surrounding prose, or trailing commas."""
+    content = content.strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        lines = lines[1:] if lines else lines
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+
+    candidates = [content, *_balanced_json_candidates(content)]
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        for prepared in (candidate, _remove_trailing_commas(candidate)):
+            try:
+                return json.loads(prepared)
+            except json.JSONDecodeError as error:
+                last_error = error
+    if last_error is not None:
+        raise last_error
+    raise ValueError("model response had no JSON object")
+
+
+def _max_response_tokens(expected_tiles: int) -> int:
+    """Leave enough output room for every indexed tile on a dense board."""
+    return min(8_000, max(2_000, 1_000 + expected_tiles * 48))
 
 
 def _parse_content(content: object) -> TileReading:
@@ -509,10 +653,7 @@ def _parse_content(content: object) -> TileReading:
         content = "".join(text_parts)
     if not isinstance(content, str):
         raise ValueError("model response had no JSON text")
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    return TileReading.model_validate(cast(object, json.loads(content)))
+    return TileReading.model_validate(_json_payload(content))
 
 
 def _response_content(response: requests.Response) -> object:
@@ -534,6 +675,30 @@ def _response_content(response: requests.Response) -> object:
     return content
 
 
+def _ordered_tile_letters(reading: TileReading, expected_tiles: int) -> list[str]:
+    """Reject omissions and duplicates before any letter can shift position."""
+    indexes = [tile.index for tile in reading.tiles]
+    counts = Counter(indexes)
+    expected = set(range(1, expected_tiles + 1))
+    actual = set(indexes)
+    duplicates = sorted(index for index, count in counts.items() if count > 1)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if len(indexes) != expected_tiles or duplicates or missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(map(str, missing)))
+        if duplicates:
+            details.append("duplicate " + ", ".join(map(str, duplicates)))
+        if unexpected:
+            details.append("unexpected " + ", ".join(map(str, unexpected)))
+        suffix = "; " + "; ".join(details) if details else ""
+        raise ValueError(
+            f"expected exactly {expected_tiles} indexed tile readings with indexes 1..{expected_tiles}{suffix}"
+        )
+    return [next(tile.letter for tile in reading.tiles if tile.index == index) for index in range(1, expected_tiles + 1)]
+
+
 def _to_board_state(
     letters: list[str],
     tiles: list[tuple[int, int]],
@@ -541,6 +706,12 @@ def _to_board_state(
     bonuses: list[list[str]],
 ) -> BoardState:
     """Put the letters back where we cut them from; a lowercase letter is a blank."""
+    # Keep this invariant at the final write boundary as well as in the API response
+    # validator. A plain zip() silently drops the last board tile when a model or a
+    # future caller supplies one letter too few, shifting the apparent error into
+    # every later position in the screenshot.
+    if len(letters) != len(tiles):
+        raise ValueError(f"expected exactly {len(tiles)} letters for {len(tiles)} tiles, received {len(letters)}")
     placed = dict(zip(tiles, letters))
     return BoardState.model_validate({
         "grid": [[{
@@ -592,24 +763,31 @@ def extract_board(
     bonuses = detect_visible_bonuses(image_path)
 
     images = [_image_data_url(rack_image)] if not tiles else [
-        _image_data_url(tile_strip(board_image, tiles)),
-        _image_data_url(rack_image),
-    ]
-    # The normal path is compact and economical.  A retry gets a materially clearer
-    # image instead of asking the model to count the same dense strip a second time.
-    recovery_images = images if not tiles else [
         _image_data_url(tile_contact_sheet(board_image, tiles)),
         _image_data_url(rack_image),
     ]
+    # The normal path uses numbered crops. A retry gets a materially clearer, larger
+    # image instead of asking the model to count the same dense contact sheet again.
+    recovery_images = images if not tiles else [
+        _image_data_url(tile_contact_sheet(board_image, tiles, columns=6, scale=4)),
+        _image_data_url(rack_image),
+    ]
     base_prompt = RACK_ONLY_PROMPT if not tiles else EXTRACTION_PROMPT
-    prompt = base_prompt
+    prompt = (
+        f"{base_prompt}\nThere are exactly {len(tiles)} placed board tiles in the first image.\n"
+        f"{JSON_OUTPUT_INSTRUCTION}"
+    )
     errors: list[str] = []
     for attempt in range(retries + 1):
         try:
+            # A full board can contain 225 indexed objects. 2,000 output tokens is
+            # enough for a small test board but can truncate a real screenshot before
+            # the closing braces, which then looks like a JSON syntax error.
+            max_tokens = _max_response_tokens(len(tiles))
             payload: dict[str, JsonValue] = {
                 "model": model,
                 "temperature": 0,
-                "max_tokens": 2_000,
+                "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": cast(list[JsonValue], [
                     {"type": "text", "text": prompt},
                     *({"type": "image_url", "image_url": {"url": url}} for url in images),
@@ -631,14 +809,11 @@ def extract_board(
             )
             response.raise_for_status()
             reading = _parse_content(_response_content(response))
-            if len(reading.letters) != len(tiles):
-                raise ValueError(
-                    f"expected exactly {len(tiles)} letters, one per tile in the image, but received {len(reading.letters)}"
-                )
+            letters = _ordered_tile_letters(reading, len(tiles))
             if reading.confidence < MINIMUM_CONFIDENCE:
                 raise LowConfidenceError(reading.confidence)
             return BoardExtraction(
-                _to_board_state(reading.letters, tiles, reading.rack, bonuses), reading.confidence
+                _to_board_state(letters, tiles, reading.rack, bonuses), reading.confidence
             )
         except (requests.RequestException, KeyError, ValueError, ValidationError, json.JSONDecodeError) as exc:
             reason = _short_reason(exc)
@@ -647,7 +822,10 @@ def extract_board(
             # board the retry also swaps in enlarged, numbered tiles, so a repeated
             # count failure does not simply re-run the same weak visual input.
             retry_prompt = RACK_ONLY_PROMPT if not tiles else RECOVERY_PROMPT
-            prompt = f"{retry_prompt}\nYour previous answer was rejected: {reason}\nReturn schema-valid JSON only."
+            prompt = (
+                f"{retry_prompt}\nYour previous answer was rejected: {reason}\n"
+                f"Return schema-valid JSON only.\n{JSON_OUTPUT_INSTRUCTION}"
+            )
             images = recovery_images
     raise VisionExtractionError(
         "Het bord kon niet worden uitgelezen; het vision-model gaf geen bruikbaar antwoord. "

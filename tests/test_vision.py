@@ -17,6 +17,8 @@ from wordfeud_analyzer.vision import (
     _disconnected_tiles,  # pyright: ignore[reportPrivateUsage]
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
+    _max_response_tokens,  # pyright: ignore[reportPrivateUsage]
+    _parse_content,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     _wordfeud_crop_images,  # pyright: ignore[reportPrivateUsage]
     detect_pending_move,
@@ -164,14 +166,67 @@ def test_letters_are_written_back_to_the_squares_they_were_cut_from() -> None:
     assert state.rack == ["R", "?"]
 
 
-def test_a_letter_list_must_hold_single_letters() -> None:
+def test_a_short_letter_list_cannot_silently_shift_the_rest_of_the_board() -> None:
+    bonuses = [["NORMAL"] * BOARD_SIZE for _ in range(BOARD_SIZE)]
+    tiles = [(7, 7), (7, 8), (7, 9)]
+
+    with pytest.raises(ValueError, match="expected exactly 3 letters"):
+        _ = _to_board_state(["K", "A"], tiles, ["R"], bonuses)
+
+
+def test_indexed_tile_readings_must_hold_single_letters() -> None:
     with pytest.raises(ValidationError):
-        _ = TileReading.model_validate({"letters": ["AB"], "rack": ["A"], "confidence": 95})
+        _ = TileReading.model_validate(
+            {"tiles": [{"index": 1, "letter": "AB"}], "rack": ["A"], "confidence": 95}
+        )
     with pytest.raises(ValidationError):
-        _ = TileReading.model_validate({"letters": ["4"], "rack": ["A"], "confidence": 95})
-    reading = TileReading.model_validate({"letters": ["A", "b"], "rack": ["a", "?"], "confidence": 95})
+        _ = TileReading.model_validate(
+            {"tiles": [{"index": 1, "letter": "4"}], "rack": ["A"], "confidence": 95}
+        )
+    reading = TileReading.model_validate(
+        {
+            "tiles": [{"index": 1, "letter": "A"}, {"index": 2, "letter": "b"}],
+            "rack": ["a", "?"],
+            "confidence": 95,
+        }
+    )
     assert reading.letters == ["A", "b"]
     assert reading.rack == ["A", "?"]
+
+
+def test_indexed_tile_readings_are_sorted_by_their_printed_index() -> None:
+    reading = TileReading.model_validate(
+        {
+            "tiles": [
+                {"index": 2, "letter": "A"},
+                {"index": 1, "letter": "K"},
+                {"index": 3, "letter": "T"},
+            ],
+            "rack": [],
+            "confidence": 95,
+        }
+    )
+    assert reading.letters == ["K", "A", "T"]
+
+
+def test_model_json_with_fences_and_trailing_commas_is_recovered() -> None:
+    reading = _parse_content(
+        """Here is the result:
+```json
+{"tiles": [{"index": 1, "letter": "K",},], "rack": ["R",], "confidence": 95,}
+```
+"""
+    )
+
+    assert reading.letters == ["K"]
+    assert reading.rack == ["R"]
+    assert reading.confidence == 95
+
+
+def test_response_budget_grows_for_a_full_board() -> None:
+    assert _max_response_tokens(3) == 2_000
+    assert _max_response_tokens(85) > 2_000
+    assert _max_response_tokens(225) <= 8_000
 
 
 class _FakeResponse:
@@ -205,9 +260,20 @@ def _sent_images(call: dict[str, Any]) -> int:
     return sum(1 for part in call["json"]["messages"][0]["content"] if part["type"] == "image_url")
 
 
+def _tile_payload(letters: str | list[str], rack: list[str], confidence: float) -> dict[str, Any]:
+    return {
+        "tiles": [
+            {"index": index, "letter": letter}
+            for index, letter in enumerate(letters, start=1)
+        ],
+        "rack": rack,
+        "confidence": confidence,
+    }
+
+
 def test_a_confident_reading_becomes_a_board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _screenshot(tmp_path / "board.png", LIGHT_THEME, {(7, 7), (7, 8), (7, 9)})
-    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A", "t"], "rack": ["R", "E"], "confidence": 96})
+    calls = _stub_openrouter(monkeypatch, _tile_payload("KAt", ["R", "E"], 96))
 
     extraction = extract_board(path, api_key="test-key")
 
@@ -223,7 +289,7 @@ def test_an_uncertain_reading_is_rejected_instead_of_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8)})
-    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A"], "rack": ["R"], "confidence": 72})
+    calls = _stub_openrouter(monkeypatch, _tile_payload("KA", ["R"], 72))
 
     with pytest.raises(LowConfidenceError) as raised:
         _ = extract_board(path, api_key="test-key")
@@ -240,8 +306,8 @@ def test_a_wrong_number_of_letters_is_retried_with_the_expected_count(
     path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
     calls = _stub_openrouter(
         monkeypatch,
-        {"letters": ["K", "A"], "rack": ["R"], "confidence": 96},
-        {"letters": ["K", "A", "T"], "rack": ["R"], "confidence": 96},
+        _tile_payload("KA", ["R"], 96),
+        _tile_payload("KAT", ["R"], 96),
     )
 
     extraction = extract_board(path, api_key="test-key")
@@ -249,32 +315,57 @@ def test_a_wrong_number_of_letters_is_retried_with_the_expected_count(
     assert extraction.state.grid[7][9].letter == "T"
     assert len(calls) == 2
     assert "rejected" not in _sent_prompt(calls[0])
-    assert "expected exactly 3 letters" in _sent_prompt(calls[1])
+    assert "expected exactly 3 indexed tile readings" in _sent_prompt(calls[1])
     assert "contact sheet" in _sent_prompt(calls[1])
     for call in calls:
-        letters_schema = call["json"]["response_format"]["json_schema"]["schema"]["properties"]["letters"]
-        assert letters_schema["minItems"] == letters_schema["maxItems"] == 3
+        tiles_schema = call["json"]["response_format"]["json_schema"]["schema"]["properties"]["tiles"]
+        assert tiles_schema["minItems"] == tiles_schema["maxItems"] == 3
+
+
+def test_a_missing_tile_index_is_retried_instead_of_shifting_following_letters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
+    calls = _stub_openrouter(
+        monkeypatch,
+        {
+            "tiles": [
+                {"index": 1, "letter": "K"},
+                {"index": 2, "letter": "A"},
+                {"index": 4, "letter": "T"},
+            ],
+            "rack": ["R"],
+            "confidence": 96,
+        },
+        _tile_payload("KAT", ["R"], 96),
+    )
+
+    extraction = extract_board(path, api_key="test-key")
+
+    assert extraction.state.grid[7][9].letter == "T"
+    assert len(calls) == 2
+    assert "missing 3" in _sent_prompt(calls[1])
 
 
 def test_a_persistent_mismatch_reports_a_readable_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
-    _ = _stub_openrouter(monkeypatch, {"letters": ["K"], "rack": ["R"], "confidence": 96})
+    _ = _stub_openrouter(monkeypatch, _tile_payload("K", ["R"], 96))
 
     with pytest.raises(VisionExtractionError) as raised:
         _ = extract_board(path, api_key="test-key")
 
     message = str(raised.value)
     assert message.startswith("Het bord kon niet worden uitgelezen")
-    assert "expected exactly 3 letters" in message
+    assert "expected exactly 3 indexed tile readings" in message
     assert "pydantic.dev" not in message
 
 
 def test_an_empty_board_asks_only_for_the_rack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An opening move is a legal position, and needs no tile strip at all."""
     path = _screenshot(tmp_path / "board.png", LIGHT_THEME)
-    calls = _stub_openrouter(monkeypatch, {"letters": [], "rack": ["R", "E", "?"], "confidence": 97})
+    calls = _stub_openrouter(monkeypatch, _tile_payload([], ["R", "E", "?"], 97))
 
     extraction = extract_board(path, api_key="test-key")
 
@@ -319,7 +410,7 @@ def test_a_move_that_is_not_played_yet_is_refused(
     """Wordfeud has not approved those words, so the board may not be used or learned from."""
     path = _yellow_bubble(tmp_path / f"{theme_name}.png", THEMES[theme_name])
     assert detect_pending_move(path)
-    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A"], "rack": ["R"], "confidence": 99})
+    calls = _stub_openrouter(monkeypatch, _tile_payload("KA", ["R"], 99))
 
     with pytest.raises(PendingMoveError, match="nog niet gespeeld"):
         _ = extract_board(path, api_key="test-key")
@@ -334,7 +425,7 @@ def test_the_play_button_marks_a_move_that_is_still_being_composed(
     """The surest signal: an invalid placement shows no score bubble, but this button."""
     path = _screenshot(tmp_path / f"{theme_name}.png", THEMES[theme_name], {(7, 7), (7, 8)}, play_button=True)
     assert detect_pending_move(path)
-    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A"], "rack": ["R"], "confidence": 99})
+    calls = _stub_openrouter(monkeypatch, _tile_payload("KA", ["R"], 99))
 
     with pytest.raises(PendingMoveError):
         _ = extract_board(path, api_key="test-key")
@@ -365,7 +456,7 @@ def test_a_loose_word_stops_the_extraction_before_any_model_call(
     path = _screenshot(
         tmp_path / "los.png", DARK_THEME, {(7, 7), (7, 8), (2, 3), (2, 4), (2, 5), (2, 6)}
     )
-    calls = _stub_openrouter(monkeypatch, {"letters": list("KAJLOE"), "rack": ["R"], "confidence": 99})
+    calls = _stub_openrouter(monkeypatch, _tile_payload("KAJLOE", ["R"], 99))
 
     with pytest.raises(LooseTilesError, match="los van de rest"):
         _ = extract_board(path, api_key="test-key")
@@ -404,7 +495,7 @@ def test_a_stray_tile_stops_the_extraction_before_any_model_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (2, 2)})
-    calls = _stub_openrouter(monkeypatch, {"letters": ["K", "A", "T"], "rack": ["R"], "confidence": 96})
+    calls = _stub_openrouter(monkeypatch, _tile_payload("KAT", ["R"], 96))
 
     with pytest.raises(LooseTilesError, match="los van de rest"):
         _ = extract_board(path, api_key="test-key")
