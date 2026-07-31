@@ -2,9 +2,11 @@
 
 The geometry of a Wordfeud screenshot is solved locally and deterministically: where
 the board is, which squares hold a tile, and which bonus each free square carries.
-The language model is asked one thing only — which letter is printed on a tile — and
-never has to count rows, pad a grid or return a coordinate. That keeps its job pure
-OCR, and keeps every positional mistake out of the pipeline by construction.
+The language model is asked one thing only that affects the board — which letter is
+printed on a tile — and never has to count rows, pad a grid or return a coordinate.
+The tiny printed point value is returned as supporting OCR metadata, but is too small
+to be a hard acceptance condition. That keeps positional mistakes out of the pipeline
+without rejecting a correct large glyph over a misread superscript.
 """
 from __future__ import annotations
 
@@ -43,6 +45,8 @@ order and never let an unclear crop move the following glyphs to different IDs.
 The second image is the player's rack. Return its letters from left to right.
 
 - Read the large glyph on a tile; the small number beside it is the tile's point value.
+- The large glyph is authoritative. Never change or omit it merely because the much
+  smaller point value is unclear or appears inconsistent.
 - A blank tile carries no point value. Return the letter it represents in lowercase.
 - An unassigned blank on the rack is `?`.
 - `confidence` is your honest certainty, 0-100, that every letter you return matches
@@ -70,6 +74,7 @@ Do not skip, merge, duplicate, or invent a crop. The second image is the player'
 rack; return its letters from left to right.
 
 - Read only the large glyph; a small number is its point value.
+- The large glyph is authoritative; a doubtful tiny point value must not change it.
 - Return a blank tile's assigned letter in lowercase, and an unassigned rack blank as `?`.
 - A board blank has no point value; return `points: 0` for it.
 - `confidence` is your honest certainty, 0-100, that every returned letter matches.
@@ -81,6 +86,7 @@ Use only the printed `#ID` above each crop as its identity. For every crop retur
 ID as `index`, its large glyph as `letter`, and its small upper-right value as
 `points`. A board blank has no value: use a lowercase glyph and `points: 0`.
 Return the rack in the second image from left to right. Never renumber by image order.
+The large glyph is authoritative; a doubtful tiny point value must not change it.
 """
 
 RACK_RECOVERY_PROMPT = """Independently read only the seven-or-fewer Wordfeud rack tiles in this image,
@@ -158,9 +164,11 @@ def _tile_reading_schema(expected_tiles: int) -> dict[str, JsonValue]:
 # the user to upload a better screenshot.
 MINIMUM_CONFIDENCE = 90.0
 
-# Dutch Wordfeud values are printed on every non-blank tile. They are a second,
-# independent OCR invariant: a shifted `W` (5) can never silently occupy a crop that
-# visibly carries the 2 belonging to `U`.
+# Dutch Wordfeud values are printed on every non-blank tile. They remain useful
+# supporting metadata in fixtures and diagnostics, but the superscripts are much
+# smaller than the glyphs. They must not invalidate an otherwise complete OCR pass:
+# stable crop IDs plus agreement between independent letter readings are the hard
+# positional invariants.
 DUTCH_TILE_POINTS: dict[str, int] = {
     "A": 1, "B": 4, "C": 5, "D": 2, "E": 1, "F": 4, "G": 3,
     "H": 4, "I": 2, "J": 4, "K": 3, "L": 3, "M": 3, "N": 1,
@@ -704,7 +712,13 @@ def _response_content(response: requests.Response) -> object:
 
 
 def _tile_letters_by_index(reading: TileReading, expected_indexes: list[int]) -> dict[int, str]:
-    """Validate stable IDs and printed values before any glyph reaches the board."""
+    """Validate stable IDs before any glyph reaches the board.
+
+    Point values are deliberately not validated here. On real phone screenshots the
+    large glyph can be unambiguous while its tiny superscript is read incorrectly
+    (notably I/T with 2 points being returned as 1). Letter agreement across the
+    normal, reversed and if necessary enlarged passes is the reliable invariant.
+    """
     indexes = [tile.index for tile in reading.tiles]
     counts = Counter(indexes)
     expected = set(expected_indexes)
@@ -730,20 +744,7 @@ def _tile_letters_by_index(reading: TileReading, expected_indexes: list[int]) ->
             f"expected exactly {len(expected_indexes)} indexed tile readings with indexes {description}{suffix}"
         )
 
-    letters: dict[int, str] = {}
-    for tile in reading.tiles:
-        if tile.letter.islower():
-            if tile.points != 0:
-                raise ValueError(f"tile {tile.index} is a blank but returned printed points {tile.points}")
-        else:
-            expected_points = DUTCH_TILE_POINTS[tile.letter.upper()]
-            if tile.points != expected_points:
-                raise ValueError(
-                    f"tile {tile.index} returned {tile.letter} with {tile.points} points; "
-                    f"Dutch Wordfeud prints {expected_points}"
-                )
-        letters[tile.index] = tile.letter
-    return letters
+    return {tile.index: tile.letter for tile in reading.tiles}
 
 
 def _ordered_tile_letters(reading: TileReading, expected_tiles: int) -> list[str]:
@@ -796,7 +797,7 @@ def _request_reading(
     expected_indexes: list[int],
     timeout_seconds: int,
 ) -> tuple[TileReading, dict[int, str]]:
-    """Run one OCR pass and validate identities, count, values, and confidence."""
+    """Run one OCR pass and validate identities, count, glyph shape, and confidence."""
     payload: dict[str, JsonValue] = {
         "model": model,
         "temperature": 0,

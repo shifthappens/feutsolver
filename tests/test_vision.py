@@ -404,24 +404,26 @@ def test_only_disputed_non_contiguous_ids_are_read_a_third_time(
     assert tiles_schema["minItems"] == tiles_schema["maxItems"] == 1
 
 
-def test_a_letter_that_conflicts_with_its_printed_points_never_reaches_the_board(
+def test_wrong_tiny_point_values_do_not_reject_matching_large_letters(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8)})
-    invalid = _tile_payload("KA", ["R"], 99)
-    invalid["tiles"][0]["points"] = 5  # K is 3 in Dutch Wordfeud.
+    """Regression: production read T2 and I2 as T1/I1 while their glyphs were right."""
+    path = _screenshot(tmp_path / "board.png", DARK_THEME, {(7, 7), (7, 8), (7, 9)})
+    first = _tile_payload("KIT", ["R"], 99)
+    second = _tile_payload("KIT", ["R"], 98)
+    first["tiles"][2]["points"] = 1  # T is 2, but the superscript is tiny.
+    second["tiles"][1]["points"] = 1  # I is 2, same real-world OCR failure.
     calls = _stub_openrouter(
         monkeypatch,
-        invalid,
-        _tile_payload("KA", ["R"], 97),
-        _tile_payload("KA", ["R"], 98),
+        first,
+        second,
     )
 
     extraction = extract_board(path, api_key="test-key")
 
-    assert extraction.state.grid[7][7].letter == "K"
-    assert len(calls) == 3
-    assert _sent_images(calls[2]) == 2
+    assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "I", "T"]
+    assert extraction.confidence == 98
+    assert len(calls) == 2
 
 
 def test_a_persistent_mismatch_reports_a_readable_message(
