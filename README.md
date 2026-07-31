@@ -60,6 +60,12 @@ De app leest eerst `OPENROUTER_API_KEY` uit de omgeving en daarna dit secrets-be
 
 Gebruik in de zijbalk `google/gemini-2.5-flash` (standaard) of een ander beeldmodel dat het OpenAI-compatibele chat-eindpunt van OpenRouter en JSON-schema-uitvoer ondersteunt.
 
+## Productie-uitrol
+
+De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De server draait de app onder systemd met `Restart=always`; een deploy moet daarnaast altijd via `DEPLOY_RESTART_COMMAND` de herstarttaak uitvoeren. Ontbreekt dat secret, dan faalt de workflow bewust zodat oude Python-modules niet ongemerkt blijven draaien.
+
+Bewaar de SSH-sleutel, hostnaam/IP-adres, doelpad en gepinde hostkey alleen als GitHub-secrets of in de lokale SSH-configuratie. Zet ze niet in Git. Gebruik op de server de service `feutsolver.service`; controleer na een uitrol dat deze `active (running)` is.
+
 ## Woordenlijst
 
 De lokale installatie gebruikt `data/opentaal-wordlist.txt` zodra dit bestand aanwezig is; anders valt hij terug op de kleine demolijst. Zet vóór werkelijk spelgebruik de `wordlist.txt` van [OpenTaal](https://github.com/OpenTaal/opentaal-wordlist) lokaal klaar of laad hem in met:
