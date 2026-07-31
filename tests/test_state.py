@@ -27,10 +27,12 @@ def test_standard_board_has_the_complete_symmetric_layout() -> None:
     assert state.grid[7][7].bonus == "NORMAL"
     assert state.grid[7][3].bonus == "DW"
     assert state.grid[7][0].bonus == "DL"
-    # The standard Wordfeud layout has 26 DL and 10 DW squares.
-    assert sum(cell.bonus == "DL" for row in state.grid for cell in row) == 26
+    assert state.grid[3][7].bonus == "DW"
+    assert state.grid[11][7].bonus == "DW"
+    # The standard Wordfeud layout has 24 DL and 12 DW squares.
+    assert sum(cell.bonus == "DL" for row in state.grid for cell in row) == 24
     assert sum(cell.bonus == "TL" for row in state.grid for cell in row) == 20
-    assert sum(cell.bonus == "DW" for row in state.grid for cell in row) == 10
+    assert sum(cell.bonus == "DW" for row in state.grid for cell in row) == 12
     assert sum(cell.bonus == "TW" for row in state.grid for cell in row) == 8
 
 
