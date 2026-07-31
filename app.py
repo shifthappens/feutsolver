@@ -27,6 +27,7 @@ from wordfeud_analyzer.state import (
     StaleSolveRequest,
     apply_place_request,
     make_solve_result,
+    replaceable_words,
     replace_from_upload,
     validate_snapshot,
 )
@@ -272,18 +273,21 @@ def render_replacement_form() -> None:
     if not isinstance(solve_result, dict) or not solve_result.get("moves"):
         return
     with st.form("replace_suggestion", clear_on_submit=True):
-        word_to_replace = st.text_input("Een suggestie vervangen", placeholder="Typ een voorgesteld woord")
+        word_to_replace = st.text_input(
+            "Een suggestie vervangen",
+            placeholder="Typ een voorgesteld woord of kruiswoord",
+        )
         submitted = st.form_submit_button("Vervang suggestie")
     if not submitted:
         return
     state = current_state()
     entered_word = normalise_word(word_to_replace)
-    suggested_words = {Move.model_validate(item).word for item in solve_result["moves"]}
+    replaceable = replaceable_words(solve_result)
     if not entered_word:
         st.warning("Vul een geldig woord in.")
         return
-    if entered_word not in suggested_words:
-        st.warning("Dat woord staat niet tussen de huidige suggesties.")
+    if entered_word not in replaceable:
+        st.warning("Dat woord staat niet tussen de huidige suggesties of bijbehorende kruiswoorden.")
         return
     try:
         removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)

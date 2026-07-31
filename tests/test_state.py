@@ -12,6 +12,7 @@ from wordfeud_analyzer.state import (
     apply_place_request,
     consume_rack,
     make_solve_result,
+    replaceable_words,
     replace_from_upload,
     is_current_solve_result,
     snapshot_hash,
@@ -100,6 +101,22 @@ def test_solve_and_place_request_is_bound_to_the_exact_snapshot_and_move() -> No
         apply_place_request(state, result, {**payload, "stateHash": "wrong"})
     with pytest.raises(InvalidSolveRequest):
         apply_place_request(state, result, {**payload, "selectedMove": {"word": "Z"}})
+
+
+def test_replaceable_words_include_suggestion_cross_words() -> None:
+    state = standard_board()
+    move = Move(
+        word="FLUX",
+        row=7,
+        col=7,
+        direction="H",
+        score=20,
+        tiles=[PlacedTile(row=7, col=7, letter="F")],
+        cross_words=["FTE"],
+    )
+    result = make_solve_result(state, [move], "solve-1")
+
+    assert replaceable_words(result) == {"FLUX", "FTE"}
 
 
 def test_upload_replacement_validates_before_the_working_state_is_swapped() -> None:

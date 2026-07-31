@@ -19,7 +19,7 @@ Het rek mag leeg zijn, maar `Solve` blijft dan uitgeschakeld met een uitleg. Han
 
 Saves worden versie `v1` in de browser-localStorage bewaard. De eerste `Save als‚Ä¶` vereist een niet-lege, hoofdletterongevoelig unieke naam; daarna werkt `Save` de gekoppelde save bij en maakt `Rename` de naamswijziging direct blijvend. `Load` herstelt de volledige stand. Corruptie of een onbekende opslagversie wordt overgeslagen met een waarschuwing. Handmatige edits en uploads slaan niets automatisch op: alleen een succesvolle `Place` werkt een gekoppelde save automatisch bij.
 
-De bestaande screenshot-afwijzingen, confidencecontrole, geleerde woorden, woordenlijstbeheer en suggestievervanging blijven beschikbaar. Een nieuw bord wist de actieve save-link; een upload behoudt die link, zodat een volgende succesvolle plaatsing nog steeds automatisch naar dezelfde save kan schrijven.
+De bestaande screenshot-afwijzingen, confidencecontrole, geleerde woorden, woordenlijstbeheer en suggestievervanging blijven beschikbaar. Je kunt daarbij zowel een hoofdvoorstel als een kruiswoord van een huidige suggestie uitsluiten. Een nieuw bord wist de actieve save-link; een upload behoudt die link, zodat een volgende succesvolle plaatsing nog steeds automatisch naar dezelfde save kan schrijven.
 
 Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden toegevoegd aan `data/geleerde-woorden.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
 
@@ -33,7 +33,7 @@ OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `fa√
 
 De app toont naast de beste zet vijf alternatieven. Selecteer een suggestie om de preview op het interactieve bord te wisselen; alleen de nieuwe stenen zijn groen gemarkeerd.
 
-Onder de suggesties kun je een voorgesteld woord insturen om het permanent uit de geconfigureerde woordenlijst te verwijderen. De app bouwt de woordenlijstcache opnieuw op en vult de suggesties daarna aan met de eerstvolgende legale zet. Staat het woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
+Onder de suggesties kun je een voorgesteld woord of bijbehorend kruiswoord insturen om het permanent uit de geconfigureerde woordenlijst te verwijderen. De app bouwt de woordenlijstcache opnieuw op en vult de suggesties daarna aan met de eerstvolgende legale zet. Staat het woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
 
 Na een screenshot-upload wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Solve`. Het vision-model geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere screenshot. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
 

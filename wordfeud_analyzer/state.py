@@ -118,6 +118,29 @@ def make_solve_result(state: BoardState, moves: Iterable[Move], token: str) -> d
     }
 
 
+def replaceable_words(solve_result: object) -> set[str]:
+    """Return suggestion words and their generated cross words.
+
+    A cross word is also checked by Wordfeud when the suggested move is played,
+    so it should be possible to report that word even when it is not one of the
+    main suggestions shown to the user.
+    """
+    if not isinstance(solve_result, dict):
+        return set()
+    result: set[str] = set()
+    moves = solve_result.get("moves", [])
+    if not isinstance(moves, list):
+        return result
+    for stored in moves:
+        try:
+            move = Move.model_validate(stored)
+        except Exception:
+            continue
+        result.add(move.word)
+        result.update(move.cross_words)
+    return result
+
+
 def selected_move(solve_result: dict[str, Any], value: object) -> Move | None:
     """Return a move only when it exactly matches one of the offered moves."""
     try:
