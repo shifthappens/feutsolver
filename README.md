@@ -80,7 +80,7 @@ De ondersteunde handmatige route is de GitHub CLI. Controleer eerst dat `gh auth
 gh workflow run deploy.yml --repo shifthappens/feutsolver --ref main
 ```
 
-De opdracht geeft de URL van de nieuwe run terug. Volg die run tot hij klaar is met `gh run watch <run-id> --repo shifthappens/feutsolver --exit-status`; alleen een eindstatus `success` betekent dat de uitrol geslaagd is. Deze route is op 1 augustus 2026 succesvol uitgevoerd voor commit `029300d`.
+De opdracht geeft de URL van de nieuwe run terug. Volg die run tot hij klaar is met `gh run watch <run-id> --repo shifthappens/feutsolver --exit-status`; alleen een eindstatus `success` betekent dat de uitrol geslaagd is. De incident- en deploynotitie van de duurzame OCR-fix staat in [`docs/ocr-incident-deployment-2026-08.md`](docs/ocr-incident-deployment-2026-08.md). De route is op 2 augustus 2026 succesvol uitgevoerd voor commit `b2928f9`.
 
 Bewaar de SSH-sleutel, hostnaam/IP-adres, doelpad en gepinde hostkey alleen als GitHub-secrets of in de lokale SSH-configuratie. Zet ze niet in Git. Gebruik op de server de service `feutsolver.service`; controleer na een uitrol dat deze `active (running)` is.
 
