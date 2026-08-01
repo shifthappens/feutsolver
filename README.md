@@ -39,6 +39,12 @@ Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst
 
 De uitlezing controleert harde eigenschappen voordat een bord wordt vervangen: de lokaal gevonden tegelposities zijn exact bekend, iedere glyph levert één letter op, de zichtbare puntwaarde wordt als extra controle gebruikt en losse tegels worden geweigerd. Zo kan een `Q` met 10 punten niet stilletjes als `O` met 1 punt doorgaan. De puntwaarde blijft buiten de remote OCR-API en het bordmodel. Kan lokale OCR een glyph niet betrouwbaar lezen, dan wordt de upload geweigerd; met `auto` kan daarna optioneel één OpenRouter-uitlezing volgen.
 
+## Server/client-scheiding
+
+De browser bevat uitsluitend de interactieve bordweergave, invoer en presentatie van serverresultaten. De upload gaat via Streamlit naar de Python-server. Daar worden de schermafbeelding, OCR, beeldbewerking en eventuele OpenRouter-aanroep uitgevoerd door `wordfeud_analyzer/vision.py`; `move_generator.py` leest de woordenlijsten en genereert en scoort de zetten. De woordenlijstbestanden en de GADDAG worden nooit als frontend-assets of browserdata meegestuurd.
+
+De browser ontvangt alleen de gevalideerde bordstatus en de door de server berekende suggesties om ze te tonen. Iedere bordwijziging en iedere plaatsingsaanvraag wordt opnieuw server-side gevalideerd. De lokale opslag in de browser bevat alleen opgeslagen bordstanden, nooit OCR-code, solvercode of woordenlijstinhoud. `tests/test_client_server_boundary.py` bewaakt deze grens.
+
 ## Starten
 
 ```bash
