@@ -68,6 +68,14 @@ Gebruik alleen bij `auto` of `openrouter` in de zijbalk `openai/gpt-4.1-mini` (s
 
 De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De workflow heeft alleen `workflow_dispatch`: een commit of push naar `main` start dus nooit een deploy. Op de server bewaakt de ingeschakelde systemd-unit `feutsolver.path` het deploypad; na een bestandswijziging start die `feutsolver-restart.service`, die na 20 seconden `feutsolver.service` herstart. Daarom heeft GitHub Actions geen restart-secret of sudo-rechten nodig.
 
+De ondersteunde handmatige route is de GitHub CLI. Controleer eerst dat `gh auth status` een actieve GitHub-sessie toont en start vervolgens de workflow voor de gepushte `main`-branch:
+
+```bash
+gh workflow run deploy.yml --repo shifthappens/feutsolver --ref main
+```
+
+De opdracht geeft de URL van de nieuwe run terug. Volg die run tot hij klaar is met `gh run watch <run-id> --repo shifthappens/feutsolver --exit-status`; alleen een eindstatus `success` betekent dat de uitrol geslaagd is. Deze route is op 1 augustus 2026 succesvol uitgevoerd voor commit `029300d`.
+
 Bewaar de SSH-sleutel, hostnaam/IP-adres, doelpad en gepinde hostkey alleen als GitHub-secrets of in de lokale SSH-configuratie. Zet ze niet in Git. Gebruik op de server de service `feutsolver.service`; controleer na een uitrol dat deze `active (running)` is.
 
 ## Woordenlijst
