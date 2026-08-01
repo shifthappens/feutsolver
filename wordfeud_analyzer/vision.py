@@ -5,8 +5,9 @@ the board is, which squares hold a tile, and which bonus each free square carrie
 Letter recognition is local by default: the large glyph is isolated from each tile and
 read with a fixed template, with Tesseract as a portable fallback. The optional remote
 route is limited to the same glyph-only task and never has to count rows, pad a grid or
-return a coordinate. The tiny printed point value is intentionally not sent to OCR. It
-is irrelevant to a board's state and is too small to improve letter recognition.
+return a coordinate. The tiny printed point value is not sent to the remote OCR route,
+but local OCR uses it as a consistency check for the large glyph. That catches the
+particularly costly Q/O confusion without making the point value part of board state.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .models import BoardState
+from .move_generator import LETTER_VALUES
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -842,11 +844,10 @@ def _outside_in(values: list[int]) -> list[int]:
     return result
 
 
-# Local OCR deliberately works on the large glyph only. The point value and the
-# surrounding tile chrome are noise; sending them through a general OCR engine is
-# slower and makes characters such as I and T less reliable. A system font template
-# is the fast path on macOS and Windows. Tesseract remains the portable fallback for
-# Linux installations where that font is not present.
+# Local OCR reads the large glyph first and uses the small point value as a separate
+# consistency signal. A system font template is the fast path on macOS and Windows.
+# Tesseract remains the portable fallback for Linux installations where that font is
+# not present.
 LOCAL_TEMPLATE_FONT_CANDIDATES = (
     "/System/Library/Fonts/HelveticaNeue.ttc",
     "/System/Library/Fonts/Helvetica.ttc",
@@ -858,6 +859,7 @@ LOCAL_TEMPLATE_FONT_CANDIDATES = (
 )
 LOCAL_GLYPH_THRESHOLD = 120
 LOCAL_TEMPLATE_SIZE = (96, 128)
+LOCAL_POINT_MAX_SCORE = 0.75
 
 
 def _dark_components(crop: Image.Image) -> list[list[tuple[int, int]]]:
@@ -902,31 +904,67 @@ def _component_image(component: list[tuple[int, int]]) -> tuple[Image.Image, tup
     return glyph, (left, top, right, bottom)
 
 
-def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, bool]:
-    """Extract the large letter and whether this tile carries a point value."""
+def _combined_component_image(components: list[list[tuple[int, int]]]) -> Image.Image:
+    """Combine separate digit components, preserving their relative positions."""
+    if not components:
+        raise ValueError("cannot combine an empty component list")
+    left = min(x for component in components for x, _ in component)
+    top = min(y for component in components for _, y in component)
+    right = max(x for component in components for x, _ in component) + 1
+    bottom = max(y for component in components for _, y in component) + 1
+    glyph = Image.new("L", (right - left, bottom - top), 0)
+    pixels = glyph.load()
+    for component in components:
+        for x, y in component:
+            pixels[x - left, y - top] = 255
+    return glyph
+
+
+def _point_components(
+    inner: Image.Image, components: list[list[tuple[int, int]]]
+) -> list[list[tuple[int, int]]]:
+    """Select the small components in the upper-right corner that form the points."""
+    if not components:
+        return []
+    glyph_area = len(components[0])
+    minimum_area = max(12, round(glyph_area * 0.005))
+    return [
+        component
+        for component in components[1:]
+        if len(component) >= minimum_area
+        and len(component) < glyph_area * 0.75
+        and (
+            (bounds := _component_image(component)[1])[0] >= inner.width * 0.52
+            and bounds[1] <= inner.height * 0.48
+        )
+    ]
+
+
+def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, int | None]:
+    """Extract the large letter and the printed point value, if present."""
     margin = max(2, round(min(tile.size) * 0.1))
     inner = tile.crop((margin, margin, tile.width - margin, tile.height - margin))
     components = _dark_components(inner)
     if not components:
-        return None, False
+        return None, None
     components.sort(key=len, reverse=True)
     glyph_component = components[0]
     # A point digit is much smaller than a letter. Treat a crop containing only a
     # point as an unassigned blank instead of returning that digit as a glyph.
     minimum_area = max(12, round(inner.width * inner.height * 0.035))
     if len(glyph_component) < minimum_area:
-        return None, False
+        return None, None
     glyph, _ = _component_image(glyph_component)
-    has_point = any(
-        len(component) >= 5
-        and len(component) < len(glyph_component) * 0.75
-        and (
-            (bounds := _component_image(component)[1])[0] >= inner.width * 0.52
-            and bounds[1] <= inner.height * 0.48
-        )
-        for component in components[1:]
-    )
-    return glyph, has_point
+    # The point digits sit very close to the tile's top edge. Use a smaller margin
+    # for them; the larger glyph keeps the original margin so the rounded tile edge
+    # cannot become part of the letter template.
+    point_margin = max(2, round(min(tile.size) * 0.04))
+    point_inner = tile.crop((point_margin, point_margin, tile.width - point_margin, tile.height - point_margin))
+    point_components = _point_components(point_inner, sorted(_dark_components(point_inner), key=len, reverse=True))
+    point_value = None
+    if point_components:
+        point_value = _template_point_value(_combined_component_image(point_components))
+    return glyph, point_value
 
 
 @lru_cache(maxsize=1)
@@ -979,6 +1017,27 @@ def _local_templates() -> dict[str, object] | None:
     return templates
 
 
+@lru_cache(maxsize=1)
+def _local_point_templates() -> dict[str, object] | None:
+    """Build digit templates for the one- and two-digit Wordfeud point values."""
+    font_spec = _local_template_font()
+    if font_spec is None:
+        return None
+    filename, index = font_spec
+    try:
+        font = ImageFont.truetype(filename, 60, index=index)
+    except OSError:
+        return None
+    templates: dict[str, object] = {}
+    for value in ("1", "2", "3", "4", "5", "8", "10"):
+        canvas = Image.new("L", (160, 160), 0)
+        ImageDraw.Draw(canvas).text((10, 0), value, font=font, fill=255)
+        bounds = canvas.getbbox()
+        if bounds is not None:
+            templates[value] = _normalise_glyph(canvas.crop(bounds))
+    return templates
+
+
 def _template_letter(glyph: Image.Image) -> tuple[str, float]:
     """Read one glyph using a fixed-font template and return its pixel error."""
     templates = _local_templates()
@@ -996,6 +1055,27 @@ def _template_letter(glyph: Image.Image) -> tuple[str, float]:
     )
     score, letter = scored[0]
     return letter, score
+
+
+def _template_point_value(glyph: Image.Image) -> int:
+    """Read a printed point value using the same template strategy as letters."""
+    templates = _local_point_templates()
+    if templates is None:
+        return _tesseract_point_value(glyph)
+    import numpy as np
+
+    actual = np.asarray(_normalise_glyph(glyph), dtype="float32") / 255
+    scored = sorted(
+        (
+            float(np.mean(np.abs(actual - np.asarray(template, dtype="float32") / 255))),
+            value,
+        )
+        for value, template in templates.items()
+    )
+    score, value = scored[0]
+    if score > LOCAL_POINT_MAX_SCORE:
+        raise LocalOCRFailure("Lokale punten-OCR is niet zeker genoeg voor een tegel.")
+    return int(value)
 
 
 def _tesseract_letter(glyph: Image.Image) -> str:
@@ -1026,6 +1106,36 @@ def _tesseract_letter(glyph: Image.Image) -> str:
     if not letters:
         raise LocalOCRFailure("Lokale OCR vond geen letter in een tegel.")
     return letters[0].upper()
+
+
+def _tesseract_point_value(glyph: Image.Image) -> int:
+    """Read a one- or two-digit point value when no local font is available."""
+    if shutil.which("tesseract") is None:
+        raise LocalOCRUnavailable(
+            "Lokale punten-OCR is niet beschikbaar. Installeer Tesseract of kies "
+            "WORDFEUD_OCR_BACKEND=auto met een OpenRouter-sleutel."
+        )
+    try:
+        import pytesseract
+
+        rendered = ImageOps.invert(glyph)
+        scale = max(4, 120 // max(1, rendered.height))
+        rendered = rendered.resize((rendered.width * scale, rendered.height * scale), Image.Resampling.LANCZOS)
+        canvas = Image.new("L", (180, 100), 255)
+        canvas.paste(rendered, ((canvas.width - rendered.width) // 2, (canvas.height - rendered.height) // 2))
+        value = pytesseract.image_to_string(
+            canvas,
+            config="--oem 1 --psm 7 -c tessedit_char_whitelist=0123458",
+            timeout=0.35,
+        )
+    except (ImportError, RuntimeError, OSError) as exc:
+        raise LocalOCRUnavailable(
+            "Lokale punten-OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
+        ) from exc
+    digits = "".join(re.findall(r"[0-9]", value))
+    if digits not in {"1", "2", "3", "4", "5", "8", "10"}:
+        raise LocalOCRFailure("Lokale OCR vond geen geldige Wordfeud-puntwaarde in een tegel.")
+    return int(digits)
 
 
 def _tile_cells(board: Image.Image, tiles: list[tuple[int, int]]) -> list[Image.Image]:
@@ -1102,11 +1212,25 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     return boxes
 
 
+def _letter_for_point_value(letter: str, point_value: int) -> str:
+    """Correct a glyph only when its printed point value identifies one letter."""
+    letter = letter.upper()
+    if LETTER_VALUES.get(letter) == point_value:
+        return letter
+    candidates = [candidate for candidate, value in LETTER_VALUES.items() if value == point_value]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise LocalOCRFailure(
+        f"Lokale OCR las {letter}, maar de tegel toont {point_value} punten; "
+        "de letter is daardoor niet betrouwbaar."
+    )
+
+
 def _local_letters(cells: list[Image.Image], *, rack: bool) -> list[str]:
     """Read a list of cells locally, preserving lowercase blank assignments."""
     readings: list[str] = []
     for cell in cells:
-        glyph, has_point = _tile_glyph(cell)
+        glyph, point_value = _tile_glyph(cell)
         if glyph is None:
             if rack:
                 readings.append("?")
@@ -1118,7 +1242,9 @@ def _local_letters(cells: list[Image.Image], *, rack: bool) -> list[str]:
                 raise LocalOCRFailure("Lokale template-OCR is niet zeker genoeg voor een tegel.")
         else:
             letter = _tesseract_letter(glyph)
-        readings.append(letter.lower() if not has_point and not rack else letter.upper())
+        if point_value is not None:
+            letter = _letter_for_point_value(letter, point_value)
+        readings.append(letter.lower() if point_value is None and not rack else letter.upper())
     return readings
 
 

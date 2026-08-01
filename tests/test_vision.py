@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
@@ -11,16 +11,21 @@ from wordfeud_analyzer.vision import (
     BoardExtraction,
     MINIMUM_CONFIDENCE,
     LooseTilesError,
+    LocalOCRFailure,
     LowConfidenceError,
     PendingMoveError,
     TileReading,
     VisionExtractionError,
     _disconnected_tiles,  # pyright: ignore[reportPrivateUsage]
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
+    _letter_for_point_value,  # pyright: ignore[reportPrivateUsage]
+    _local_letters,  # pyright: ignore[reportPrivateUsage]
+    _local_template_font,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _max_response_tokens,  # pyright: ignore[reportPrivateUsage]
     _outside_in,  # pyright: ignore[reportPrivateUsage]
     _rack_boxes,  # pyright: ignore[reportPrivateUsage]
+    _tile_glyph,  # pyright: ignore[reportPrivateUsage]
     _parse_content,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     _wordfeud_crop_images,  # pyright: ignore[reportPrivateUsage]
@@ -152,6 +157,29 @@ def test_local_rack_geometry_finds_all_tiles_without_reading_the_letters() -> No
     boxes = _rack_boxes(rack, DARK_THEME["empty"])
 
     assert boxes == [(15 + index * 80, 95, 15 + index * 80 + 77, 171) for index in range(7)]
+
+
+def test_the_point_value_corrects_a_q_misread_as_o() -> None:
+    """Q's unique ten points must win when its large glyph looks like O."""
+    font_spec = _local_template_font()
+    if font_spec is None:
+        pytest.skip("geen lokaal testfont beschikbaar")
+    filename, index = font_spec
+    letter_font = ImageFont.truetype(filename, 60, index=index)
+    point_font = ImageFont.truetype(filename, 18, index=index)
+    tile = Image.new("RGB", (100, 100), (245, 242, 235))
+    draw = ImageDraw.Draw(tile)
+    draw.text((14, 12), "O", font=letter_font, fill=(0, 0, 0))
+    draw.text((69, 5), "10", font=point_font, fill=(0, 0, 0))
+
+    assert _tile_glyph(tile)[1] == 10
+    assert _local_letters([tile], rack=True) == ["Q"]
+    assert _letter_for_point_value("Q", 10) == "Q"
+
+
+def test_an_ambiguous_point_mismatch_is_rejected() -> None:
+    with pytest.raises(LocalOCRFailure, match="punten"):
+        _ = _letter_for_point_value("Q", 1)
 
 
 def test_local_backend_does_not_require_an_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
