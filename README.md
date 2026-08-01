@@ -62,7 +62,7 @@ Gebruik in de zijbalk `openai/gpt-4.1-mini` (standaard) of een ander beeldmodel 
 
 ## Productie-uitrol
 
-De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De workflow heeft alleen `workflow_dispatch`: een commit of push naar `main` start dus nooit een deploy. De server draait de app onder systemd met `Restart=always`; een handmatige deploy moet daarnaast altijd via `DEPLOY_RESTART_COMMAND` de herstarttaak uitvoeren. Ontbreekt dat secret, dan faalt de workflow bewust zodat oude Python-modules niet ongemerkt blijven draaien.
+De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De workflow heeft alleen `workflow_dispatch`: een commit of push naar `main` start dus nooit een deploy. Op de server bewaakt de ingeschakelde systemd-unit `feutsolver.path` het deploypad; na een bestandswijziging start die `feutsolver-restart.service`, die na 20 seconden `feutsolver.service` herstart. Daarom heeft GitHub Actions geen restart-secret of sudo-rechten nodig.
 
 Bewaar de SSH-sleutel, hostnaam/IP-adres, doelpad en gepinde hostkey alleen als GitHub-secrets of in de lokale SSH-configuratie. Zet ze niet in Git. Gebruik op de server de service `feutsolver.service`; controleer na een uitrol dat deze `active (running)` is.
 

@@ -83,18 +83,7 @@ jobs:
              case \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c7)\" in x|s) ;; *) exit 1 ;; esac
              echo 'Deployment permissions verified'"
 
-      # Copying the files is not enough: the running Streamlit process keeps the
-      # modules it imported at startup, so a deploy without a restart can still
-      # serve the previous version. The command lives in a secret instead of in
-      # this file, because the workflow cannot know how the server supervises the
-      # app (a system unit needs `sudo -n`, which in turn needs a NOPASSWD rule).
-      - name: Restart the application
-        env:
-          RESTART_COMMAND: ${{ secrets.DEPLOY_RESTART_COMMAND }}
-        run: |
-          if [ -z "$RESTART_COMMAND" ]; then
-            echo "::error::Secret DEPLOY_RESTART_COMMAND ontbreekt. De uitrol wordt afgebroken, omdat het draaiende proces anders de vorige versie kan blijven serveren."
-            exit 1
-          fi
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" "$RESTART_COMMAND"
+      # The server's enabled feutsolver.path unit watches this deployment path and
+      # starts feutsolver-restart.service after a file change. That oneshot waits
+      # briefly for rsync to finish and then restarts the Streamlit service, so no
+      # privileged restart command or GitHub secret is needed here.
