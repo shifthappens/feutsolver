@@ -2,12 +2,11 @@
 
 The geometry of a Wordfeud screenshot is solved locally and deterministically: where
 the board is, which squares hold a tile, and which bonus each free square carries.
-The language model is asked one thing only that affects the board — which letter is
-printed on a tile — and never has to count rows, pad a grid or return a coordinate.
-The tiny printed point value is intentionally not sent to the model. It is irrelevant
-to a board's state, costs output tokens for every tile, and is too small to improve
-letter recognition. Stable crop IDs and agreement between independent letter readings
-are the positional safeguards.
+Letter recognition is local by default: the large glyph is isolated from each tile and
+read with a fixed template, with Tesseract as a portable fallback. The optional remote
+route is limited to the same glyph-only task and never has to count rows, pad a grid or
+return a coordinate. The tiny printed point value is intentionally not sent to OCR. It
+is irrelevant to a board's state and is too small to improve letter recognition.
 """
 from __future__ import annotations
 
@@ -15,14 +14,17 @@ import base64
 import colorsys
 import json
 import os
+import re
+import shutil
 from collections import Counter
 from copy import deepcopy
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import NamedTuple, TypeAlias, cast
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .models import BoardState
@@ -161,6 +163,14 @@ MINIMUM_CONFIDENCE = 90.0
 
 class VisionExtractionError(RuntimeError):
     pass
+
+
+class LocalOCRUnavailable(VisionExtractionError):
+    """The optional local OCR dependency is not installed on this machine."""
+
+
+class LocalOCRFailure(VisionExtractionError):
+    """Local OCR ran, but could not produce one trustworthy glyph per tile."""
 
 
 class PendingMoveError(VisionExtractionError):
@@ -832,7 +842,304 @@ def _outside_in(values: list[int]) -> list[int]:
     return result
 
 
-def extract_board(
+# Local OCR deliberately works on the large glyph only. The point value and the
+# surrounding tile chrome are noise; sending them through a general OCR engine is
+# slower and makes characters such as I and T less reliable. A system font template
+# is the fast path on macOS and Windows. Tesseract remains the portable fallback for
+# Linux installations where that font is not present.
+LOCAL_TEMPLATE_FONT_CANDIDATES = (
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/SFNS.ttf",
+    "C:/Windows/Fonts/Arial.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+)
+LOCAL_GLYPH_THRESHOLD = 120
+LOCAL_TEMPLATE_SIZE = (96, 128)
+
+
+def _dark_components(crop: Image.Image) -> list[list[tuple[int, int]]]:
+    """Return connected dark pixel components in a small tile crop."""
+    gray = ImageOps.grayscale(crop)
+    width, height = gray.size
+    pixels = gray.load()
+    dark = {
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if pixels[x, y] < LOCAL_GLYPH_THRESHOLD
+    }
+    components: list[list[tuple[int, int]]] = []
+    while dark:
+        seed = dark.pop()
+        pending = [seed]
+        component = [seed]
+        while pending:
+            x, y = pending.pop()
+            for next_x in range(max(0, x - 1), min(width, x + 2)):
+                for next_y in range(max(0, y - 1), min(height, y + 2)):
+                    point = (next_x, next_y)
+                    if point in dark:
+                        dark.remove(point)
+                        pending.append(point)
+                        component.append(point)
+        components.append(component)
+    return components
+
+
+def _component_image(component: list[tuple[int, int]]) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Convert a component to a tight white-on-black glyph mask."""
+    left = min(x for x, _ in component)
+    top = min(y for _, y in component)
+    right = max(x for x, _ in component) + 1
+    bottom = max(y for _, y in component) + 1
+    glyph = Image.new("L", (right - left, bottom - top), 0)
+    pixels = glyph.load()
+    for x, y in component:
+        pixels[x - left, y - top] = 255
+    return glyph, (left, top, right, bottom)
+
+
+def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, bool]:
+    """Extract the large letter and whether this tile carries a point value."""
+    margin = max(2, round(min(tile.size) * 0.1))
+    inner = tile.crop((margin, margin, tile.width - margin, tile.height - margin))
+    components = _dark_components(inner)
+    if not components:
+        return None, False
+    components.sort(key=len, reverse=True)
+    glyph_component = components[0]
+    # A point digit is much smaller than a letter. Treat a crop containing only a
+    # point as an unassigned blank instead of returning that digit as a glyph.
+    minimum_area = max(12, round(inner.width * inner.height * 0.035))
+    if len(glyph_component) < minimum_area:
+        return None, False
+    glyph, _ = _component_image(glyph_component)
+    has_point = any(
+        len(component) >= 5
+        and len(component) < len(glyph_component) * 0.75
+        and (
+            (bounds := _component_image(component)[1])[0] >= inner.width * 0.52
+            and bounds[1] <= inner.height * 0.48
+        )
+        for component in components[1:]
+    )
+    return glyph, has_point
+
+
+@lru_cache(maxsize=1)
+def _local_template_font() -> tuple[str, int] | None:
+    """Find a local sans font close to the font used by the Wordfeud client."""
+    configured = os.environ.get("WORDFEUD_TEMPLATE_FONT")
+    candidates = ((configured,) if configured else ()) + LOCAL_TEMPLATE_FONT_CANDIDATES
+    for filename in candidates:
+        if not filename or not Path(filename).exists():
+            continue
+        try:
+            ImageFont.truetype(filename, 60, index=0)
+        except OSError:
+            continue
+        return filename, 0
+    return None
+
+
+def _normalise_glyph(glyph: Image.Image) -> object:
+    """Normalise a glyph mask for cheap pixel-template comparison."""
+    return glyph.resize(LOCAL_TEMPLATE_SIZE, Image.Resampling.LANCZOS)
+
+
+@lru_cache(maxsize=1)
+def _local_templates() -> dict[str, object] | None:
+    font_spec = _local_template_font()
+    if font_spec is None:
+        return None
+    filename, index = font_spec
+    try:
+        font = ImageFont.truetype(filename, 60, index=index)
+    except OSError:
+        return None
+    templates: dict[str, object] = {}
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        canvas = Image.new("L", (160, 160), 0)
+        ImageDraw.Draw(canvas).text((10, 0), letter, font=font, fill=255)
+        bounds = canvas.getbbox()
+        if bounds is not None:
+            templates[letter] = _normalise_glyph(canvas.crop(bounds))
+
+    # Helvetica renders a capital I as a simple stem, while Wordfeud's glyph has
+    # small horizontal bars. Keep this extra shape independent of the installed font.
+    i_shape = Image.new("L", (160, 160), 0)
+    draw = ImageDraw.Draw(i_shape)
+    draw.rectangle((45, 15, 115, 23), fill=255)
+    draw.rectangle((75, 15, 85, 120), fill=255)
+    draw.rectangle((45, 112, 115, 120), fill=255)
+    templates["I"] = _normalise_glyph(i_shape.crop(i_shape.getbbox()))
+    return templates
+
+
+def _template_letter(glyph: Image.Image) -> tuple[str, float]:
+    """Read one glyph using a fixed-font template and return its pixel error."""
+    templates = _local_templates()
+    if templates is None:
+        raise LocalOCRUnavailable("Lokale letterherkenning is niet beschikbaar: installeer Tesseract OCR.")
+    import numpy as np
+
+    actual = np.asarray(_normalise_glyph(glyph), dtype="float32") / 255
+    scored = sorted(
+        (
+            float(np.mean(np.abs(actual - np.asarray(template, dtype="float32") / 255))),
+            letter,
+        )
+        for letter, template in templates.items()
+    )
+    score, letter = scored[0]
+    return letter, score
+
+
+def _tesseract_letter(glyph: Image.Image) -> str:
+    """Portable one-glyph fallback used when no suitable local font is available."""
+    if shutil.which("tesseract") is None:
+        raise LocalOCRUnavailable(
+            "Lokale OCR is niet beschikbaar. Installeer Tesseract (macOS: `brew install tesseract`) "
+            "of kies WORDFEUD_OCR_BACKEND=auto met een OpenRouter-sleutel."
+        )
+    try:
+        import pytesseract
+
+        rendered = ImageOps.invert(glyph)
+        scale = max(3, 120 // max(1, rendered.height))
+        rendered = rendered.resize((rendered.width * scale, rendered.height * scale), Image.Resampling.LANCZOS)
+        canvas = Image.new("L", (180, 220), 255)
+        canvas.paste(rendered, ((canvas.width - rendered.width) // 2, canvas.height - rendered.height - 16))
+        value = pytesseract.image_to_string(
+            canvas,
+            config="--oem 1 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            timeout=0.35,
+        )
+    except (ImportError, RuntimeError, OSError) as exc:
+        raise LocalOCRUnavailable(
+            "Lokale OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
+        ) from exc
+    letters = re.findall(r"[A-Za-z]", value)
+    if not letters:
+        raise LocalOCRFailure("Lokale OCR vond geen letter in een tegel.")
+    return letters[0].upper()
+
+
+def _tile_cells(board: Image.Image, tiles: list[tuple[int, int]]) -> list[Image.Image]:
+    """Crop board cells with exact fractional boundaries to avoid cumulative drift."""
+    width, height = board.size
+    return [
+        board.crop((
+            int(col * width / BOARD_SIZE),
+            int(row * height / BOARD_SIZE),
+            int((col + 1) * width / BOARD_SIZE),
+            int((row + 1) * height / BOARD_SIZE),
+        ))
+        for row, col in tiles
+    ]
+
+
+def _tile_runs(row: list[bool], minimum_width: int, maximum_width: int) -> list[tuple[int, int]]:
+    """Find pale tile runs in one rack scanline and merge JPEG gaps."""
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for x, is_tile in enumerate(row + [False]):
+        if is_tile and start is None:
+            start = x
+        elif not is_tile and start is not None:
+            if x - start >= minimum_width:
+                runs.append((start, min(x, start + maximum_width)))
+            start = None
+    merged: list[tuple[int, int]] = []
+    for start, end in runs:
+        if merged and start - merged[-1][1] <= 1:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, int, int]]:
+    """Locate the seven-or-fewer rack tiles without OCR or fixed tile counts."""
+    width, height = rack.size
+    minimum_width = max(30, round(width * 0.055))
+    maximum_width = round(width * 0.2)
+    best: list[tuple[int, int]] = []
+    for y in range(round(height * 0.25), round(height * 0.7)):
+        row = [_is_tile_colour(_rgb_pixel(rack, x, y), empty_colour) for x in range(width)]
+        runs = _tile_runs(row, minimum_width, maximum_width)
+        if (len(runs), sum(end - start for start, end in runs)) > (
+            len(best), sum(end - start for start, end in best)
+        ):
+            best = runs
+    if not best:
+        return []
+    boxes: list[tuple[int, int, int, int]] = []
+    for left, right in best:
+        rows: list[int] = []
+        for y in range(height):
+            coverage = sum(
+                _is_tile_colour(_rgb_pixel(rack, x, y), empty_colour)
+                for x in range(left, right)
+            ) / max(1, right - left)
+            if coverage >= 0.5:
+                rows.append(y)
+        if not rows:
+            continue
+        top = rows[0]
+        bottom = rows[0]
+        for y in rows[1:]:
+            if y > bottom + 1:
+                break
+            bottom = y
+        if bottom - top >= 40:
+            boxes.append((left, top, right, bottom + 1))
+    if len(boxes) > 7:
+        raise LocalOCRFailure(f"Lokale OCR vond {len(boxes)} rekvakken; maximaal zeven verwacht.")
+    return boxes
+
+
+def _local_letters(cells: list[Image.Image], *, rack: bool) -> list[str]:
+    """Read a list of cells locally, preserving lowercase blank assignments."""
+    readings: list[str] = []
+    for cell in cells:
+        glyph, has_point = _tile_glyph(cell)
+        if glyph is None:
+            if rack:
+                readings.append("?")
+                continue
+            raise LocalOCRFailure("Lokale OCR vond geen grote letter in een bordtegel.")
+        if _local_templates() is not None:
+            letter, score = _template_letter(glyph)
+            if score > 0.75:
+                raise LocalOCRFailure("Lokale template-OCR is niet zeker genoeg voor een tegel.")
+        else:
+            letter = _tesseract_letter(glyph)
+        readings.append(letter.lower() if not has_point and not rack else letter.upper())
+    return readings
+
+
+def _extract_board_local(image_path: str | Path) -> BoardExtraction:
+    """Extract a screenshot without a network call or a language model."""
+    if detect_pending_move(image_path):
+        raise PendingMoveError
+    board_image, rack_image = _wordfeud_crop_images(image_path)
+    tiles = sorted(detect_visible_tiles(image_path))
+    loose = _disconnected_tiles(set(tiles)) | _implausible_tiles(set(tiles))
+    if loose:
+        raise LooseTilesError(len(loose))
+    bonuses = detect_visible_bonuses(image_path)
+    letters = _local_letters(_tile_cells(board_image, tiles), rack=False)
+    empty_colour = _empty_cell_colour(_cell_colours(board_image))
+    rack_cells = [rack_image.crop(box) for box in _rack_boxes(rack_image, empty_colour)]
+    rack = _local_letters(rack_cells, rack=True)
+    return BoardExtraction(_to_board_state(letters, tiles, rack, bonuses), 98.0)
+
+
+def _extract_board_openrouter(
     image_path: str | Path,
     *,
     api_key: str | None = None,
@@ -989,3 +1296,50 @@ def extract_board(
         "Probeer het opnieuw met een scherpe schermafbeelding van het volledige bord. "
         "(technisch: " + " | ".join(errors) + ")"
     )
+
+
+def extract_board(
+    image_path: str | Path,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    retries: int = 1,
+    timeout_seconds: int = 45,
+    backend: str | None = None,
+) -> BoardExtraction:
+    """Extract a board locally by default in the app, with an explicit AI fallback.
+
+    ``openrouter`` remains the default here for backwards compatibility with callers
+    and tests that already provide a mocked API key. The Streamlit app explicitly
+    selects ``local`` so a normal upload never waits for a network round trip.
+    ``auto`` tries local OCR first and uses OpenRouter only when local OCR cannot read
+    the screenshot and a key is available.
+    """
+    selected = (backend or os.environ.get("WORDFEUD_OCR_BACKEND", "openrouter")).strip().lower()
+    if selected not in {"local", "auto", "openrouter"}:
+        raise VisionExtractionError(
+            f"Onbekende OCR-backend `{selected}`. Gebruik local, auto of openrouter."
+        )
+    if selected == "openrouter":
+        return _extract_board_openrouter(
+            image_path,
+            api_key=api_key,
+            model=model,
+            retries=retries,
+            timeout_seconds=timeout_seconds,
+        )
+    try:
+        return _extract_board_local(image_path)
+    except (PendingMoveError, LooseTilesError):
+        raise
+    except (LocalOCRUnavailable, LocalOCRFailure) as local_error:
+        resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        if selected == "auto" and resolved_key:
+            return _extract_board_openrouter(
+                image_path,
+                api_key=resolved_key,
+                model=model,
+                retries=retries,
+                timeout_seconds=timeout_seconds,
+            )
+        raise local_error

@@ -245,8 +245,15 @@ def process_upload() -> None:
         st.session_state.upload_error_signature = signature
         st.session_state.upload_feedback = "Deze schermafbeelding is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw."
         return
+    ocr_backend = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
     api_key = secret_or_env("OPENROUTER_API_KEY")
-    if not api_key:
+    if ocr_backend not in {"local", "auto", "openrouter"}:
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = (
+            f"Onbekende OCR-backend `{ocr_backend}`. Gebruik local, auto of openrouter."
+        )
+        return
+    if ocr_backend == "openrouter" and not api_key:
         st.session_state.upload_error_signature = signature
         st.session_state.upload_feedback = "De OpenRouter API-sleutel is niet op de server geconfigureerd."
         return
@@ -260,6 +267,7 @@ def process_upload() -> None:
             temporary_path,
             api_key=api_key,
             model=secret_or_env("OPENROUTER_VISION_MODEL", "openai/gpt-4.1-mini"),
+            backend=ocr_backend,
         )
         # Replace the complete working state only after extraction succeeds.
         set_state(replace_from_upload(current_state(), extraction))

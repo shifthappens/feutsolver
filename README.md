@@ -2,7 +2,7 @@
 
 Een Nederlandse Wordfeud-oplosser met twee strikt gescheiden onderdelen:
 
-1. `wordfeud_analyzer/vision.py` lost de geometrie lokaal en deterministisch op: waar het bord staat, welke vakken een tegel dragen en welke bonus elk vrij vak heeft. Iedere uitgesneden tegel krijgt een stabiel nummer dat rechtstreeks aan zijn lokaal gevonden bordvak gekoppeld is. Het beeldmodel leest de grote letter en de kleine puntwaarde als ondersteunende metadata. Een bezet bord wordt onafhankelijk in normale én omgekeerde tegelvolgorde gelezen; verschillen krijgen een derde, vergrote beslissende lezing. Daardoor kan een overgeslagen glyph niet meer alle volgende letters ongemerkt naar een ander vak schuiven, terwijl een verkeerd gelezen piepkleine puntwaarde een correcte letter niet afkeurt.
+1. `wordfeud_analyzer/vision.py` lost de geometrie en letterherkenning lokaal en deterministisch op: waar het bord staat, welke vakken een tegel dragen, welke bonus elk vrij vak heeft en welke glyph op iedere tegel staat. De normale route heeft geen AI of netwerk nodig; hij gebruikt snelle glyph-templates en Tesseract als draagbare fallback. OpenRouter blijft beschikbaar als expliciete fallback via `WORDFEUD_OCR_BACKEND=auto`.
 
    Tegel- en bonusherkenning ijken zichzelf per schermafbeelding op de meest voorkomende celkleur, en bonusvakken worden op tint geclassificeerd. Daardoor werken het donkere en het lichte thema via hetzelfde codepad, en zit er nergens een vaste bordindeling in.
 2. `wordfeud_analyzer/move_generator.py` gebruikt een compacte, geminimaliseerde GADDAG met anker-vakken en kruiswoordchecks. Hij genereert legale zetten en berekent punten, bonussen, blanco's en de 40-punten-bingo lokaal.
@@ -23,7 +23,7 @@ De bestaande afwijzingen van schermafbeeldingen, zekerheidscontrole, geleerde wo
 
 Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden toegevoegd aan `data/geleerde-woorden.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
 
-Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n schermafbeelding wordt geweigerd vóór er een model aan te pas komt, zodat er ook niets van geleerd wordt.
+Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n schermafbeelding wordt geweigerd vóór er OCR aan te pas komt, zodat er ook niets van geleerd wordt.
 
 Het betrouwbaarste kenmerk is de knoppenbalk: zolang een zet klaarligt staat daar een gevulde blauwe **Speel**-knop in plaats van het neutrale Pas/Hussel. Dat werkt ook wanneer de tegels ongeldig liggen, want dan toont Wordfeud helemaal geen punten. Ligt de zet wél geldig, dan verschijnt daarnaast het gele puntenbolletje op het bord; ook dat wordt herkend, waar het ook ligt en welk getal er ook in staat.
 
@@ -35,9 +35,9 @@ De app toont naast de beste zet vijf alternatieven. Selecteer een suggestie om h
 
 Onder de suggesties kun je een voorgesteld woord of bijbehorend kruiswoord insturen om het permanent uit de geconfigureerde woordenlijst te verwijderen. De app bouwt de woordenlijstcache opnieuw op en vult de suggesties daarna aan met de eerstvolgende legale zet. Staat het woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
 
-Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Geef oplossingen weer`. Het beeldmodel geeft bij iedere uitlezing een eigen zekerheidspercentage mee; onder de 90% wordt het resultaat niet gebruikt en vraagt de app om een betere schermafbeelding. Boven die grens staat het gerapporteerde percentage bij het uitgelezen bord.
+Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Geef oplossingen weer`. De lokale OCR-route levert bij iedere uitlezing zekerheidsmetadata van 98%; bij een onleesbare glyph wordt het resultaat niet gebruikt en vraagt de app om een betere schermafbeelding.
 
-De uitlezing controleert drie harde eigenschappen voordat een bord wordt vervangen: alle lokaal gevonden tegel-ID's zijn exact eenmaal aanwezig, de normale en omgekeerde letterlezing zijn gelijk en iedere gebruikte lezing haalt de zekerheidsgrens. De kleine puntwaarde blijft ondersteunende OCR-informatie, maar is door zijn formaat geen afwijzingsgrond. Bij een letterverschil leest het model alleen de betwiste tegels opnieuw op groter formaat en geldt een tweederdemeerderheid. Blijft er onenigheid, dan wordt de upload geweigerd in plaats van een mogelijk verschoven bord te tonen. Losse tegels zonder buur kan Wordfeud niet produceren; die worden als herkenningsfout gemeld vóór er een model aan te pas komt.
+De uitlezing controleert harde eigenschappen voordat een bord wordt vervangen: de lokaal gevonden tegelposities zijn exact bekend, iedere glyph levert één letter op en losse tegels worden geweigerd. De kleine puntwaarde is geen input voor OCR en kan dus geen letterverschuiving veroorzaken. Kan lokale OCR een glyph niet betrouwbaar lezen, dan wordt de upload geweigerd; met `auto` kan daarna optioneel één OpenRouter-uitlezing volgen.
 
 ## Starten
 
@@ -45,20 +45,24 @@ De uitlezing controleert drie harde eigenschappen voordat een bord wordt vervang
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export OPENROUTER_API_KEY='...'
+# macOS: brew install tesseract
+# Debian/Ubuntu: sudo apt-get install tesseract-ocr
 streamlit run app.py
 ```
+
+De standaard is lokale OCR (`WORDFEUD_OCR_BACKEND=local`), waardoor een API-sleutel niet nodig is. De lokale route is ontworpen voor Wordfeud-screenshots en blijft ruim onder twee seconden op een normale laptop. Zet voor een optionele cloudfallback `WORDFEUD_OCR_BACKEND=auto`; `openrouter` forceert de oude AI-route.
 
 Een blijvende, lokale optie is `.streamlit/secrets.toml` (dit bestand staat in `.gitignore`):
 
 ```toml
 OPENROUTER_API_KEY = "jouw-sleutel"
 OPENROUTER_VISION_MODEL = "openai/gpt-4.1-mini"
+WORDFEUD_OCR_BACKEND = "local"
 ```
 
 De app leest eerst `OPENROUTER_API_KEY` uit de omgeving en daarna dit secrets-bestand. Deel de sleutel niet in chat, commit hem niet en plak hem alleen eventueel in het afgeschermde wachtwoordveld van je lokaal draaiende app.
 
-Gebruik in de zijbalk `openai/gpt-4.1-mini` (standaard) of een ander beeldmodel dat het OpenAI-compatibele chat-eindpunt van OpenRouter en JSON-schema-uitvoer ondersteunt.
+Gebruik alleen bij `auto` of `openrouter` in de zijbalk `openai/gpt-4.1-mini` (standaard) of een ander beeldmodel dat het OpenAI-compatibele chat-eindpunt van OpenRouter en JSON-schema-uitvoer ondersteunt.
 
 ## Productie-uitrol
 
@@ -80,9 +84,9 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 
 ## Privacy en betrouwbaarheid
 
-- De schermafbeelding gaat alleen naar het gekozen beeldmodel. Bord, woordvalidatie en scores gaan niet naar een model.
+- Bij de standaard lokale route verlaat de schermafbeelding de server niet. Alleen met `auto` na een lokale OCR-fout of met `openrouter` gaat het beeld naar het gekozen beeldmodel.
 - Zet de sleutel in een omgevingsvariabele of Streamlit secrets, nooit in Git. `.env` staat in `.gitignore`.
-- De app gebruikt een bezet bord pas wanneer twee onafhankelijke tegelvolgordes overeenkomen (of een derde lezing het verschil beslist) en iedere gebruikte lezing minstens 90% zekerheid meldt. Blijf het getoonde bord vergelijken met je schermafbeelding voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerd puntenaantal.
+- De app gebruikt een bezet bord pas wanneer de lokale geometrie en glyph-uitlezing volledig zijn. Blijf het getoonde bord vergelijken met je schermafbeelding voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerd puntenaantal.
 
 ## Testen
 

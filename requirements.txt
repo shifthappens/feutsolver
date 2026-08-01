@@ -2,4 +2,6 @@ streamlit>=1.37
 requests>=2.32
 pydantic>=2.8
 Pillow>=10.4
+pytesseract>=0.3.13
+numpy>=1.26
 pytest>=8.3

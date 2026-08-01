@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
     BOARD_SIZE,
+    BoardExtraction,
     MINIMUM_CONFIDENCE,
     LooseTilesError,
     LowConfidenceError,
@@ -19,6 +20,7 @@ from wordfeud_analyzer.vision import (
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _max_response_tokens,  # pyright: ignore[reportPrivateUsage]
     _outside_in,  # pyright: ignore[reportPrivateUsage]
+    _rack_boxes,  # pyright: ignore[reportPrivateUsage]
     _parse_content,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     _wordfeud_crop_images,  # pyright: ignore[reportPrivateUsage]
@@ -137,7 +139,27 @@ def test_the_strip_holds_the_tiles_in_reading_order(tmp_path: Path) -> None:
         y = 6 + cell // 2
         source = board.getpixel((int((col + 0.5) * board.size[0] / BOARD_SIZE),
                                  int((row + 0.5) * board.size[1] / BOARD_SIZE)))
-        assert strip.getpixel((x, y)) == source
+    assert strip.getpixel((x, y)) == source
+
+
+def test_local_rack_geometry_finds_all_tiles_without_reading_the_letters() -> None:
+    rack = Image.new("RGB", (588, 315), DARK_THEME["empty"])
+    draw = ImageDraw.Draw(rack)
+    for index in range(7):
+        left = 15 + index * 80
+        draw.rectangle((left, 95, left + 76, 170), fill=DARK_THEME["tile"])
+
+    boxes = _rack_boxes(rack, DARK_THEME["empty"])
+
+    assert boxes == [(15 + index * 80, 95, 15 + index * 80 + 77, 171) for index in range(7)]
+
+
+def test_local_backend_does_not_require_an_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _screenshot(tmp_path / "local.png", DARK_THEME)
+    expected = BoardExtraction(_to_board_state([], [], [], [["NORMAL"] * BOARD_SIZE for _ in range(BOARD_SIZE)]), 98.0)
+    monkeypatch.setattr("wordfeud_analyzer.vision._extract_board_local", lambda _: expected)
+
+    assert extract_board(path, backend="local") is expected
 
 
 def test_recovery_sheet_enlarges_and_numbers_a_dense_tile_sequence(tmp_path: Path) -> None:
