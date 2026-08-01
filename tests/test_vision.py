@@ -204,6 +204,33 @@ def test_a_point_conflict_prefers_an_independent_glyph_reading_when_it_matches(
     assert _reconcile_local_letter(Image.new("L", (10, 10)), "O", 0.2, 3) == "M"
 
 
+def test_a_closed_o_outranks_a_false_three_point_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tiny 1 can look like 3, while the O outline stays unambiguous."""
+    glyph = Image.new("L", (20, 28), 0)
+    draw = ImageDraw.Draw(glyph)
+    draw.rounded_rectangle((1, 1, 18, 26), radius=7, outline=255, width=3)
+    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "R")
+
+    assert _reconcile_local_letter(glyph, "O", 0.14, 3) == "O"
+
+
+def test_an_m_outline_corrects_an_o_when_the_tile_shows_three_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M's two outer stems are independent evidence beyond system font templates."""
+    glyph = Image.new("L", (20, 28), 0)
+    draw = ImageDraw.Draw(glyph)
+    draw.rectangle((0, 0, 3, 27), fill=255)
+    draw.rectangle((16, 0, 19, 27), fill=255)
+    draw.line((3, 0, 10, 27), fill=255, width=3)
+    draw.line((16, 0, 10, 27), fill=255, width=3)
+    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "R")
+
+    assert _reconcile_local_letter(glyph, "O", 0.2, 3) == "M"
+
+
 def test_local_backend_does_not_require_an_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _screenshot(tmp_path / "local.png", DARK_THEME)
     expected = BoardExtraction(_to_board_state([], [], [], [["NORMAL"] * BOARD_SIZE for _ in range(BOARD_SIZE)]), 98.0)

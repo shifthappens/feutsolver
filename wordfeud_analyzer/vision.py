@@ -19,7 +19,7 @@ import json
 import os
 import re
 import shutil
-from collections import Counter
+from collections import Counter, deque
 from copy import deepcopy
 from functools import lru_cache
 from io import BytesIO
@@ -971,6 +971,112 @@ def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, int | None]:
     return glyph, point_value
 
 
+_LETTERS_WITH_ENCLOSED_HOLES = frozenset("ABDOPQR")
+
+
+def _glyph_has_enclosed_hole(glyph: Image.Image) -> bool:
+    """Return whether the binary glyph contains a substantial enclosed background area.
+
+    This is deliberately font-independent.  In particular, a true ``O`` keeps a
+    large closed counter even when the installed template font or Tesseract does
+    not look like the Wordfeud client font.
+    """
+    width, height = glyph.size
+    foreground = {
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if glyph.getpixel((x, y)) >= 128
+    }
+    background = {
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if (x, y) not in foreground
+    }
+    exterior: set[tuple[int, int]] = set()
+    pending = deque(
+        point
+        for point in background
+        if point[0] in {0, width - 1} or point[1] in {0, height - 1}
+    )
+    while pending:
+        point = pending.popleft()
+        if point in exterior:
+            continue
+        exterior.add(point)
+        x, y = point
+        for neighbour in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if neighbour in background and neighbour not in exterior:
+                pending.append(neighbour)
+
+    # Reject incidental one-pixel gaps from JPEG compression, but retain the
+    # sizeable counter in the O-shaped Wordfeud glyph.
+    return len(background - exterior) >= max(4, round(width * height * 0.015))
+
+
+def _glyph_looks_like_m(glyph: Image.Image) -> bool:
+    """Recognise the stable two-stem, lower-centre structure of a capital M."""
+    if _glyph_has_enclosed_hole(glyph):
+        return False
+    width, height = glyph.size
+    edge_width = max(1, round(width * 0.2))
+    upper_height = max(4, round(height * 0.5))
+    lower_start = max(0, round(height * 2 / 3))
+    centre_left = max(0, width // 2 - 1)
+    centre_right = min(width, width // 2 + 2)
+
+    def covered(start: int, end: int, y: int) -> bool:
+        return any(glyph.getpixel((x, y)) >= 128 for x in range(start, end))
+
+    def foreground_runs(y: int) -> int:
+        runs = 0
+        inside = False
+        for x in range(width + 1):
+            filled = x < width and glyph.getpixel((x, y)) >= 128
+            if filled and not inside:
+                runs += 1
+            inside = filled
+        return runs
+
+    upper_rows = range(upper_height)
+    lower_rows = range(lower_start, height)
+    left_coverage = sum(covered(0, edge_width, y) for y in upper_rows) / upper_height
+    right_coverage = sum(covered(width - edge_width, width, y) for y in upper_rows) / upper_height
+    split_coverage = sum(foreground_runs(y) >= 2 for y in upper_rows) / upper_height
+    lower_centre_coverage = sum(
+        covered(centre_left, centre_right, y) for y in lower_rows
+    ) / max(1, height - lower_start)
+    return (
+        left_coverage >= 0.85
+        and right_coverage >= 0.85
+        and split_coverage >= 0.85
+        and lower_centre_coverage >= 0.5
+    )
+
+
+def _topology_point_candidate(glyph: Image.Image, point_value: int) -> str | None:
+    """Return a point-compatible letter only when its outline independently proves it."""
+    # G and K do not keep two outer stems throughout their upper half.  M does,
+    # and its diagonals meet in the lower centre.  That lets a visible 3 correct
+    # an O/M template mistake without depending on a particular installed font.
+    if point_value == 3 and _glyph_looks_like_m(glyph):
+        return "M"
+    return None
+
+
+def _point_value_conflicts_with_glyph_topology(
+    glyph: Image.Image, letter: str, point_value: int
+) -> bool:
+    """Identify a tiny point reading that cannot fit a clear enclosed glyph."""
+    if letter not in _LETTERS_WITH_ENCLOSED_HOLES or not _glyph_has_enclosed_hole(glyph):
+        return False
+    point_candidates = [
+        candidate for candidate, value in LETTER_VALUES.items() if value == point_value
+    ]
+    return not any(candidate in _LETTERS_WITH_ENCLOSED_HOLES for candidate in point_candidates)
+
+
 @lru_cache(maxsize=1)
 def _local_template_font() -> tuple[str, int] | None:
     """Find a local sans font close to the font used by the Wordfeud client."""
@@ -1263,6 +1369,14 @@ def _reconcile_local_letter(
         # superscript contains enough information to correct the large glyph by
         # itself; all shared values still require independent glyph evidence.
         return unique_point_letters[0]
+
+    topology_candidate = _topology_point_candidate(glyph, point_value)
+    if topology_candidate is not None:
+        return topology_candidate
+    if _point_value_conflicts_with_glyph_topology(glyph, letter, point_value):
+        # An enclosed O/P/D/etc. cannot become G, K or M merely because the
+        # superscript was read as 3.  The shape is a third independent reader.
+        return letter
 
     try:
         verified = _tesseract_letter(glyph).upper()
