@@ -20,6 +20,7 @@ from wordfeud_analyzer.vision import (
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
     _letter_for_point_value,  # pyright: ignore[reportPrivateUsage]
     _local_letters,  # pyright: ignore[reportPrivateUsage]
+    _reconcile_local_letter,  # pyright: ignore[reportPrivateUsage]
     _local_template_font,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _max_response_tokens,  # pyright: ignore[reportPrivateUsage]
@@ -153,6 +154,9 @@ def test_local_rack_geometry_finds_all_tiles_without_reading_the_letters() -> No
     for index in range(7):
         left = 15 + index * 80
         draw.rectangle((left, 95, left + 76, 170), fill=DARK_THEME["tile"])
+        # A scanline through the glyph would otherwise split every tile into two
+        # bright runs and look like fourteen rack tiles.
+        draw.rectangle((left + 35, 105, left + 40, 130), fill=(0, 0, 0))
 
     boxes = _rack_boxes(rack, DARK_THEME["empty"])
 
@@ -180,6 +184,24 @@ def test_the_point_value_corrects_a_q_misread_as_o() -> None:
 def test_an_ambiguous_point_mismatch_is_rejected() -> None:
     with pytest.raises(LocalOCRFailure, match="punten"):
         _ = _letter_for_point_value("Q", 1)
+
+
+def test_a_tiny_point_misread_does_not_discard_two_agreeing_glyph_readers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear L must survive a superscript that was read as the wrong value."""
+    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "L")
+
+    assert _reconcile_local_letter(Image.new("L", (10, 10)), "L", 0.08, 5) == "L"
+
+
+def test_a_point_conflict_prefers_an_independent_glyph_reading_when_it_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An O/3 conflict can be corrected when the second glyph reader sees M."""
+    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "M")
+
+    assert _reconcile_local_letter(Image.new("L", (10, 10)), "O", 0.2, 3) == "M"
 
 
 def test_local_backend_does_not_require_an_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

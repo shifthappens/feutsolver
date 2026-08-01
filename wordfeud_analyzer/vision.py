@@ -5,9 +5,11 @@ the board is, which squares hold a tile, and which bonus each free square carrie
 Letter recognition is local by default: the large glyph is isolated from each tile and
 read with a fixed template, with Tesseract as a portable fallback. The optional remote
 route is limited to the same glyph-only task and never has to count rows, pad a grid or
-return a coordinate. The tiny printed point value is not sent to the remote OCR route,
-but local OCR uses it as a consistency check for the large glyph. That catches the
-particularly costly Q/O confusion without making the point value part of board state.
+return a coordinate. The tiny printed point value is not sent to the remote OCR route.
+Local OCR uses it as a soft consistency signal for the large glyph, with an independent
+glyph check before rejecting a conflict. The superscript is too small to be a hard
+invariant on phone screenshots, but it can still catch a particularly costly Q/O
+confusion.
 """
 from __future__ import annotations
 
@@ -860,6 +862,8 @@ LOCAL_TEMPLATE_FONT_CANDIDATES = (
 LOCAL_GLYPH_THRESHOLD = 120
 LOCAL_TEMPLATE_SIZE = (96, 128)
 LOCAL_POINT_MAX_SCORE = 0.75
+LOCAL_POINT_CANDIDATE_MAX_SCORE = 0.45
+LOCAL_POINT_CANDIDATE_MARGIN = 0.04
 
 
 def _dark_components(crop: Image.Image) -> list[list[tuple[int, int]]]:
@@ -1038,22 +1042,26 @@ def _local_point_templates() -> dict[str, object] | None:
     return templates
 
 
-def _template_letter(glyph: Image.Image) -> tuple[str, float]:
-    """Read one glyph using a fixed-font template and return its pixel error."""
+def _template_letter_candidates(glyph: Image.Image) -> list[tuple[float, str]]:
+    """Return fixed-font glyph candidates in ascending pixel-error order."""
     templates = _local_templates()
     if templates is None:
         raise LocalOCRUnavailable("Lokale letterherkenning is niet beschikbaar: installeer Tesseract OCR.")
     import numpy as np
 
     actual = np.asarray(_normalise_glyph(glyph), dtype="float32") / 255
-    scored = sorted(
+    return sorted(
         (
             float(np.mean(np.abs(actual - np.asarray(template, dtype="float32") / 255))),
             letter,
         )
         for letter, template in templates.items()
     )
-    score, letter = scored[0]
+
+
+def _template_letter(glyph: Image.Image) -> tuple[str, float]:
+    """Read one glyph using a fixed-font template and return its pixel error."""
+    score, letter = _template_letter_candidates(glyph)[0]
     return letter, score
 
 
@@ -1181,6 +1189,12 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     for y in range(round(height * 0.25), round(height * 0.7)):
         row = [_is_tile_colour(_rgb_pixel(rack, x, y), empty_colour) for x in range(width)]
         runs = _tile_runs(row, minimum_width, maximum_width)
+        # Letter strokes and point values can split a tile into several bright
+        # runs. A rack contains at most seven tiles, so such a scanline is noise,
+        # not a better geometry candidate. Prefer a lower scanline where the tile
+        # bodies form seven contiguous runs instead.
+        if len(runs) > 7:
+            continue
         if (len(runs), sum(end - start for start, end in runs)) > (
             len(best), sum(end - start for start, end in best)
         ):
@@ -1226,6 +1240,59 @@ def _letter_for_point_value(letter: str, point_value: int) -> str:
     )
 
 
+def _reconcile_local_letter(
+    glyph: Image.Image, letter: str, score: float, point_value: int | None
+) -> str:
+    """Use points as a hint, never as the sole reason to discard a clear glyph.
+
+    The superscript is only a handful of pixels wide in a normal phone screenshot.
+    It is therefore common for its template read to be wrong while the large glyph
+    is clear (for example a real ``L`` with a visible ``3`` read as ``5``). A conflict
+    gets an independent Tesseract pass first. If both glyph readers agree, the tiny
+    superscript loses. If they disagree, a visually strong candidate with the printed
+    value can still win; otherwise the tile is rejected instead of guessing.
+    """
+    letter = letter.upper()
+    if point_value is None or LETTER_VALUES.get(letter) == point_value:
+        return letter
+    unique_point_letters = [
+        candidate for candidate, value in LETTER_VALUES.items() if value == point_value
+    ]
+    if len(unique_point_letters) == 1:
+        # Ten points uniquely identifies Q. This is the one case where the tiny
+        # superscript contains enough information to correct the large glyph by
+        # itself; all shared values still require independent glyph evidence.
+        return unique_point_letters[0]
+
+    try:
+        verified = _tesseract_letter(glyph).upper()
+    except (LocalOCRUnavailable, LocalOCRFailure):
+        verified = None
+    if verified == letter:
+        return letter
+    if verified is not None and LETTER_VALUES.get(verified) == point_value:
+        return verified
+
+    if _local_templates() is not None:
+        point_candidates = [
+            (candidate_score, candidate)
+            for candidate_score, candidate in _template_letter_candidates(glyph)
+            if LETTER_VALUES.get(candidate) == point_value
+        ]
+        if point_candidates:
+            candidate_score, candidate = point_candidates[0]
+            if (
+                candidate_score <= LOCAL_POINT_CANDIDATE_MAX_SCORE
+                and candidate_score + LOCAL_POINT_CANDIDATE_MARGIN <= score
+            ):
+                return candidate
+
+    raise LocalOCRFailure(
+        f"Lokale OCR las {letter}, maar de tegel toont {point_value} punten; "
+        "ook een onafhankelijke controle kon de letter niet betrouwbaar bevestigen."
+    )
+
+
 def _local_letters(cells: list[Image.Image], *, rack: bool) -> list[str]:
     """Read a list of cells locally, preserving lowercase blank assignments."""
     readings: list[str] = []
@@ -1236,14 +1303,14 @@ def _local_letters(cells: list[Image.Image], *, rack: bool) -> list[str]:
                 readings.append("?")
                 continue
             raise LocalOCRFailure("Lokale OCR vond geen grote letter in een bordtegel.")
-        if _local_templates() is not None:
+        template_available = _local_templates() is not None
+        if template_available:
             letter, score = _template_letter(glyph)
             if score > 0.75:
                 raise LocalOCRFailure("Lokale template-OCR is niet zeker genoeg voor een tegel.")
         else:
             letter = _tesseract_letter(glyph)
-        if point_value is not None:
-            letter = _letter_for_point_value(letter, point_value)
+        letter = _reconcile_local_letter(glyph, letter, score if template_available else 0.0, point_value)
         readings.append(letter.lower() if point_value is None and not rack else letter.upper())
     return readings
 

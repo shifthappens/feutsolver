@@ -37,7 +37,7 @@ Onder de suggesties kun je één of meer voorgestelde woorden of bijbehorende kr
 
 Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Geef oplossingen weer`. De lokale OCR-route levert bij iedere uitlezing zekerheidsmetadata van 98%; bij een onleesbare glyph wordt het resultaat niet gebruikt en vraagt de app om een betere schermafbeelding.
 
-De uitlezing controleert harde eigenschappen voordat een bord wordt vervangen: de lokaal gevonden tegelposities zijn exact bekend, iedere glyph levert één letter op, de zichtbare puntwaarde wordt als extra controle gebruikt en losse tegels worden geweigerd. Zo kan een `Q` met 10 punten niet stilletjes als `O` met 1 punt doorgaan. De puntwaarde blijft buiten de remote OCR-API en het bordmodel. Kan lokale OCR een glyph niet betrouwbaar lezen, dan wordt de upload geweigerd; met `auto` kan daarna optioneel één OpenRouter-uitlezing volgen.
+De uitlezing controleert harde eigenschappen voordat een bord wordt vervangen: de lokaal gevonden tegelposities zijn exact bekend, iedere glyph levert één letter op en losse tegels worden geweigerd. De zichtbare puntwaarde is een zachte extra controle: bij een conflict volgt eerst een onafhankelijke glyph-lezing, zodat een fout gelezen superscript een duidelijke letter niet onnodig afwijst. Zo kan een `Q` met 10 punten niet stilletjes als `O` met 1 punt doorgaan, maar blijft een klein en slecht leesbaar cijfer niet de enige beslisser. De puntwaarde blijft buiten de remote OCR-API en het bordmodel. Kan lokale OCR een glyph niet betrouwbaar lezen, dan wordt de upload geweigerd; met `auto` kan daarna optioneel één OpenRouter-uitlezing volgen.
 
 ## Server/client-scheiding
 
