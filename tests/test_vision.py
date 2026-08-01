@@ -3,11 +3,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
     BOARD_SIZE,
+    LOCAL_PROFILE_SIZE,
     BoardExtraction,
     MINIMUM_CONFIDENCE,
     LooseTilesError,
@@ -18,15 +19,14 @@ from wordfeud_analyzer.vision import (
     VisionExtractionError,
     _disconnected_tiles,  # pyright: ignore[reportPrivateUsage]
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
-    _letter_for_point_value,  # pyright: ignore[reportPrivateUsage]
-    _local_letters,  # pyright: ignore[reportPrivateUsage]
+    _decoded_wordfeud_profiles,  # pyright: ignore[reportPrivateUsage]
+    _profile_is_decisive,  # pyright: ignore[reportPrivateUsage]
+    _profile_letter_candidates,  # pyright: ignore[reportPrivateUsage]
     _reconcile_local_letter,  # pyright: ignore[reportPrivateUsage]
-    _local_template_font,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
     _max_response_tokens,  # pyright: ignore[reportPrivateUsage]
     _outside_in,  # pyright: ignore[reportPrivateUsage]
     _rack_boxes,  # pyright: ignore[reportPrivateUsage]
-    _tile_glyph,  # pyright: ignore[reportPrivateUsage]
     _parse_content,  # pyright: ignore[reportPrivateUsage]
     _to_board_state,  # pyright: ignore[reportPrivateUsage]
     _wordfeud_crop_images,  # pyright: ignore[reportPrivateUsage]
@@ -163,72 +163,41 @@ def test_local_rack_geometry_finds_all_tiles_without_reading_the_letters() -> No
     assert boxes == [(15 + index * 80, 95, 15 + index * 80 + 77, 171) for index in range(7)]
 
 
-def test_the_point_value_corrects_a_q_misread_as_o() -> None:
-    """Q's unique ten points must win when its large glyph looks like O."""
-    font_spec = _local_template_font()
-    if font_spec is None:
-        pytest.skip("geen lokaal testfont beschikbaar")
-    filename, index = font_spec
-    letter_font = ImageFont.truetype(filename, 60, index=index)
-    point_font = ImageFont.truetype(filename, 18, index=index)
-    tile = Image.new("RGB", (100, 100), (245, 242, 235))
-    draw = ImageDraw.Draw(tile)
-    draw.text((14, 12), "O", font=letter_font, fill=(0, 0, 0))
-    draw.text((69, 5), "10", font=point_font, fill=(0, 0, 0))
-
-    assert _tile_glyph(tile)[1] == 10
-    assert _local_letters([tile], rack=True) == ["Q"]
-    assert _letter_for_point_value("Q", 10) == "Q"
+def _glyph_from_profile(letter: str) -> Image.Image:
+    """Build a real, versioned Wordfeud glyph fixture without a host font."""
+    mask = _decoded_wordfeud_profiles()[letter][0]
+    pixels = bytes(
+        255 if value & (1 << (7 - offset)) else 0
+        for value in mask
+        for offset in range(8)
+    )
+    return Image.frombytes("L", LOCAL_PROFILE_SIZE, pixels)
 
 
-def test_an_ambiguous_point_mismatch_is_rejected() -> None:
-    with pytest.raises(LocalOCRFailure, match="punten"):
-        _ = _letter_for_point_value("Q", 1)
+def test_versioned_glyph_profiles_have_complete_fixed_size_masks() -> None:
+    assert {
+        len(mask)
+        for masks in _decoded_wordfeud_profiles().values()
+        for mask in masks
+    } == {LOCAL_PROFILE_SIZE[0] * LOCAL_PROFILE_SIZE[1] // 8}
 
 
-def test_a_tiny_point_misread_does_not_discard_two_agreeing_glyph_readers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A clear L must survive a superscript that was read as the wrong value."""
-    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "L")
+def test_real_three_point_m_profile_is_not_read_as_o() -> None:
+    """Regression from the supplied iPhone screenshot: M has value three, O one."""
+    candidates = _profile_letter_candidates(_glyph_from_profile("M"))
 
-    assert _reconcile_local_letter(Image.new("L", (10, 10)), "L", 0.08, 5) == "L"
-
-
-def test_a_point_conflict_prefers_an_independent_glyph_reading_when_it_matches(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An O/3 conflict can be corrected when the second glyph reader sees M."""
-    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "M")
-
-    assert _reconcile_local_letter(Image.new("L", (10, 10)), "O", 0.2, 3) == "M"
+    assert candidates[0] == (0.0, "M")
+    assert _profile_is_decisive(candidates)
 
 
-def test_a_closed_o_outranks_a_false_three_point_reading(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The tiny 1 can look like 3, while the O outline stays unambiguous."""
-    glyph = Image.new("L", (20, 28), 0)
-    draw = ImageDraw.Draw(glyph)
-    draw.rounded_rectangle((1, 1, 18, 26), radius=7, outline=255, width=3)
-    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "R")
-
-    assert _reconcile_local_letter(glyph, "O", 0.14, 3) == "O"
+def test_a_moderate_profile_cannot_be_confirmed_by_the_same_ocr_path() -> None:
+    """E/3 must fail closed instead of yielding a confident but contradictory tile."""
+    with pytest.raises(LocalOCRFailure, match="glyphprofiel"):
+        _ = _reconcile_local_letter("E", 0.12, 3)
 
 
-def test_an_m_outline_corrects_an_o_when_the_tile_shows_three_points(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """M's two outer stems are independent evidence beyond system font templates."""
-    glyph = Image.new("L", (20, 28), 0)
-    draw = ImageDraw.Draw(glyph)
-    draw.rectangle((0, 0, 3, 27), fill=255)
-    draw.rectangle((16, 0, 19, 27), fill=255)
-    draw.line((3, 0, 10, 27), fill=255, width=3)
-    draw.line((16, 0, 10, 27), fill=255, width=3)
-    monkeypatch.setattr("wordfeud_analyzer.vision._tesseract_letter", lambda _glyph: "R")
-
-    assert _reconcile_local_letter(glyph, "O", 0.2, 3) == "M"
+def test_a_strong_profile_can_reject_a_bad_tiny_point_reading() -> None:
+    assert _reconcile_local_letter("L", 0.08, 5) == "L"
 
 
 def test_local_backend_does_not_require_an_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

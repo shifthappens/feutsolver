@@ -373,7 +373,13 @@ process_upload()
 state = current_state()
 confidence = st.session_state.get("confidence")
 if confidence is not None:
-    st.caption(f"Zekerheid van schermafbeelding: {float(confidence):.0f}%. Controleer de zichtbare letters en bonussen.")
+    confidence_value = float(confidence)
+    st.caption(f"Gemeten OCR-zekerheid: {confidence_value:.0f}%. Controleer de zichtbare letters en bonussen.")
+    if confidence_value < 80:
+        st.warning(
+            "De lokale OCR heeft een of meer letters maar beperkt kunnen onderscheiden. "
+            "Controleer het bord voordat je oplossingen gebruikt."
+        )
 if st.session_state.get("learned"):
     st.caption("Nieuw geleerd: " + ", ".join(sorted(st.session_state.learned)))
 if st.session_state.get("upload_feedback"):

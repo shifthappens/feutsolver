@@ -19,7 +19,7 @@ import json
 import os
 import re
 import shutil
-from collections import Counter, deque
+from collections import Counter
 from copy import deepcopy
 from functools import lru_cache
 from io import BytesIO
@@ -847,23 +847,56 @@ def _outside_in(values: list[int]) -> list[int]:
 
 
 # Local OCR reads the large glyph first and uses the small point value as a separate
-# consistency signal. A system font template is the fast path on macOS and Windows.
-# Tesseract remains the portable fallback for Linux installations where that font is
-# not present.
-LOCAL_TEMPLATE_FONT_CANDIDATES = (
-    "/System/Library/Fonts/HelveticaNeue.ttc",
-    "/System/Library/Fonts/Helvetica.ttc",
-    "/System/Library/Fonts/SFNS.ttf",
-    "C:/Windows/Fonts/Arial.ttf",
-    "C:/Windows/Fonts/arial.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-)
+# consistency signal.  Crucially, glyph recognition must not depend on whichever
+# system font happens to be installed on the web server.  These profiles are compact
+# binary masks taken from the Wordfeud client itself, versioned with the application.
+# A profile therefore produces the same candidate ordering on macOS, Linux and CI.
 LOCAL_GLYPH_THRESHOLD = 120
-LOCAL_TEMPLATE_SIZE = (96, 128)
-LOCAL_POINT_MAX_SCORE = 0.75
-LOCAL_POINT_CANDIDATE_MAX_SCORE = 0.45
-LOCAL_POINT_CANDIDATE_MARGIN = 0.04
+LOCAL_PROFILE_SIZE = (24, 32)
+LOCAL_PROFILE_MAX_DISTANCE = 0.18
+LOCAL_PROFILE_MIN_MARGIN = 0.035
+LOCAL_PROFILE_STRONG_DISTANCE = 0.08
+
+# Multiple examples can be added per letter as Wordfeud changes its rendering. The
+# first set covers the client glyphs in the supported iPhone screenshot family.
+# An unrepresented glyph fails closed, except Q: its unique value 10 still requires
+# a separate large-glyph Tesseract read and is reported as low confidence.
+WORDFEUD_GLYPH_PROFILES: dict[str, tuple[str, ...]] = {
+    "A": ("ABgAABgAAD8AAD8AAH4AAP8AAP+AAGeAAOeAAeOAAePAAePAAcPAA8HAA8DgA8DwA4DwBwDwD4HwD//4D//4D//4HwB4HgA8HgA+HgA+PAA8fAAefAAPPAAP+AAP8AAP",),
+    "B": ("P//Af//A///4/Af8+AB8+AA++AAf+AAf+AAf+AAf+AAc+AAc+AA8///g///A///A///4+AB8+AA++AAf+AAf+AAf+AAf+AAf+AAf+AAf+AA/+AB////8///4f//AP//A",),
+    "C": ("AA/wAP//A///B///D8ACH4AAHwAAPgAAPAAAfAAAeAAA+AAA+AAA+AAA+AAA+AAA+AAA+AAA+AAA+AAA+AAAeAAAeAAAfAAAPAAAPgAAPwAAH4AAD/g+B//+Af/+AH/4",),
+    "E": ("/////////////AAA+AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA+AAA/AAA///8///8///8/AAA+AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA+AAA/AAA////////////",),
+    "F": ("////////////8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA/AAA/////////////AAA/AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA",),
+    "G": ("AD/8AH/8A//8B+AcD8AAH4AAHwAAPgAAPAAAPAAAPAAAPAAAPAAA+AAA+AAA+AP/+AP/+AP/+AH/PAAfPAAfPAAfPAAfPAAfPgAfHwAfH4AfD8AfB///A///AH/9AD/4",),
+    "H": (
+        "4AAM4AAO" "4AAf4AAf" "4AAf4AAf" "4AAf4AAf"
+        "4AAf4AAf" "4AAf4AAf" "4AAf////" "////////"
+        "////8AA/" "4AAf4AAf" "4AAf4AAf" "4AAf4AAf"
+        "4AAf4AAf" "4AAf4AAf" "4AAf4AAf" "4AAf4AAf",
+        "+AAH+AAH" "+AAH+AAH" "+AAH+AAH" "+AAH+AAH"
+        "+AAH+AAH" "+AAH+AAH" "+AAH////" "////////"
+        "+AAf+AAP" "+AAH+AAH" "+AAH+AAH" "+AAH+AAH"
+        "+AAH+AAH" "+AAH+AAH" "+AAH+AAH" "cAAOMAAM",
+    ),
+    "I": (
+        "////////////AD8AAD8AAD8AADwAADwAADwAADwAADwAAD4AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAD8AAH8AAP8A////////////",
+        "P//8////////AP8AAH4AADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAAHwAAPwAP//8////////",
+    ),
+    "J": ("AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAAcAAA8AAB8AAH8AAP8///w///gH/yAD/gA",),
+    "K": ("OAAHeAAP+AAf+AB8+AD4+AHw+APg+A/A+A+A+A4A+B4A+D4A+PwA+fAA//AA//AA//wA/z4A/j4A+D4A+B+A+A+A+APg+APg+APg+AH4+AH8+AD8+AB8+AAf+AAf+AAf",),
+    "L": ("MAAA+AAA/AAAPAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAPAAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA+AAA/AAA/gAA////f///P///",),
+    "M": ("/AA//AA//AA//AA//gB//wD//wD//wD//wD/5wDn5wDn5wDn44HH48PH48PH48PH48PH48PH44MH4cMH4OcH4OcH4OcH4OcH4P8H4P8H4DwH4DwH4DwH4DwH4DwH4DwH",),
+    "N": ("PAAcfAAe/gAf/wAf/wAf/wAfP8Af+8Af+cAf+eAf+OAf+PAf+Pgf+Dgf+Dgf+Dwf+Bwf+B4f+B8f+Acf+Acf+Acf+Aef+AP/+AP/+AP/+AD/+AD/+AD/+AB/cAA+IAAc",),
+    "O": ("AP8AAf+AB//gH+f4PwB8PwA8+AAfPAA8+AAf+AAf+AAf+AAf+AAf+AAf+AAP+AAH+AAH+AAP+AAf+AAf+AAf+AAf+AAf+AAf+AAfPAA8PAA8PgB8H8D4B//gA//AA//A",),
+    "P": ("//+A//+A///4/B/88AD/8AB/8AA/8AAf8AA/8AA/8AA/8AAf8AA/8AB88AD88AH8///w///g///A/AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA",),
+    "R": ("//+A///A///g8APw4AP44AD44AB84AB84AB84AB84AB84AB44AD48AHw+APg///A//+A//4A/D4A+B8A4A+A+A+A+A+A4APg4APg8APg+AHw8AB84AB8+AB8+AA/4AAf",),
+    "S": ("AP+AB//+H//+P//8fgAMfAAA+AAA8AAA+AAA+AAAeAAAfgAAPwAAH8AAH/wAB/8AAP/gAD/4AAP8AAD+AAA+AAAfAAAPAAAPAAAPAAAfAAAeAAA+/AP8///4///wP/8A",),
+    "T": ("////////////APwAAHgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADgA",),
+    "U": ("+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAP+AAf+AAf+AAf/gAfPgB8PgB8P//8B//4AP8gAH4A",),
+    "V": ("8AAPcAAPeAAeeAAefAA+PAAePAA8HAA8HgA4HgB4HgB4DwDwDwDwDwDwBwDgB4HgB4HgB4HgA8PAA8PAAcPAAcOAAeeAAOcAAOeAAP8AAP8AAH8AAH4AADwAADwAADwA",),
+    "W": ("4AAG4AAG4AAP8AAP8AAO8AAO8AAO8AAO8AAOcAAOcDgOcHgOcHgOcH4eeH4eeH4eeO4YeOYYeOcYeOcYOecYGecYGYeYH4P4H4H4H4H4H4H4H4H4HwH4HwDwHwDwDwDw",),
+    "Z": ("P//8P//8P//8AAD8AAB4AAB4AABgAAHwAAHgAAfAAA+AAA8AAA8AAB4AADwAAHgAAHwAAPgAAfAAA+AAA+AAA8AAB4AAHwAAHgAAHAAAPAAAfAAA////////f//+P//8",),
+}
 
 
 def _dark_components(crop: Image.Image) -> list[list[tuple[int, int]]]:
@@ -967,229 +1000,74 @@ def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, int | None]:
     point_components = _point_components(point_inner, sorted(_dark_components(point_inner), key=len, reverse=True))
     point_value = None
     if point_components:
-        point_value = _template_point_value(_combined_component_image(point_components))
+        try:
+            point_value = _template_point_value(_combined_component_image(point_components))
+        except (LocalOCRUnavailable, LocalOCRFailure):
+            # The superscript is secondary evidence.  A failed tiny-digit read must
+            # never turn a clear large-glyph profile into a failed whole-board OCR.
+            point_value = None
     return glyph, point_value
 
 
-_LETTERS_WITH_ENCLOSED_HOLES = frozenset("ABDOPQR")
-
-
-def _glyph_has_enclosed_hole(glyph: Image.Image) -> bool:
-    """Return whether the binary glyph contains a substantial enclosed background area.
-
-    This is deliberately font-independent.  In particular, a true ``O`` keeps a
-    large closed counter even when the installed template font or Tesseract does
-    not look like the Wordfeud client font.
-    """
-    width, height = glyph.size
-    foreground = {
-        (x, y)
-        for y in range(height)
-        for x in range(width)
-        if glyph.getpixel((x, y)) >= 128
-    }
-    background = {
-        (x, y)
-        for y in range(height)
-        for x in range(width)
-        if (x, y) not in foreground
-    }
-    exterior: set[tuple[int, int]] = set()
-    pending = deque(
-        point
-        for point in background
-        if point[0] in {0, width - 1} or point[1] in {0, height - 1}
-    )
-    while pending:
-        point = pending.popleft()
-        if point in exterior:
-            continue
-        exterior.add(point)
-        x, y = point
-        for neighbour in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-            if neighbour in background and neighbour not in exterior:
-                pending.append(neighbour)
-
-    # Reject incidental one-pixel gaps from JPEG compression, but retain the
-    # sizeable counter in the O-shaped Wordfeud glyph.
-    return len(background - exterior) >= max(4, round(width * height * 0.015))
-
-
-def _glyph_looks_like_m(glyph: Image.Image) -> bool:
-    """Recognise the stable two-stem, lower-centre structure of a capital M."""
-    if _glyph_has_enclosed_hole(glyph):
-        return False
-    width, height = glyph.size
-    edge_width = max(1, round(width * 0.2))
-    upper_height = max(4, round(height * 0.5))
-    lower_start = max(0, round(height * 2 / 3))
-    centre_left = max(0, width // 2 - 1)
-    centre_right = min(width, width // 2 + 2)
-
-    def covered(start: int, end: int, y: int) -> bool:
-        return any(glyph.getpixel((x, y)) >= 128 for x in range(start, end))
-
-    def foreground_runs(y: int) -> int:
-        runs = 0
-        inside = False
-        for x in range(width + 1):
-            filled = x < width and glyph.getpixel((x, y)) >= 128
-            if filled and not inside:
-                runs += 1
-            inside = filled
-        return runs
-
-    upper_rows = range(upper_height)
-    lower_rows = range(lower_start, height)
-    left_coverage = sum(covered(0, edge_width, y) for y in upper_rows) / upper_height
-    right_coverage = sum(covered(width - edge_width, width, y) for y in upper_rows) / upper_height
-    split_coverage = sum(foreground_runs(y) >= 2 for y in upper_rows) / upper_height
-    lower_centre_coverage = sum(
-        covered(centre_left, centre_right, y) for y in lower_rows
-    ) / max(1, height - lower_start)
-    return (
-        left_coverage >= 0.85
-        and right_coverage >= 0.85
-        and split_coverage >= 0.85
-        and lower_centre_coverage >= 0.5
+def _packed_profile(glyph: Image.Image) -> bytes:
+    """Return a compact, deterministic binary fingerprint for a tight glyph crop."""
+    resized = glyph.resize(LOCAL_PROFILE_SIZE, Image.Resampling.LANCZOS)
+    pixels = [pixel >= 128 for pixel in resized.tobytes()]
+    return bytes(
+        sum(bit << (7 - offset) for offset, bit in enumerate(pixels[index:index + 8]))
+        for index in range(0, len(pixels), 8)
     )
 
 
-def _topology_point_candidate(glyph: Image.Image, point_value: int) -> str | None:
-    """Return a point-compatible letter only when its outline independently proves it."""
-    # G and K do not keep two outer stems throughout their upper half.  M does,
-    # and its diagonals meet in the lower centre.  That lets a visible 3 correct
-    # an O/M template mistake without depending on a particular installed font.
-    if point_value == 3 and _glyph_looks_like_m(glyph):
-        return "M"
-    return None
-
-
-def _point_value_conflicts_with_glyph_topology(
-    glyph: Image.Image, letter: str, point_value: int
-) -> bool:
-    """Identify a tiny point reading that cannot fit a clear enclosed glyph."""
-    if letter not in _LETTERS_WITH_ENCLOSED_HOLES or not _glyph_has_enclosed_hole(glyph):
-        return False
-    point_candidates = [
-        candidate for candidate, value in LETTER_VALUES.items() if value == point_value
-    ]
-    return not any(candidate in _LETTERS_WITH_ENCLOSED_HOLES for candidate in point_candidates)
-
-
 @lru_cache(maxsize=1)
-def _local_template_font() -> tuple[str, int] | None:
-    """Find a local sans font close to the font used by the Wordfeud client."""
-    configured = os.environ.get("WORDFEUD_TEMPLATE_FONT")
-    candidates = ((configured,) if configured else ()) + LOCAL_TEMPLATE_FONT_CANDIDATES
-    for filename in candidates:
-        if not filename or not Path(filename).exists():
-            continue
-        try:
-            ImageFont.truetype(filename, 60, index=0)
-        except OSError:
-            continue
-        return filename, 0
-    return None
+def _decoded_wordfeud_profiles() -> dict[str, tuple[bytes, ...]]:
+    """Decode checked-in client glyphs once; no host font is consulted."""
+    profiles = {
+        letter: tuple(base64.b64decode(profile) for profile in profiles)
+        for letter, profiles in WORDFEUD_GLYPH_PROFILES.items()
+    }
+    expected_length = LOCAL_PROFILE_SIZE[0] * LOCAL_PROFILE_SIZE[1] // 8
+    if any(len(profile) != expected_length for masks in profiles.values() for profile in masks):
+        raise RuntimeError("Wordfeud-glyphprofielen hebben een ongeldige lengte.")
+    return profiles
 
 
-def _normalise_glyph(glyph: Image.Image) -> object:
-    """Normalise a glyph mask for cheap pixel-template comparison."""
-    return glyph.resize(LOCAL_TEMPLATE_SIZE, Image.Resampling.LANCZOS)
+def _profile_distance(left: bytes, right: bytes) -> float:
+    if len(left) != len(right):
+        raise ValueError("glyphprofielen moeten dezelfde lengte hebben")
+    return sum((first ^ second).bit_count() for first, second in zip(left, right)) / (8 * len(left))
 
 
-@lru_cache(maxsize=1)
-def _local_templates() -> dict[str, object] | None:
-    font_spec = _local_template_font()
-    if font_spec is None:
-        return None
-    filename, index = font_spec
-    try:
-        font = ImageFont.truetype(filename, 60, index=index)
-    except OSError:
-        return None
-    templates: dict[str, object] = {}
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        canvas = Image.new("L", (160, 160), 0)
-        ImageDraw.Draw(canvas).text((10, 0), letter, font=font, fill=255)
-        bounds = canvas.getbbox()
-        if bounds is not None:
-            templates[letter] = _normalise_glyph(canvas.crop(bounds))
-
-    # Helvetica renders a capital I as a simple stem, while Wordfeud's glyph has
-    # small horizontal bars. Keep this extra shape independent of the installed font.
-    i_shape = Image.new("L", (160, 160), 0)
-    draw = ImageDraw.Draw(i_shape)
-    draw.rectangle((45, 15, 115, 23), fill=255)
-    draw.rectangle((75, 15, 85, 120), fill=255)
-    draw.rectangle((45, 112, 115, 120), fill=255)
-    templates["I"] = _normalise_glyph(i_shape.crop(i_shape.getbbox()))
-    return templates
-
-
-@lru_cache(maxsize=1)
-def _local_point_templates() -> dict[str, object] | None:
-    """Build digit templates for the one- and two-digit Wordfeud point values."""
-    font_spec = _local_template_font()
-    if font_spec is None:
-        return None
-    filename, index = font_spec
-    try:
-        font = ImageFont.truetype(filename, 60, index=index)
-    except OSError:
-        return None
-    templates: dict[str, object] = {}
-    for value in ("1", "2", "3", "4", "5", "8", "10"):
-        canvas = Image.new("L", (160, 160), 0)
-        ImageDraw.Draw(canvas).text((10, 0), value, font=font, fill=255)
-        bounds = canvas.getbbox()
-        if bounds is not None:
-            templates[value] = _normalise_glyph(canvas.crop(bounds))
-    return templates
-
-
-def _template_letter_candidates(glyph: Image.Image) -> list[tuple[float, str]]:
-    """Return fixed-font glyph candidates in ascending pixel-error order."""
-    templates = _local_templates()
-    if templates is None:
-        raise LocalOCRUnavailable("Lokale letterherkenning is niet beschikbaar: installeer Tesseract OCR.")
-    import numpy as np
-
-    actual = np.asarray(_normalise_glyph(glyph), dtype="float32") / 255
+def _profile_letter_candidates(glyph: Image.Image) -> list[tuple[float, str]]:
+    """Rank versioned Wordfeud-client profiles, independent of machine fonts."""
+    actual = _packed_profile(glyph)
     return sorted(
-        (
-            float(np.mean(np.abs(actual - np.asarray(template, dtype="float32") / 255))),
-            letter,
-        )
-        for letter, template in templates.items()
+        (min(_profile_distance(actual, profile) for profile in profiles), letter)
+        for letter, profiles in _decoded_wordfeud_profiles().items()
     )
 
 
-def _template_letter(glyph: Image.Image) -> tuple[str, float]:
-    """Read one glyph using a fixed-font template and return its pixel error."""
-    score, letter = _template_letter_candidates(glyph)[0]
-    return letter, score
+def _profile_confidence(candidates: list[tuple[float, str]]) -> float:
+    """Convert measured match quality and separation into a conservative percentage."""
+    best_score = candidates[0][0]
+    next_score = candidates[1][0] if len(candidates) > 1 else 1.0
+    quality = max(0.0, 1 - best_score / LOCAL_PROFILE_MAX_DISTANCE)
+    separation = min(1.0, max(0.0, (next_score - best_score) / LOCAL_PROFILE_MIN_MARGIN))
+    return min(99.0, round((0.45 + 0.55 * quality * separation) * 100, 1))
+
+
+def _profile_is_decisive(candidates: list[tuple[float, str]]) -> bool:
+    if len(candidates) < 2:
+        return bool(candidates) and candidates[0][0] <= LOCAL_PROFILE_MAX_DISTANCE
+    return (
+        candidates[0][0] <= LOCAL_PROFILE_MAX_DISTANCE
+        and candidates[1][0] - candidates[0][0] >= LOCAL_PROFILE_MIN_MARGIN
+    )
 
 
 def _template_point_value(glyph: Image.Image) -> int:
-    """Read a printed point value using the same template strategy as letters."""
-    templates = _local_point_templates()
-    if templates is None:
-        return _tesseract_point_value(glyph)
-    import numpy as np
-
-    actual = np.asarray(_normalise_glyph(glyph), dtype="float32") / 255
-    scored = sorted(
-        (
-            float(np.mean(np.abs(actual - np.asarray(template, dtype="float32") / 255))),
-            value,
-        )
-        for value, template in templates.items()
-    )
-    score, value = scored[0]
-    if score > LOCAL_POINT_MAX_SCORE:
-        raise LocalOCRFailure("Lokale punten-OCR is niet zeker genoeg voor een tegel.")
-    return int(value)
+    """Read the tiny secondary point signal without rendering a host font."""
+    return _tesseract_point_value(glyph)
 
 
 def _tesseract_letter(glyph: Image.Image) -> str:
@@ -1332,100 +1210,64 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     return boxes
 
 
-def _letter_for_point_value(letter: str, point_value: int) -> str:
-    """Correct a glyph only when its printed point value identifies one letter."""
-    letter = letter.upper()
-    if LETTER_VALUES.get(letter) == point_value:
-        return letter
-    candidates = [candidate for candidate, value in LETTER_VALUES.items() if value == point_value]
-    if len(candidates) == 1:
-        return candidates[0]
-    raise LocalOCRFailure(
-        f"Lokale OCR las {letter}, maar de tegel toont {point_value} punten; "
-        "de letter is daardoor niet betrouwbaar."
-    )
+def _reconcile_local_letter(letter: str, score: float, point_value: int | None) -> str:
+    """Accept a point conflict only when the client glyph profile is very strong.
 
-
-def _reconcile_local_letter(
-    glyph: Image.Image, letter: str, score: float, point_value: int | None
-) -> str:
-    """Use points as a hint, never as the sole reason to discard a clear glyph.
-
-    The superscript is only a handful of pixels wide in a normal phone screenshot.
-    It is therefore common for its template read to be wrong while the large glyph
-    is clear (for example a real ``L`` with a visible ``3`` read as ``5``). A conflict
-    gets an independent Tesseract pass first. If both glyph readers agree, the tiny
-    superscript loses. If they disagree, a visually strong candidate with the printed
-    value can still win; otherwise the tile is rejected instead of guessing.
+    A superscript is weak evidence, but a second character OCR without calibrated
+    confidence is not an independent confirmation either. A moderate profile plus
+    a conflicting point is deliberately rejected instead of guessing.
     """
     letter = letter.upper()
     if point_value is None or LETTER_VALUES.get(letter) == point_value:
         return letter
-    unique_point_letters = [
-        candidate for candidate, value in LETTER_VALUES.items() if value == point_value
-    ]
-    if len(unique_point_letters) == 1:
-        # Ten points uniquely identifies Q. This is the one case where the tiny
-        # superscript contains enough information to correct the large glyph by
-        # itself; all shared values still require independent glyph evidence.
-        return unique_point_letters[0]
-
-    topology_candidate = _topology_point_candidate(glyph, point_value)
-    if topology_candidate is not None:
-        return topology_candidate
-    if _point_value_conflicts_with_glyph_topology(glyph, letter, point_value):
-        # An enclosed O/P/D/etc. cannot become G, K or M merely because the
-        # superscript was read as 3.  The shape is a third independent reader.
+    # A close match against a checked-in Wordfeud-client profile is stronger
+    # evidence than a few-pixel Tesseract read of the superscript.  This avoids
+    # rejecting a clear E merely because its tiny 1 was read as 4 on a server.
+    # A weak or ambiguous profile never gets this escape hatch.
+    if score <= LOCAL_PROFILE_STRONG_DISTANCE:
         return letter
-
-    try:
-        verified = _tesseract_letter(glyph).upper()
-    except (LocalOCRUnavailable, LocalOCRFailure):
-        verified = None
-    if verified == letter:
-        return letter
-    if verified is not None and LETTER_VALUES.get(verified) == point_value:
-        return verified
-
-    if _local_templates() is not None:
-        point_candidates = [
-            (candidate_score, candidate)
-            for candidate_score, candidate in _template_letter_candidates(glyph)
-            if LETTER_VALUES.get(candidate) == point_value
-        ]
-        if point_candidates:
-            candidate_score, candidate = point_candidates[0]
-            if (
-                candidate_score <= LOCAL_POINT_CANDIDATE_MAX_SCORE
-                and candidate_score + LOCAL_POINT_CANDIDATE_MARGIN <= score
-            ):
-                return candidate
 
     raise LocalOCRFailure(
         f"Lokale OCR las {letter}, maar de tegel toont {point_value} punten; "
-        "ook een onafhankelijke controle kon de letter niet betrouwbaar bevestigen."
+        "het glyphprofiel is niet sterk genoeg om dat conflict veilig te negeren."
     )
 
 
-def _local_letters(cells: list[Image.Image], *, rack: bool) -> list[str]:
-    """Read a list of cells locally, preserving lowercase blank assignments."""
-    readings: list[str] = []
+class LocalGlyphReading(NamedTuple):
+    letter: str
+    confidence: float
+
+
+def _local_glyph_readings(cells: list[Image.Image], *, rack: bool) -> list[LocalGlyphReading]:
+    """Read cells using checked-in Wordfeud profiles and measured confidence."""
+    readings: list[LocalGlyphReading] = []
     for cell in cells:
         glyph, point_value = _tile_glyph(cell)
         if glyph is None:
             if rack:
-                readings.append("?")
+                readings.append(LocalGlyphReading("?", 50.0))
                 continue
             raise LocalOCRFailure("Lokale OCR vond geen grote letter in een bordtegel.")
-        template_available = _local_templates() is not None
-        if template_available:
-            letter, score = _template_letter(glyph)
-            if score > 0.75:
-                raise LocalOCRFailure("Lokale template-OCR is niet zeker genoeg voor een tegel.")
-        else:
-            letter = _tesseract_letter(glyph)
-        letter = _reconcile_local_letter(glyph, letter, score if template_available else 0.0, point_value)
-        readings.append(letter.lower() if point_value is None and not rack else letter.upper())
+        candidates = _profile_letter_candidates(glyph)
+        if not _profile_is_decisive(candidates):
+            if point_value == 10:
+                try:
+                    if _tesseract_letter(glyph).upper() == "Q":
+                        # Q is not yet represented in the checked-in screenshot
+                        # family. Its unique value is accepted only with a separate
+                        # large-glyph read and remains visibly low-confidence.
+                        readings.append(LocalGlyphReading("Q", 60.0))
+                        continue
+                except (LocalOCRUnavailable, LocalOCRFailure):
+                    pass
+            raise LocalOCRFailure(
+                "Lokale OCR heeft geen stabiel Wordfeud-glyphprofiel voor een tegel. "
+                "Gebruik een scherpere schermafbeelding of de expliciete AI-fallback."
+            )
+        score, letter = candidates[0]
+        letter = _reconcile_local_letter(letter, score, point_value)
+        reading = letter.lower() if point_value is None and not rack else letter.upper()
+        readings.append(LocalGlyphReading(reading, _profile_confidence(candidates)))
     return readings
 
 
@@ -1439,11 +1281,21 @@ def _extract_board_local(image_path: str | Path) -> BoardExtraction:
     if loose:
         raise LooseTilesError(len(loose))
     bonuses = detect_visible_bonuses(image_path)
-    letters = _local_letters(_tile_cells(board_image, tiles), rack=False)
+    board_readings = _local_glyph_readings(_tile_cells(board_image, tiles), rack=False)
     empty_colour = _empty_cell_colour(_cell_colours(board_image))
     rack_cells = [rack_image.crop(box) for box in _rack_boxes(rack_image, empty_colour)]
-    rack = _local_letters(rack_cells, rack=True)
-    return BoardExtraction(_to_board_state(letters, tiles, rack, bonuses), 98.0)
+    rack_readings = _local_glyph_readings(rack_cells, rack=True)
+    readings = board_readings + rack_readings
+    confidence = min(reading.confidence for reading in readings) if readings else 99.0
+    return BoardExtraction(
+        _to_board_state(
+            [reading.letter for reading in board_readings],
+            tiles,
+            [reading.letter for reading in rack_readings],
+            bonuses,
+        ),
+        confidence,
+    )
 
 
 def _extract_board_openrouter(
