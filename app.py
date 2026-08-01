@@ -20,7 +20,7 @@ from wordfeud_analyzer.move_generator import (
     generate_moves,
     learn_words,
     load_wordlist,
-    normalise_word,
+    parse_comma_separated_words,
     remove_word_from_wordlist,
 )
 from wordfeud_analyzer.state import (
@@ -299,28 +299,39 @@ def render_replacement_form() -> None:
     with st.form("replace_suggestion", clear_on_submit=True):
         word_to_replace = st.text_input(
             "Een suggestie vervangen",
-            placeholder="Typ een voorgesteld woord of kruiswoord",
+            placeholder="Bijv. woord, ander woord, kruiswoord",
+            help="Vul één of meer voorgestelde woorden of kruiswoorden in, gescheiden door komma's.",
         )
         submitted = st.form_submit_button("Vervang suggestie")
     if not submitted:
         return
     state = current_state()
-    entered_word = normalise_word(word_to_replace)
+    entered_words = parse_comma_separated_words(word_to_replace)
     replaceable = replaceable_words(solve_result)
-    if not entered_word:
-        st.warning("Vul een geldig woord in.")
+    if not entered_words:
+        st.warning("Vul één of meer geldige woorden in, gescheiden door komma's.")
         return
-    if entered_word not in replaceable:
-        st.warning("Dat woord staat niet tussen de huidige suggesties of bijbehorende kruiswoorden.")
+    not_replaceable = [word for word in entered_words if word not in replaceable]
+    if not_replaceable:
+        st.warning(
+            "Deze woorden staan niet tussen de huidige suggesties of bijbehorende kruiswoorden: "
+            + ", ".join(not_replaceable)
+            + "."
+        )
         return
+    removed_words: list[str] = []
     try:
-        removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)
-        removed_from_learned = remove_word_from_wordlist(entered_word, LEARNED_WORDS)
+        for entered_word in entered_words:
+            removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)
+            removed_from_learned = remove_word_from_wordlist(entered_word, LEARNED_WORDS)
+            if removed_from_wordlist or removed_from_learned:
+                removed_words.append(entered_word)
     except OSError as error:
         st.error(f"Het woord kon niet uit de woordenlijst worden verwijderd ({error}).")
         return
-    if not (removed_from_wordlist or removed_from_learned):
-        st.error("Het woord staat niet in de geconfigureerde woordenlijsten.")
+    if len(removed_words) != len(entered_words):
+        missing = [word for word in entered_words if word not in removed_words]
+        st.error("Deze woorden staan niet in de geconfigureerde woordenlijsten: " + ", ".join(missing) + ".")
         return
     try:
         moves, learned = solve_state(state)
@@ -332,7 +343,16 @@ def render_replacement_form() -> None:
         st.session_state.solve_result = None
         response("solve_error", error="Geen vervangende legale zet gevonden in de gekozen woordenlijst.")
         st.rerun()
-    st.session_state.solve_result = make_solve_result(state, moves, uuid4().hex)
+    next_solve_result = make_solve_result(state, moves, uuid4().hex)
+    still_suggested = replaceable_words(next_solve_result).intersection(entered_words)
+    if still_suggested:
+        st.error(
+            "Deze woorden staan nog in de nieuwe suggesties: "
+            + ", ".join(sorted(still_suggested))
+            + "."
+        )
+        return
+    st.session_state.solve_result = next_solve_result
     st.rerun()
 
 

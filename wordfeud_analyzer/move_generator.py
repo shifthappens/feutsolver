@@ -236,6 +236,17 @@ def normalise_word(word: str) -> str:
     return word if word and all("A" <= char <= "Z" for char in word) else ""
 
 
+def parse_comma_separated_words(value: str) -> list[str]:
+    """Parse one or more comma-separated words into unique normalised words."""
+    if not value.strip():
+        return []
+    parts = [part.strip() for part in value.split(",")]
+    words = [normalise_word(part) for part in parts]
+    if any(not word for word in words):
+        return []
+    return list(dict.fromkeys(words))
+
+
 def _is_plain_netherlands_word(word: str) -> bool:
     """Exclude OpenTaal entries such as 06-nummers, t/m and capitalised names.
 

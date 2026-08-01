@@ -7,6 +7,7 @@ from wordfeud_analyzer.move_generator import (
     generate_moves,
     learn_words,
     load_wordlist,
+    parse_comma_separated_words,
     read_learned_words,
     remove_word_from_wordlist,
 )
@@ -129,6 +130,29 @@ def test_remove_word_from_wordlist_removes_diacritic_spelling(tmp_path: Path) ->
     assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
     assert not remove_word_from_wordlist("FACADE", source)
     assert not load_wordlist(source).contains("FACADE")
+
+
+def test_parse_comma_separated_words_normalises_and_deduplicates() -> None:
+    assert parse_comma_separated_words(" façade, KAT, façade ") == ["FACADE", "KAT"]
+    assert parse_comma_separated_words("kat,") == []
+    assert parse_comma_separated_words("") == []
+
+
+def test_removed_words_do_not_return_in_new_suggestions(tmp_path: Path) -> None:
+    source = tmp_path / "lijst.txt"
+    _ = source.write_text("gin\n", encoding="utf-8")
+    learned = tmp_path / "geleerd.txt"
+    _ = learned.write_text("gins\n", encoding="utf-8")
+    state = board_with({(7, 7): "G", (7, 8): "I", (7, 9): "N"}, ["S"])
+
+    before = generate_moves(state, load_wordlist(source, learned), limit=20)
+    assert any(move.word == "GINS" for move in before)
+
+    for word in parse_comma_separated_words("gins, gin"):
+        assert remove_word_from_wordlist(word, source) or remove_word_from_wordlist(word, learned)
+
+    after = generate_moves(state, load_wordlist(source, learned), limit=20)
+    assert not any(word in {move.word, *move.cross_words} for move in after for word in {"GINS", "GIN"})
 
 
 def test_a_learned_word_makes_a_move_possible_that_was_rejected_before(tmp_path: Path) -> None:
