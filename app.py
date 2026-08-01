@@ -40,7 +40,7 @@ st.set_page_config(page_title="Wordfeud-oplosser", page_icon="🔤", layout="wid
 configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
 LEARNED_WORDS = Path(os.getenv("WORDFEUD_LEARNED_WORDS_PATH", str(DEFAULT_LEARNED_WORDS_PATH)))
-MAX_UPLOAD_BYTES = 1 * 1024 * 1024
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 FRONTEND = Path(__file__).parent / "frontend"
 wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
 
@@ -243,7 +243,7 @@ def process_upload() -> None:
         return
     if upload.size > MAX_UPLOAD_BYTES:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = "Deze schermafbeelding is groter dan 1 MB. Exporteer of deel hem kleiner en probeer opnieuw."
+        st.session_state.upload_feedback = "Deze schermafbeelding is groter dan 2 MB. Exporteer of deel hem kleiner en probeer opnieuw."
         return
     ocr_backend = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
     api_key = secret_or_env("OPENROUTER_API_KEY")
