@@ -19,9 +19,9 @@ Het rek mag leeg zijn, maar `Geef oplossingen weer` blijft dan uitgeschakeld met
 
 Opgeslagen spellen worden versie `v1` in de browseropslag (`localStorage`) bewaard. De eerste `Opslaan als…` vereist een niet-lege, hoofdletterongevoelig unieke naam; daarna werkt `Opslaan` het gekoppelde spel bij en maakt `Naam wijzigen` de naamswijziging direct blijvend. `Laden` herstelt de volledige stand. Corruptie of een onbekende opslagversie wordt overgeslagen met een waarschuwing. Handmatige bordwijzigingen worden na 3 seconden inactiviteit automatisch opgeslagen wanneer er al een gekoppeld spel bestaat; zonder bestaand spel wordt niets aangemaakt. Een succesvolle `Zet plaatsen` werkt een gekoppeld spel ook direct bij. Het inladen van een schermafbeelding sluit de actieve spelopslag eerst, zodat de nieuwe stand niet per ongeluk in het oude spel wordt opgeslagen.
 
-De bestaande afwijzingen van schermafbeeldingen, zekerheidscontrole, geleerde woorden, woordenlijstbeheer en suggestievervanging blijven beschikbaar. Je kunt daarbij zowel een hoofdvoorstel als een kruiswoord van een huidige suggestie uitsluiten. Een nieuw bord en het opnieuw inladen van een schermafbeelding wissen de actieve spelopslag; de nieuwe stand wordt daardoor als onopgeslagen bord behandeld.
+De bestaande afwijzingen van schermafbeeldingen, zekerheidscontrole, OCR-woordsuggesties, woordenlijstbeheer en suggestievervanging blijven beschikbaar. Je kunt daarbij zowel een hoofdvoorstel als een kruiswoord van een huidige suggestie uitsluiten. Een nieuw bord en het opnieuw inladen van een schermafbeelding wissen de actieve spelopslag; de nieuwe stand wordt daardoor als onopgeslagen bord behandeld.
 
-Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden rechtstreeks toegevoegd aan `data/opentaal-wordlist.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
+Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Onbekende woorden die de OCR op het bord ziet worden daarom als afzonderlijke suggesties getoond. Ze worden pas aan `data/opentaal-wordlist.txt` toegevoegd nadat je ze expliciet selecteert en bevestigt; een OCR-uitlezing of solve verandert de woordenlijst nooit automatisch.
 
 Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n schermafbeelding wordt geweigerd vóór er OCR aan te pas komt, zodat er ook niets van geleerd wordt.
 
@@ -92,7 +92,7 @@ De lokale installatie gebruikt `data/opentaal-wordlist.txt` zodra dit bestand aa
 curl -fL https://raw.githubusercontent.com/OpenTaal/opentaal-wordlist/master/wordlist.txt -o data/opentaal-wordlist.txt
 ```
 
-De eerdere inhoud van `data/geleerde-woorden.txt` is samengevoegd met de hoofdwoordenlijst. Nieuwe geleerde woorden worden niet meer in een apart bestand geschreven; `WORDFEUD_LEARNED_WORDS_PATH` is daarom niet meer nodig.
+De eerdere inhoud van `data/geleerde-woorden.txt` is samengevoegd met de hoofdwoordenlijst. Nieuwe woorden uit OCR worden niet meer automatisch of in een apart bestand geschreven; ze verschijnen eerst als bevestigbare suggesties. `WORDFEUD_LEARNED_WORDS_PATH` is daarom niet nodig.
 
 De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermelding van OpenTaal over wanneer je die verspreidt. De tool houdt uitsluitend kleine, alfabetische Nederlandse woorden van 2–15 letters over: nummers, leestekens, afkortingen en eigennamen worden uitgesloten. De eerste opbouw van de GADDAG kost lokaal circa een halve minuut voor de volledige lijst; binnen dezelfde draaiende Streamlit-app wordt hij gecachet.
 

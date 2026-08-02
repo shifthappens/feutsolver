@@ -21,7 +21,8 @@ def test_frontend_does_not_ship_server_processing_or_wordlist_access() -> None:
         "extract_board",
         "generate_moves",
         "load_wordlist",
-        "learn_words",
+        "suggest_words",
+        "add_words_to_wordlist",
         "remove_word_from_wordlist",
         "gaddag",
         "tesseract",
@@ -52,3 +53,13 @@ def test_server_owns_screenshot_solving_and_wordlist_operations() -> None:
     assert "requests" in vision_source
     assert "def generate_moves" in move_source
     assert "def load_wordlist" in move_source
+
+
+def test_ocr_words_require_explicit_dictionary_confirmation() -> None:
+    app_source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    assert "suggest_words(board_words(extraction.state)" in app_source
+    assert 'with st.form("ocr_word_suggestions")' in app_source
+    assert 'st.form_submit_button("Voeg geselecteerde woorden toe")' in app_source
+    assert "add_words_to_wordlist(selected" in app_source
+    assert "learn_words" not in app_source

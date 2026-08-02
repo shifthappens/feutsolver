@@ -15,12 +15,13 @@ from streamlit.errors import StreamlitSecretNotFoundError
 from wordfeud_analyzer.models import BoardState, Move, standard_board
 from wordfeud_analyzer.move_generator import (
     Gaddag,
+    add_words_to_wordlist,
     board_words,
     generate_moves,
-    learn_words,
     load_wordlist,
     parse_comma_separated_words,
     remove_word_from_wordlist,
+    suggest_words,
 )
 from wordfeud_analyzer.state import (
     InvalidSolveRequest,
@@ -71,20 +72,9 @@ def lexicon_signature() -> tuple[int, ...]:
     return tuple(values)
 
 
-def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]]:
-    """Persist board words directly in the configured word list."""
-    lexicon = get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature())
-    unknown = [word for word in board_words(state) if not lexicon.contains(word)]
-    if not unknown:
-        return lexicon, []
-    try:
-        added = learn_words(unknown, DEFAULT_WORDLIST)
-    except OSError as error:
-        st.warning(f"Nieuwe woorden konden niet worden bewaard ({error}). De suggesties kloppen wel.")
-        return lexicon, []
-    if not added:
-        return lexicon, []
-    return get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature()), added
+def configured_lexicon() -> Gaddag:
+    """Load the configured word list without learning from the current board."""
+    return get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature())
 
 
 def initialise_session() -> None:
@@ -92,7 +82,7 @@ def initialise_session() -> None:
         st.session_state.working_state = standard_board().model_dump(mode="json")
     st.session_state.setdefault("solve_result", None)
     st.session_state.setdefault("confidence", None)
-    st.session_state.setdefault("learned", [])
+    st.session_state.setdefault("word_suggestions", [])
     st.session_state.setdefault("upload_signature", None)
     st.session_state.setdefault("upload_error_signature", None)
     st.session_state.setdefault("upload_feedback", None)
@@ -114,9 +104,12 @@ def response(kind: str, **payload: Any) -> None:
     st.session_state.component_response = {"kind": kind, **payload}
 
 
-def solve_state(state: BoardState) -> tuple[list[Move], list[str]]:
-    lexicon, learned = lexicon_including_played_words(state)
-    return generate_moves(state, lexicon, limit=6), learned
+def solve_state(state: BoardState) -> list[Move]:
+    return generate_moves(state, configured_lexicon(), limit=6)
+
+
+def clear_word_suggestions() -> None:
+    st.session_state.word_suggestions = []
 
 
 def handle_component_event(event: object) -> None:
@@ -144,7 +137,7 @@ def handle_component_event(event: object) -> None:
         set_state(standard_board())
         st.session_state.solve_result = None
         st.session_state.confidence = None
-        st.session_state.learned = []
+        clear_word_suggestions()
         st.session_state.upload_feedback = None
         st.session_state.upload_signature = None
         st.session_state.upload_error_signature = None
@@ -162,7 +155,7 @@ def handle_component_event(event: object) -> None:
                 return
             set_state(incoming)
             st.session_state.confidence = None
-            st.session_state.learned = []
+            clear_word_suggestions()
             st.session_state.upload_feedback = None
             st.rerun()
         state = incoming
@@ -173,8 +166,7 @@ def handle_component_event(event: object) -> None:
                 response("solve_error", error="Vul minstens één letter of blanco in het rek in voordat je oplossingen laat weergeven.")
                 st.session_state.solve_result = None
                 st.rerun()
-            moves, learned = solve_state(state)
-            st.session_state.learned = learned
+            moves = solve_state(state)
         except Exception as error:
             st.session_state.solve_result = None
             response("solve_error", error=f"De zetten konden niet worden berekend: {error}")
@@ -199,7 +191,7 @@ def handle_component_event(event: object) -> None:
         set_state(loaded)
         st.session_state.solve_result = None
         st.session_state.confidence = None
-        st.session_state.learned = []
+        clear_word_suggestions()
         st.session_state.upload_feedback = None
         st.rerun()
 
@@ -271,7 +263,7 @@ def process_upload() -> None:
         set_state(replace_from_upload(current_state(), extraction))
         st.session_state.board_version += 1
         st.session_state.confidence = extraction.confidence
-        st.session_state.learned = []
+        st.session_state.word_suggestions = suggest_words(board_words(extraction.state), DEFAULT_WORDLIST)
         st.session_state.solve_result = None
         # A response belonging to the previous board must not overwrite this
         # upload when the component receives the next render.
@@ -330,11 +322,10 @@ def render_replacement_form() -> None:
         st.error("Deze woorden staan niet in de geconfigureerde woordenlijsten: " + ", ".join(missing) + ".")
         return
     try:
-        moves, learned = solve_state(state)
+        moves = solve_state(state)
     except Exception as error:
         st.error(f"De vervangende suggestie kon niet worden berekend: {error}")
         return
-    st.session_state.learned = learned
     if not moves:
         st.session_state.solve_result = None
         response("solve_error", error="Geen vervangende legale zet gevonden in de gekozen woordenlijst.")
@@ -349,6 +340,41 @@ def render_replacement_form() -> None:
         )
         return
     st.session_state.solve_result = next_solve_result
+    st.rerun()
+
+
+def render_word_suggestions() -> None:
+    suggestions = list(st.session_state.get("word_suggestions", []))
+    if not suggestions:
+        return
+    st.subheader("Mogelijke nieuwe woorden")
+    st.caption(
+        "Deze woorden zijn uit de OCR-stand afgeleid maar staan nog niet in de woordenlijst. "
+        "Controleer ze eerst; toevoegen gebeurt pas na je bevestiging."
+    )
+    with st.form("ocr_word_suggestions"):
+        selected = [
+            word
+            for word in suggestions
+            if st.checkbox(word, value=False, key=f"ocr-word-suggestion-{word}")
+        ]
+        submitted = st.form_submit_button("Voeg geselecteerde woorden toe")
+    if not submitted:
+        return
+    if not selected:
+        st.warning("Selecteer minstens één woord om toe te voegen.")
+        return
+    try:
+        added = add_words_to_wordlist(selected, DEFAULT_WORDLIST)
+    except OSError as error:
+        st.error(f"De geselecteerde woorden konden niet worden toegevoegd ({error}).")
+        return
+    st.session_state.word_suggestions = suggest_words(suggestions, DEFAULT_WORDLIST)
+    st.session_state.solve_result = None
+    if added:
+        st.session_state.upload_feedback = "Toegevoegd na bevestiging: " + ", ".join(added)
+    else:
+        st.session_state.upload_feedback = "De geselecteerde woorden stonden inmiddels al in de woordenlijst."
     st.rerun()
 
 
@@ -376,8 +402,6 @@ if confidence is not None:
             "De lokale OCR heeft een of meer letters maar beperkt kunnen onderscheiden. "
             "Controleer het bord voordat je oplossingen gebruikt."
         )
-if st.session_state.get("learned"):
-    st.caption("Nieuw geleerd: " + ", ".join(sorted(st.session_state.learned)))
 if st.session_state.get("upload_feedback"):
     st.info(st.session_state.upload_feedback)
 
@@ -393,4 +417,5 @@ event = wordfeud_board(
     key="wordfeud-board",
 )
 handle_component_event(event)
+render_word_suggestions()
 render_replacement_form()

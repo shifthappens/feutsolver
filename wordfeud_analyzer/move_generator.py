@@ -342,21 +342,31 @@ def load_wordlist(path: str | Path) -> Gaddag:
     return instance
 
 
-def learn_words(words: Iterable[str], path: str | Path) -> list[str]:
-    """Append newly observed board words directly to the configured word list."""
+def suggest_words(words: Iterable[str], path: str | Path) -> list[str]:
+    """Return normalised words not yet present in the configured word list.
+
+    The returned words are only suggestions. This helper deliberately has no
+    write side effect: OCR output must never change the dictionary implicitly.
+    """
     target = Path(path)
     try:
         known = {normalise_word(line) for line in target.read_text(encoding="utf-8").split()}
     except FileNotFoundError:
         known = set()
-    fresh = sorted({normalise_word(word) for word in words} - known - {""})
+    return sorted({normalise_word(word) for word in words} - known - {""})
+
+
+def add_words_to_wordlist(words: Iterable[str], path: str | Path) -> list[str]:
+    """Append explicitly confirmed words to the configured word list."""
+    target = Path(path)
+    fresh = suggest_words(words, target)
     if not fresh:
         return []
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
         for word in fresh:
             _ = handle.write(word.lower() + "\n")
-    return [word.lower() for word in fresh]
+    return fresh
 
 
 def remove_word_from_wordlist(word: str, path: str | Path) -> bool:
