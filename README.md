@@ -21,7 +21,7 @@ Opgeslagen spellen worden versie `v1` in de browseropslag (`localStorage`) bewaa
 
 De bestaande afwijzingen van schermafbeeldingen, zekerheidscontrole, geleerde woorden, woordenlijstbeheer en suggestievervanging blijven beschikbaar. Je kunt daarbij zowel een hoofdvoorstel als een kruiswoord van een huidige suggestie uitsluiten. Een nieuw bord en het opnieuw inladen van een schermafbeelding wissen de actieve spelopslag; de nieuwe stand wordt daardoor als onopgeslagen bord behandeld.
 
-Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden toegevoegd aan `data/geleerde-woorden.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
+Wordfeud laat een speler alleen een zet indienen die zijn eigen woordenboek accepteert. Wat er op het bord ligt is dus per definitie geldig, ook als OpenTaal het niet kent. Na iedere uitlezing worden zulke woorden rechtstreeks toegevoegd aan `data/opentaal-wordlist.txt` en meteen meegenomen in de suggesties van diezelfde beurt.
 
 Eén uitzondering: staat er een zet klaar die nog niet gespeeld is, dan heeft Wordfeud die woorden nog niet goedgekeurd. Zo'n schermafbeelding wordt geweigerd vóór er OCR aan te pas komt, zodat er ook niets van geleerd wordt.
 
@@ -92,7 +92,7 @@ De lokale installatie gebruikt `data/opentaal-wordlist.txt` zodra dit bestand aa
 curl -fL https://raw.githubusercontent.com/OpenTaal/opentaal-wordlist/master/wordlist.txt -o data/opentaal-wordlist.txt
 ```
 
-De geleerde woorden staan los van de bronlijst in `data/geleerde-woorden.txt`. Dat bestand staat niet in Git en wordt niet meegestuurd bij een uitrol: het hoort bij de server, net als de OpenTaal-lijst zelf. De rsync-uitrol sluit het uit van overdracht, en `--delete` verwijdert uitgesloten bestanden niet, dus het overleeft een uitrol. Draait de app als een gebruiker die niet in `data/` mag schrijven, zet dan `WORDFEUD_LEARNED_WORDS_PATH` naar een pad dat wél schrijfbaar is; lukt schrijven niet, dan blijven de suggesties gewoon kloppen maar wordt er niets onthouden.
+De eerdere inhoud van `data/geleerde-woorden.txt` is samengevoegd met de hoofdwoordenlijst. Nieuwe geleerde woorden worden niet meer in een apart bestand geschreven; `WORDFEUD_LEARNED_WORDS_PATH` is daarom niet meer nodig.
 
 De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermelding van OpenTaal over wanneer je die verspreidt. De tool houdt uitsluitend kleine, alfabetische Nederlandse woorden van 2–15 letters over: nummers, leestekens, afkortingen en eigennamen worden uitgesloten. De eerste opbouw van de GADDAG kost lokaal circa een halve minuut voor de volledige lijst; binnen dezelfde draaiende Streamlit-app wordt hij gecachet.
 

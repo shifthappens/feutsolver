@@ -8,7 +8,6 @@ from wordfeud_analyzer.move_generator import (
     learn_words,
     load_wordlist,
     parse_comma_separated_words,
-    read_learned_words,
     remove_word_from_wordlist,
 )
 
@@ -106,18 +105,15 @@ def test_board_words_reads_both_directions_and_survives_the_edges() -> None:
 def test_words_seen_on_a_board_are_learned_and_then_known(tmp_path: Path) -> None:
     source = tmp_path / "lijst.txt"
     _ = source.write_text("kat\n", encoding="utf-8")
-    learned = tmp_path / "geleerd.txt"
 
-    lexicon = load_wordlist(source, learned)
+    lexicon = load_wordlist(source)
     assert not lexicon.contains("GINS")
 
-    # learn_words dedupes against its own file; filtering against the main list is
-    # the caller's job, which is what the app does before calling this.
-    assert learn_words(["GINS"], learned) == ["gins"]
-    assert learn_words(["GINS"], learned) == []
-    assert read_learned_words(learned) == ["gins"]
+    assert learn_words(["GINS"], source) == ["gins"]
+    assert learn_words(["GINS"], source) == []
+    assert "gins" in source.read_text(encoding="utf-8").splitlines()
 
-    relearned = load_wordlist(source, learned)
+    relearned = load_wordlist(source)
     assert relearned.contains("GINS")
     assert relearned.contains("KAT")
 
@@ -140,32 +136,29 @@ def test_parse_comma_separated_words_normalises_and_deduplicates() -> None:
 
 def test_removed_words_do_not_return_in_new_suggestions(tmp_path: Path) -> None:
     source = tmp_path / "lijst.txt"
-    _ = source.write_text("gin\n", encoding="utf-8")
-    learned = tmp_path / "geleerd.txt"
-    _ = learned.write_text("gins\n", encoding="utf-8")
+    _ = source.write_text("gin\ngins\n", encoding="utf-8")
     state = board_with({(7, 7): "G", (7, 8): "I", (7, 9): "N"}, ["S"])
 
-    before = generate_moves(state, load_wordlist(source, learned), limit=20)
+    before = generate_moves(state, load_wordlist(source), limit=20)
     assert any(move.word == "GINS" for move in before)
 
     for word in parse_comma_separated_words("gins, gin"):
-        assert remove_word_from_wordlist(word, source) or remove_word_from_wordlist(word, learned)
+        assert remove_word_from_wordlist(word, source)
 
-    after = generate_moves(state, load_wordlist(source, learned), limit=20)
+    after = generate_moves(state, load_wordlist(source), limit=20)
     assert not any(word in {move.word, *move.cross_words} for move in after for word in {"GINS", "GIN"})
 
 
 def test_a_learned_word_makes_a_move_possible_that_was_rejected_before(tmp_path: Path) -> None:
     """The point of learning: a cross word Wordfeud allows must stop blocking moves."""
     source = tmp_path / "lijst.txt"
-    _ = source.write_text("gin\ngins\n", encoding="utf-8")
-    learned = tmp_path / "geleerd.txt"
+    _ = source.write_text("gin\n", encoding="utf-8")
     state = board_with({(7, 7): "G", (7, 8): "I", (7, 9): "N"}, ["S"])
 
-    before = generate_moves(state, load_wordlist(source, learned), limit=20)
-    assert any(move.word == "GINS" for move in before)
+    before = generate_moves(state, load_wordlist(source), limit=20)
+    assert not any(move.word == "GINS" for move in before)
 
-    _ = learn_words(["ZQX"], learned)
-    after = load_wordlist(source, learned)
+    _ = learn_words(["ZQX", "GINS"], source)
+    after = load_wordlist(source)
     assert after.contains("ZQX")
     assert after.contains("GINS")

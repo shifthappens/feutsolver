@@ -14,7 +14,6 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 from wordfeud_analyzer.models import BoardState, Move, standard_board
 from wordfeud_analyzer.move_generator import (
-    DEFAULT_LEARNED_WORDS_PATH,
     Gaddag,
     board_words,
     generate_moves,
@@ -39,7 +38,6 @@ st.set_page_config(page_title="Wordfeud-oplosser", page_icon="🔤", layout="wid
 
 configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
-LEARNED_WORDS = Path(os.getenv("WORDFEUD_LEARNED_WORDS_PATH", str(DEFAULT_LEARNED_WORDS_PATH)))
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 FRONTEND = Path(__file__).parent / "frontend"
 wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
@@ -56,14 +54,14 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 
 @st.cache_resource(show_spinner=False)
-def get_lexicon(path: str, learned_path: str, source_signature: tuple[int, ...]) -> Gaddag:
+def get_lexicon(path: str, source_signature: tuple[int, ...]) -> Gaddag:
     _ = source_signature
-    return load_wordlist(path, learned_path)
+    return load_wordlist(path)
 
 
 def lexicon_signature() -> tuple[int, ...]:
     values: list[int] = []
-    for path in (DEFAULT_WORDLIST, LEARNED_WORDS):
+    for path in (DEFAULT_WORDLIST,):
         try:
             stat = path.stat()
         except OSError:
@@ -74,19 +72,19 @@ def lexicon_signature() -> tuple[int, ...]:
 
 
 def lexicon_including_played_words(state: BoardState) -> tuple[Gaddag, list[str]]:
-    """Keep the existing learned-word behavior for screenshots and manual boards."""
-    lexicon = get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature())
+    """Persist board words directly in the configured word list."""
+    lexicon = get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature())
     unknown = [word for word in board_words(state) if not lexicon.contains(word)]
     if not unknown:
         return lexicon, []
     try:
-        added = learn_words(unknown, LEARNED_WORDS)
+        added = learn_words(unknown, DEFAULT_WORDLIST)
     except OSError as error:
         st.warning(f"Nieuwe woorden konden niet worden bewaard ({error}). De suggesties kloppen wel.")
         return lexicon, []
     if not added:
         return lexicon, []
-    return get_lexicon(str(DEFAULT_WORDLIST), str(LEARNED_WORDS), lexicon_signature()), added
+    return get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature()), added
 
 
 def initialise_session() -> None:
@@ -322,9 +320,7 @@ def render_replacement_form() -> None:
     removed_words: list[str] = []
     try:
         for entered_word in entered_words:
-            removed_from_wordlist = remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST)
-            removed_from_learned = remove_word_from_wordlist(entered_word, LEARNED_WORDS)
-            if removed_from_wordlist or removed_from_learned:
+            if remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST):
                 removed_words.append(entered_word)
     except OSError as error:
         st.error(f"Het woord kon niet uit de woordenlijst worden verwijderd ({error}).")

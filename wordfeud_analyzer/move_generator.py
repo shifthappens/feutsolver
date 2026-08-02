@@ -22,7 +22,7 @@ LETTER_VALUES = {
 }
 LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
-GADDAG_CACHE_VERSION = 4
+GADDAG_CACHE_VERSION = 5
 Direction = Literal["H", "V"]
 # `array` only became subscriptable at runtime in Python 3.12; the element types
 # are quoted so this alias also evaluates on 3.11 without losing type information.
@@ -302,7 +302,7 @@ def _read_cached_data(handle: BinaryIO) -> tuple[int, tuple[int, ...], int, Grap
 
 
 def _signature(paths: Iterable[Path]) -> tuple[int, ...]:
-    """Rebuild whenever any source list changed, including the learned one."""
+    """Rebuild whenever a source list changes."""
     values: list[int] = []
     for path in paths:
         try:
@@ -314,15 +314,10 @@ def _signature(paths: Iterable[Path]) -> tuple[int, ...]:
     return tuple(values)
 
 
-def load_wordlist(path: str | Path, learned_path: str | Path | None = None) -> Gaddag:
-    """Load a packed, persistent GADDAG; build it only when a word list changed.
-
-    `learned_path` holds words we saw lying on a real board. Wordfeud accepted those,
-    so they are legal here too, even when OpenTaal does not list them.
-    """
+def load_wordlist(path: str | Path) -> Gaddag:
+    """Load a packed, persistent GADDAG; build it only when the word list changed."""
     source = Path(path)
-    sources = [source] + ([Path(learned_path)] if learned_path is not None else [])
-    signature = _signature(sources)
+    signature = _signature([source])
     cache = _cache_path(source)
     try:
         with cache.open("rb") as handle:
@@ -334,7 +329,7 @@ def load_wordlist(path: str | Path, learned_path: str | Path | None = None) -> G
     except (OSError, EOFError, pickle.PickleError, ValueError):
         pass
 
-    instance = Gaddag.from_wordlist(*sources)
+    instance = Gaddag.from_wordlist(source)
     try:
         with tempfile.NamedTemporaryFile(dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
             pickle.dump((GADDAG_CACHE_VERSION, signature, instance.count, instance.graph_data()),
@@ -347,34 +342,21 @@ def load_wordlist(path: str | Path, learned_path: str | Path | None = None) -> G
     return instance
 
 
-DEFAULT_LEARNED_WORDS_PATH = Path("data/geleerde-woorden.txt")
-
-
-def read_learned_words(path: str | Path) -> list[str]:
-    """The words we picked up from real boards, lowercase, in the order they came."""
-    try:
-        lines = Path(path).read_text(encoding="utf-8").split()
-    except OSError:
-        return []
-    return [normalise_word(line).lower() for line in lines if normalise_word(line)]
-
-
 def learn_words(words: Iterable[str], path: str | Path) -> list[str]:
-    """Append words that were played on a real board; return the ones that were new.
-
-    Wordfeud only lets a player submit a move its own dictionary accepts, so a word
-    lying on the board is proof of legality that OpenTaal may simply lack.
-    """
+    """Append newly observed board words directly to the configured word list."""
     target = Path(path)
-    known = set(read_learned_words(target))
-    fresh = sorted({normalise_word(word).lower() for word in words} - known - {""})
+    try:
+        known = {normalise_word(line) for line in target.read_text(encoding="utf-8").split()}
+    except FileNotFoundError:
+        known = set()
+    fresh = sorted({normalise_word(word) for word in words} - known - {""})
     if not fresh:
         return []
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as handle:
         for word in fresh:
-            _ = handle.write(word + "\n")
-    return fresh
+            _ = handle.write(word.lower() + "\n")
+    return [word.lower() for word in fresh]
 
 
 def remove_word_from_wordlist(word: str, path: str | Path) -> bool:
