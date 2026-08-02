@@ -1085,12 +1085,37 @@ def _profile_letter_candidates(glyph: Image.Image) -> list[tuple[float, str]]:
 
 
 def _profile_confidence(candidates: list[tuple[float, str]]) -> float:
-    """Convert measured match quality and separation into a conservative percentage."""
+    """Calibrate a decisive profile match to its measured glyph evidence.
+
+    ``_profile_is_decisive`` has already excluded matches that are either too far
+    from a checked-in client glyph or too close to another letter.  Within that
+    accepted region, pixel distance is a measure of rendering variation rather
+    than the probability of a different letter: a 0.11 O with its nearest
+    alternative at 0.21 is still a clear O.  Keep reporting the measured distance
+    and separation, but reserve sub-90 values for reads that are not decisive and
+    are therefore rejected instead of being shown as usable OCR output.
+    """
     best_score = candidates[0][0]
     next_score = candidates[1][0] if len(candidates) > 1 else 1.0
     quality = max(0.0, 1 - best_score / LOCAL_PROFILE_MAX_DISTANCE)
     separation = min(1.0, max(0.0, (next_score - best_score) / LOCAL_PROFILE_MIN_MARGIN))
-    return min(99.0, round((0.45 + 0.55 * quality * separation) * 100, 1))
+    return min(99.0, round((0.90 + 0.05 * quality + 0.04 * separation) * 100, 1))
+
+
+def _blank_tile_confidence(tile: Image.Image) -> float:
+    """Measure how clearly a detected rack tile contains no large glyph.
+
+    A rack blank is not an uncertain letter: the tile geometry is known and its
+    largest dark component is smaller than a real glyph.  Score that absence by
+    its distance from the minimum glyph area, instead of assigning every blank a
+    fixed low confidence.
+    """
+    margin = max(2, round(min(tile.size) * 0.1))
+    inner = tile.crop((margin, margin, tile.width - margin, tile.height - margin))
+    largest_component = max((len(component) for component in _dark_components(inner)), default=0)
+    minimum_area = max(12, round(inner.width * inner.height * 0.035))
+    absence = max(0.0, 1 - largest_component / minimum_area)
+    return min(99.0, round((0.90 + 0.09 * absence) * 100, 1))
 
 
 def _profile_is_decisive(candidates: list[tuple[float, str]]) -> bool:
@@ -1287,7 +1312,7 @@ def _local_glyph_readings(cells: list[Image.Image], *, rack: bool) -> list[Local
         glyph, point_value = _tile_glyph(cell)
         if glyph is None:
             if rack:
-                readings.append(LocalGlyphReading("?", 50.0))
+                readings.append(LocalGlyphReading("?", _blank_tile_confidence(cell)))
                 continue
             raise LocalOCRFailure("Lokale OCR vond geen grote letter in een bordtegel.")
         candidates = _profile_letter_candidates(glyph)

@@ -8,6 +8,8 @@ from pydantic import ValidationError
 
 from wordfeud_analyzer.vision import (
     BOARD_SIZE,
+    LOCAL_PROFILE_MAX_DISTANCE,
+    LOCAL_PROFILE_MIN_MARGIN,
     LOCAL_PROFILE_SIZE,
     BoardExtraction,
     MINIMUM_CONFIDENCE,
@@ -21,6 +23,7 @@ from wordfeud_analyzer.vision import (
     _implausible_tiles,  # pyright: ignore[reportPrivateUsage]
     _decoded_wordfeud_profiles,  # pyright: ignore[reportPrivateUsage]
     _profile_is_decisive,  # pyright: ignore[reportPrivateUsage]
+    _profile_confidence,  # pyright: ignore[reportPrivateUsage]
     _profile_letter_candidates,  # pyright: ignore[reportPrivateUsage]
     _reconcile_local_letter,  # pyright: ignore[reportPrivateUsage]
     _locate_board_top,  # pyright: ignore[reportPrivateUsage]
@@ -188,6 +191,18 @@ def test_real_three_point_m_profile_is_not_read_as_o() -> None:
 
     assert candidates[0] == (0.0, "M")
     assert _profile_is_decisive(candidates)
+
+
+def test_decisive_profile_confidence_is_measured_and_above_the_ocr_threshold() -> None:
+    """Accepted local glyphs must be measured as usable, not merely displayed."""
+    exact = _profile_confidence([(0.0, "M"), (0.2, "O")])
+    boundary = _profile_confidence([
+        (LOCAL_PROFILE_MAX_DISTANCE, "M"),
+        (LOCAL_PROFILE_MAX_DISTANCE + LOCAL_PROFILE_MIN_MARGIN, "O"),
+    ])
+
+    assert exact == 99.0
+    assert MINIMUM_CONFIDENCE <= boundary < exact
 
 
 def test_a_moderate_profile_cannot_be_confirmed_by_the_same_ocr_path() -> None:

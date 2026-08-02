@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from wordfeud_analyzer.vision import BOARD_SIZE, extract_board
+from wordfeud_analyzer.vision import BOARD_SIZE, MINIMUM_CONFIDENCE, extract_board
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,6 +169,7 @@ def test_confirmed_screenshot_matches_production_ocr(filename: str) -> None:
     extraction = extract_board(SCREENSHOTS / filename, backend="local")
     bonuses = _expected_bonus_matrix(layout, rows)
 
+    assert extraction.confidence >= MINIMUM_CONFIDENCE, filename
     assert extraction.state.rack == list(rack), filename
     assert extraction.state.effective_bonuses == bonuses, filename
     assert [
