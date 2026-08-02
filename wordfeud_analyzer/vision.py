@@ -855,19 +855,26 @@ LOCAL_GLYPH_THRESHOLD = 120
 LOCAL_PROFILE_SIZE = (24, 32)
 LOCAL_PROFILE_MAX_DISTANCE = 0.18
 LOCAL_PROFILE_MIN_MARGIN = 0.035
-LOCAL_PROFILE_STRONG_DISTANCE = 0.08
+LOCAL_PROFILE_STRONG_DISTANCE = 0.11
 
 # Multiple examples can be added per letter as Wordfeud changes its rendering. The
-# first set covers the client glyphs in the supported iPhone screenshot family.
-# An unrepresented glyph fails closed, except Q: its unique value 10 still requires
-# a separate large-glyph Tesseract read and is reported as low confidence.
+# set below covers the client glyphs and anti-aliased variants in the supported
+# iPhone screenshot family. An unrepresented glyph fails closed.
 WORDFEUD_GLYPH_PROFILES: dict[str, tuple[str, ...]] = {
     "A": ("ABgAABgAAD8AAD8AAH4AAP8AAP+AAGeAAOeAAeOAAePAAePAAcPAA8HAA8DgA8DwA4DwBwDwD4HwD//4D//4D//4HwB4HgA8HgA+HgA+PAA8fAAefAAPPAAP+AAP8AAP",),
     "B": ("P//Af//A///4/Af8+AB8+AA++AAf+AAf+AAf+AAf+AAc+AAc+AA8///g///A///A///4+AB8+AA++AAf+AAf+AAf+AAf+AAf+AAf+AAf+AA/+AB////8///4f//AP//A",),
     "C": ("AA/wAP//A///B///D8ACH4AAHwAAPgAAPAAAfAAAeAAA+AAA+AAA+AAA+AAA+AAA+AAA+AAA+AAA+AAA+AAAeAAAeAAAfAAAPAAAPgAAPwAAH4AAD/g+B//+Af/+AH/4",),
+    # The supplied iPhone captures add a second anti-aliased scale and cover D,
+    # which was absent from the original profile bank.
+    "D": (
+        "//AA//8A///A///g8Af48AH48AD88AB88AA+8AA+8AA+8AAf8AAf8AAf8AAf8AAf8AAf8AAf8AAf8AAf8AAf8AA+8AA+8AA+8AB88AD88AH48Afw+f/g///A//8A//gA",
+    ),
     "E": ("/////////////AAA+AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA+AAA/AAA///8///8///8/AAA+AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA+AAA/AAA////////////",),
     "F": ("////////////8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA/AAA/////////////AAA/AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA",),
-    "G": ("AD/8AH/8A//8B+AcD8AAH4AAHwAAPgAAPAAAPAAAPAAAPAAAPAAA+AAA+AAA+AP/+AP/+AP/+AH/PAAfPAAfPAAfPAAfPAAfPgAfHwAfH4AfD8AfB///A///AH/9AD/4",),
+    "G": (
+        "AD/8AH/8A//8B+AcD8AAH4AAHwAAPgAAPAAAPAAAPAAAPAAAPAAA+AAA+AAA+AP/+AP/+AP/+AH/PAAfPAAfPAAfPAAfPAAfPgAfHwAfH4AfD8AfB///A///AH/9AD/4",
+        "AB/gAP/+A//+D//8D8AMH4AAPgAAPgAAPAAAfAAAfAAAeAAA+AAA+AAA+AAA+AP/+AP/+AAf+AAf+AAfeAAffAAffAAfPAAfPAAfPgAfPwAfH4AfD/D/B///Af//AH/w",
+    ),
     "H": (
         "4AAM4AAO" "4AAf4AAf" "4AAf4AAf" "4AAf4AAf"
         "4AAf4AAf" "4AAf4AAf" "4AAf////" "////////"
@@ -883,21 +890,51 @@ WORDFEUD_GLYPH_PROFILES: dict[str, tuple[str, ...]] = {
         "P//8////////AP8AAH4AADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAAHwAAPwAP//8////////",
     ),
     "J": ("AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAAcAAA8AAB8AAH8AAP8///w///gH/yAD/gA",),
-    "K": ("OAAHeAAP+AAf+AB8+AD4+AHw+APg+A/A+A+A+A4A+B4A+D4A+PwA+fAA//AA//AA//wA/z4A/j4A+D4A+B+A+A+A+APg+APg+APg+AH4+AH8+AD8+AB8+AAf+AAf+AAf",),
+    "K": (
+        "OAAHeAAP+AAf+AB8+AD4+AHw+APg+A/A+A+A+A4A+B4A+D4A+PwA+fAA//AA//AA//wA/z4A/j4A+D4A+B+A+A+A+APg+APg+APg+AH4+AH8+AD8+AB8+AAf+AAf+AAf",
+        "+AA8+AB8+AD4+AHw+APg+APA+A+A+B8A+B8A+D4A+HwA+PgA+fAA++AA+/AA//AA//gA/nwA+HwA+D4A+B8A+B8A+A+A+AfA+APg+APg+AHw+AD4+AB4+AA8+AA++AA/",
+    ),
     "L": ("MAAA+AAA/AAAPAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAOAAAPAAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA/AAA+AAA/AAA/gAA////f///P///",),
-    "M": ("/AA//AA//AA//AA//gB//wD//wD//wD//wD/5wDn5wDn5wDn44HH48PH48PH48PH48PH48PH44MH4cMH4OcH4OcH4OcH4OcH4P8H4P8H4DwH4DwH4DwH4DwH4DwH4DwH",),
+    "M": (
+        "/AA//AA//AA//AA//gB//wD//wD//wD//wD/5wDn5wDn5wDn44HH48PH48PH48PH48PH48PH44MH4cMH4OcH4OcH4OcH4OcH4P8H4P8H4DwH4DwH4DwH4DwH4DwH4DwH",
+        "/AA//AA//AB//gB/7gB/7gB/7wD/5wDv9wDv9wHv94Hv94Dv94Hv84HP84HP84HP84OP8cOP8cOP8cOP8ecP8OcP8OcP8O4P8GYP8P8P8H4P8H4P8H4P8HwP8DwP8DwP",
+        "/AA//AA//AB//gB/7gB37gB/7wD/5wDv9wDv9wHv9wHv94Dv94Hv84HP84HP84HP84OP8cOP8cOP8cOP8ecP8OcP8OcP8O4P8GYP8P8P8H4P8H4P8H4P8HwP8DwP8DwP",
+    ),
     "N": ("PAAcfAAe/gAf/wAf/wAf/wAfP8Af+8Af+cAf+eAf+OAf+PAf+Pgf+Dgf+Dgf+Dwf+Bwf+B4f+B8f+Acf+Acf+Acf+Aef+AP/+AP/+AP/+AD/+AD/+AD/+AB/cAA+IAAc",),
     "O": ("AP8AAf+AB//gH+f4PwB8PwA8+AAfPAA8+AAf+AAf+AAf+AAf+AAf+AAf+AAP+AAH+AAH+AAP+AAf+AAf+AAf+AAf+AAf+AAf+AAfPAA8PAA8PgB8H8D4B//gA//AA//A",),
     "P": ("//+A//+A///4/B/88AD/8AB/8AA/8AAf8AA/8AA/8AA/8AAf8AA/8AB88AD88AH8///w///g///A/AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA8AAA",),
+    "Q": (
+        "AH4AA//AB//gH4H4HgB4PAA8fAA+fAAeeAAeeAAeeAAOcAAP8AAP8AAP8AAPeAAPeAAOeAAeeAAefAA+PAA8PgB8HwB4D8PwB//gA//AAB/AAAPgAAHwAAD4AAB+AAA+",
+    ),
     "R": ("//+A///A///g8APw4AP44AD44AB84AB84AB84AB84AB84AB44AD48AHw+APg///A//+A//4A/D4A+B8A4A+A+A+A+A+A4APg4APg8APg+AHw8AB84AB8+AB8+AA/4AAf",),
     "S": ("AP+AB//+H//+P//8fgAMfAAA+AAA8AAA+AAA+AAAeAAAfgAAPwAAH8AAH/wAB/8AAP/gAD/4AAP8AAD+AAA+AAAfAAAPAAAPAAAPAAAfAAAeAAA+/AP8///4///wP/8A",),
     "T": ("////////////APwAAHgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADgAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADgA",),
     "U": ("+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAH+AAP+AAf+AAf+AAf/gAfPgB8PgB8P//8B//4AP8gAH4A",),
     "V": ("8AAPcAAPeAAeeAAefAA+PAAePAA8HAA8HgA4HgB4HgB4DwDwDwDwDwDwBwDgB4HgB4HgB4HgA8PAA8PAAcPAAcOAAeeAAOcAAOeAAP8AAP8AAH8AAH4AADwAADwAADwA",),
-    "W": ("4AAG4AAG4AAP8AAP8AAO8AAO8AAO8AAO8AAOcAAOcDgOcHgOcHgOcH4eeH4eeH4eeO4YeOYYeOcYeOcYOecYGecYGYeYH4P4H4H4H4H4H4H4H4H4HwH4HwDwHwDwDwDw",),
-    "Z": ("P//8P//8P//8AAD8AAB4AAB4AABgAAHwAAHgAAfAAA+AAA8AAA8AAB4AADwAAHgAAHwAAPgAAfAAA+AAA+AAA8AAB4AAHwAAHgAAHAAAPAAAfAAA////////f//+P//8",),
+    "W": (
+        "4AAG4AAG4AAP8AAP8AAO8AAO8AAO8AAO8AAOcAAOcDgOcHgOcHgOcH4eeH4eeH4eeO4YeOYYeOcYeOcYOecYGecYGYeYH4P4H4H4H4H4H4H4H4H4HwH4HwDwHwDwDwDw",
+        "4AAH4AAH4AAHcAAOcAAOcAAOcAAOcAAOeAAOeAAOeDwOeDwOeDweOH4eOH4cOHYcOGYcOOccGOccHMMcHMMYHcOYHcOYHcGYHYH4HYG4HYG4HwD4DwD4DwD4DwDwDwBw",
+        "4AAH8AAHcAAHcAAHcAAOcAAOcAAOeAAOeAAOeBgOeDwOODwOOD4eOD4eOH4eOHYcOHcMOOccHOMcHOMcHMOcHMOYHcOYHcGYHcGYHYH4H4H4H4D4DwD4DwD4DwD4DwB4",
+        "4AAH4AAH4AAH4AAH4AAH4AAGcAAOcAAOcAAOcBgOcDwOeDwOeDwOeH4eeGYeeGYeOGYcOOccOOccOOccOcOcGcOcGcOcGYGYGYGYH4HYH4H4H4D4HwD4HwD4HwD4HgB4",
+        "4AAH4AAH4AAH4AAH4AAH4AAGcAAOcAAOcAAOcAAOcDwOeDwOeDwOeH4eeG4eeGYeeGYcOOccOOccOOccOcOcOcOcGcOcGYGYGYGYHYHYH4H4H4H4HwD4HwD4HwD4HgB4",
+        "4AAH4AAH4AAH8AAO8AAOcAAOcAAOcAAOcAAOcAAOeDweeDweeDweeHwcOH4cOG4cOGYcOOccOOccOMMcGMMYGcOYHcO4HcO4H4G4HYG4H4G4HwD4HwD4HwD4DwDwDwBw",
+    ),
+    "X": (
+        "eAAeeAAcPAA8PgB4HgD4DwDwDwHgB4HgB8PAA8eAAeeAAe8AAP8AAH4AAH4AAH4AAH4AAP8AAf8AAeeAAceAA8PAB4PgB4HgDwHwHgDwHgB4PAB4PAB8eAA+8AAe8AAf",
+    ),
+    "Y": (
+        "8AAPeAAeeAAePAA8HAA4HgB4HgB4DwDwDwDwB4HgB4HgA8PAAcOAAeeAAOcAAO8AAP8AAH4AAHwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwAADwA",
+    ),
+    "Z": (
+        "P//8P//8P//8AAD8AAB4AAB4AABgAAHwAAHgAAfAAA+AAA8AAA8AAB4AADwAAHgAAHwAAPgAAfAAA+AAA+AAA8AAB4AAHwAAHgAAHAAAPAAAfAAA////////f//+P//8",
+        "///+///+///+AAA+AAA8AAB8AAD4AADwAAHgAAPAAAfAAA+AAA8AAB4AAB4AAHwAAHgAAPgAAfAAAeAAA8AAB8AAD4AADwAAHwAAPgAAPAAAeAAA////////////////",
+        "f//+f///f///f///AAAeAAA8AAB4AAD4AAHwAAHgAAPAAAeAAA+AAA8AAB4AADwAADwAAPgAAPAAAfAAA+AAA8AAB4AAD4AAHwAAHgAAPAAAeAAA////////////////",
+        "f//+f///f///f///AAAeAAA8AAB4AAD4AAHwAAHgAAPAAAeAAA+AAA8AAB4AADwAADwAAHgAAPAAAfAAAeAAA8AAB4AAD4AAHwAAHgAAPAAAeAAA////////////////",
+        "f//+f//+f//+f//+AAA+AAA8AAB4AADwAAHgAAPgAAPAAAeAAA8AAB8AAB4AADwAAHgAAPAAAfAAAeAAA+AAB8AAB4AADwAAHwAAPgAAPAAAeAAA////////////////",
+        "f///f///f///AAAeAAA+AAA8AAB4AADwAAHgAAPgAAPAAAfAAA+AAA8AAB4AAD4AAHwAAPgAAPAAAeAAA+AAA8AAB4AAD4AADwAAHgAAPAAAeAAA////////////////",
+        "f//+f//+f//+f//+AAA8AAB8AAB4AADwAAHgAAPgAAfAAAeAAA+AAB8AAD4AADwAAHwAAPgAAPAAAeAAA+AAB8AAB4AADwAAHwAAHgAAPAAAeAAA////////////////",
+    ),
 }
-
 
 def _dark_components(crop: Image.Image) -> list[list[tuple[int, int]]]:
     """Return connected dark pixel components in a small tile crop."""
@@ -1199,8 +1236,13 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
             continue
         top = rows[0]
         bottom = rows[0]
+        # A printed point value can make one or two horizontal scanlines look like
+        # background even though they are inside the same rack tile. Treat a small
+        # internal gap as JPEG/glyph noise; only a real gap larger than this ends
+        # the tile body.
+        maximum_internal_gap = max(2, round(height * 0.01))
         for y in rows[1:]:
-            if y > bottom + 1:
+            if y > bottom + maximum_internal_gap:
                 break
             bottom = y
         if bottom - top >= 40:
@@ -1253,8 +1295,8 @@ def _local_glyph_readings(cells: list[Image.Image], *, rack: bool) -> list[Local
             if point_value == 10:
                 try:
                     if _tesseract_letter(glyph).upper() == "Q":
-                        # Q is not yet represented in the checked-in screenshot
-                        # family. Its unique value is accepted only with a separate
+                        # Retain this fallback for older profile-bank variants where
+                        # Q is unavailable; its unique value still needs a separate
                         # large-glyph read and remains visibly low-confidence.
                         readings.append(LocalGlyphReading("Q", 60.0))
                         continue
@@ -1266,7 +1308,10 @@ def _local_glyph_readings(cells: list[Image.Image], *, rack: bool) -> list[Local
             )
         score, letter = candidates[0]
         letter = _reconcile_local_letter(letter, score, point_value)
-        reading = letter.lower() if point_value is None and not rack else letter.upper()
+        # Missing tiny-point OCR is not evidence of a blank: the points are optional
+        # metadata and can disappear after resizing/compression. A local blank
+        # classifier must provide explicit evidence before a board letter is lowered.
+        reading = letter.upper()
         readings.append(LocalGlyphReading(reading, _profile_confidence(candidates)))
     return readings
 
