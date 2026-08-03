@@ -72,6 +72,7 @@
     let lastSolveToken = null;
     let autosaveTimer = null;
     let autosaveDirty = false;
+    let localChangesPending = false;
 
     function storage() { try { return window.localStorage; } catch (_error) { return null; } }
     function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
@@ -151,6 +152,7 @@
       const snapshot = WF.snapshotFromRecord(record);
       if (snapshot && !same(snapshot, props.snapshot)) {
         editor = WF.createEditor(snapshot);
+        localChangesPending = false;
         props.mode = "edit";
         props.solve_result = null;
         emit("load", { snapshot, saveId: record.id });
@@ -182,11 +184,14 @@
     }
     function apply(action) {
       if (!editor || props.mode === "preview") return;
+      const changesSnapshot = ["set_board", "clear_board", "backspace", "set_rack", "remove_rack"].includes(action.type);
+      // Keep typing inside the iframe. Sending one component event per key
+      // reruns Streamlit and can blur this input on mobile browsers.
+      if (changesSnapshot) localChangesPending = true;
       editor = WF.reduceEditor(editor, action);
       render();
-      if (["set_board", "clear_board", "backspace", "set_rack", "remove_rack"].includes(action.type)) {
+      if (changesSnapshot) {
         markAutosaveDirty();
-        emit("board_change", { snapshot: editor.snapshot, clientRevision: editor.revision });
       } else if (autosaveDirty) {
         scheduleAutosave();
       }
@@ -270,15 +275,22 @@
       document.querySelectorAll("[data-suggestion]").forEach(button => button.addEventListener("click", () => { selectedSuggestion = Number(button.dataset.suggestion); render(); }));
       document.getElementById("new-button")?.addEventListener("click", () => {
         resetAutosave();
+        localChangesPending = false;
         const link = setActive(null, "");
         if (!link.ok) return showNotice(`Nieuw bord kon niet worden geopend omdat de actieve spelopslag niet kon worden gewist: ${link.error}`, "error");
         emit("new_board");
       });
-      document.getElementById("solve-button")?.addEventListener("click", () => emit("solve_request", { snapshot: editor.snapshot, clientRevision: editor.revision }));
+      document.getElementById("solve-button")?.addEventListener("click", () => {
+        localChangesPending = false;
+        emit("solve_request", { snapshot: editor.snapshot, clientRevision: editor.revision });
+      });
       document.getElementById("cancel-button")?.addEventListener("click", () => { notice = null; emit("cancel"); });
       document.getElementById("place-button")?.addEventListener("click", () => {
         const move = props.solve_result?.moves?.[selectedSuggestion];
-        if (move) emit("place_request", { solveToken: props.solve_result.token, selectedMove: move, stateHash: props.solve_result.state_hash });
+        if (move) {
+          localChangesPending = false;
+          emit("place_request", { solveToken: props.solve_result.token, selectedMove: move, stateHash: props.solve_result.state_hash });
+        }
       });
       const nameInput = document.getElementById("save-name");
       nameInput?.addEventListener("input", event => { saveName = event.target.value; saveNameDirty = true; });
@@ -297,6 +309,7 @@
         const snapshot = record && WF.snapshotFromRecord(record);
         if (!snapshot) return showNotice("Dit opgeslagen spel is ongeldig of niet meer beschikbaar.", "error");
         resetAutosave();
+        localChangesPending = false;
         const link = setActive(record.id, record.name);
         if (!link.ok) return showNotice(`Opgeslagen spel kon niet worden geladen omdat de actieve spelopslag niet kon worden opgeslagen: ${link.error}`, "error");
         editor = WF.createEditor(snapshot);
@@ -341,12 +354,16 @@
         const incomingBoardVersion = Number(props.board_version);
         const boardWasReplaced = Number.isFinite(incomingBoardVersion) && incomingBoardVersion !== boardVersion;
         if (Number.isFinite(incomingBoardVersion)) boardVersion = incomingBoardVersion;
-        if (boardWasReplaced) closeActiveSave();
+        if (boardWasReplaced) {
+          closeActiveSave();
+          localChangesPending = false;
+        }
         let restoredActive = false;
         if (!initialized) { restoredActive = restoreActive(); initialized = true; }
         const incomingSnapshotChanged = Boolean(editor) && !same(editor.snapshot, props.snapshot);
-        if (!editor || (!restoredActive && incomingSnapshotChanged)) {
+        if (!editor || (!restoredActive && incomingSnapshotChanged && !localChangesPending)) {
           editor = WF.createEditor(props.snapshot);
+          localChangesPending = false;
           if (incomingSnapshotChanged && !restoredActive && !boardWasReplaced) markAutosaveDirty();
         }
         const solveToken = props.mode === "preview" ? (props.solve_result?.token || null) : null;
@@ -356,6 +373,7 @@
         const response = props.response;
         if (response.kind === "place_result" && response.ok) {
           editor = WF.createEditor(response.snapshot); props.mode = "edit";
+          localChangesPending = false;
           resetAutosave();
           if (activeSaveId) {
             const saved = WF.autosaveSnapshot(storage(), activeSaveName, response.snapshot, activeSaveId);
@@ -363,8 +381,8 @@
             else if (saved.saved) notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
             else notice = { message:`Plaatsing gelukt, maar automatisch opslaan mislukte: ${saved.error}`, kind:"error" };
           } else notice = { message:"Zet geplaatst.", kind:"success" };
-        } else if (response.kind === "place_result") { props.mode = "edit"; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
-        else if (response.kind === "solve_error") { props.mode = "edit"; notice = { message:response.error, kind:"error" }; }
+        } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
+        else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error, kind:"error" }; }
       }
       if (props.mode === "preview" && props.solve_result && selectedSuggestion >= props.solve_result.moves.length) selectedSuggestion = 0;
       render();

@@ -144,19 +144,13 @@ def handle_component_event(event: object) -> None:
         st.session_state.upload_key += 1
         st.rerun()
 
-    if kind in {"board_change", "solve_request"}:
+    # Board edits stay local to the component while typing. Synchronizing each
+    # key with Python would rerun Streamlit and can blur the mobile keyboard.
+    if kind == "solve_request":
         try:
             incoming = validate_snapshot(payload.get("snapshot"))
         except Exception:
             response("solve_error", error="Het bordbericht was ongeldig; de huidige stand is behouden.")
-            st.rerun()
-        if kind == "board_change":
-            if st.session_state.solve_result is not None:
-                return
-            set_state(incoming)
-            st.session_state.confidence = None
-            clear_word_suggestions()
-            st.session_state.upload_feedback = None
             st.rerun()
         state = incoming
         set_state(state)
