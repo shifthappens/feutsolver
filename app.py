@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -20,7 +22,7 @@ from wordfeud_analyzer.move_generator import (
     generate_moves,
     load_wordlist,
     parse_comma_separated_words,
-    remove_word_from_wordlist,
+    remove_words_from_wordlist,
     suggest_words,
 )
 from wordfeud_analyzer.state import (
@@ -60,6 +62,12 @@ def get_lexicon(path: str, source_signature: tuple[int, ...]) -> Gaddag:
     return load_wordlist(path)
 
 
+@st.cache_resource(show_spinner=False)
+def wordlist_update_executor() -> ThreadPoolExecutor:
+    """Serialize dictionary writes without blocking suggestion rendering."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="wordfeud-wordlist")
+
+
 def lexicon_signature() -> tuple[int, ...]:
     values: list[int] = []
     for path in (DEFAULT_WORDLIST,):
@@ -90,6 +98,9 @@ def initialise_session() -> None:
     st.session_state.setdefault("component_response", None)
     st.session_state.setdefault("last_component_event_signature", None)
     st.session_state.setdefault("board_version", 0)
+    st.session_state.setdefault("replacement_update_future", None)
+    st.session_state.setdefault("replacement_update_words", [])
+    st.session_state.setdefault("replacement_update_feedback", None)
 
 
 def current_state() -> BoardState:
@@ -104,8 +115,69 @@ def response(kind: str, **payload: Any) -> None:
     st.session_state.component_response = {"kind": kind, **payload}
 
 
-def solve_state(state: BoardState) -> list[Move]:
-    return generate_moves(state, configured_lexicon(), limit=6)
+def solve_state(state: BoardState, excluded_words: Iterable[str] = ()) -> list[Move]:
+    return generate_moves(state, configured_lexicon(), limit=6, excluded_words=excluded_words)
+
+
+def replacement_update_active() -> bool:
+    """Return whether a dictionary update is queued or still being written."""
+    return st.session_state.get("replacement_update_future") is not None
+
+
+def queue_wordlist_update(words: Iterable[str]) -> bool:
+    """Write replacement exclusions in the background after solving them out."""
+    if replacement_update_active():
+        return False
+    normalised_words = tuple(words)
+    try:
+        future = wordlist_update_executor().submit(
+            remove_words_from_wordlist,
+            normalised_words,
+            DEFAULT_WORDLIST,
+        )
+    except Exception as error:
+        st.session_state.replacement_update_feedback = (
+            f"De woordenlijst kon niet worden bijgewerkt ({error})."
+        )
+        return False
+    st.session_state.replacement_update_future = future
+    st.session_state.replacement_update_words = list(normalised_words)
+    st.session_state.replacement_update_feedback = None
+    return True
+
+
+def poll_wordlist_update() -> bool:
+    """Finish a background dictionary update on the Streamlit thread."""
+    future = st.session_state.get("replacement_update_future")
+    if future is None or not isinstance(future, Future) or not future.done():
+        return False
+
+    expected = set(st.session_state.get("replacement_update_words", []))
+    st.session_state.replacement_update_future = None
+    st.session_state.replacement_update_words = []
+    try:
+        removed = set(cast(list[str], future.result()))
+    except Exception as error:
+        get_lexicon.clear()
+        st.session_state.solve_result = None
+        response("solve_error", error=f"De woordenlijst kon niet worden bijgewerkt ({error}).")
+        return True
+
+    get_lexicon.clear()
+    if removed != expected:
+        missing = sorted(expected - removed)
+        detail = ", ".join(missing) if missing else "onbekende woorden"
+        st.session_state.solve_result = None
+        response(
+            "solve_error",
+            error="Niet alle opgegeven woorden konden uit de woordenlijst worden verwijderd: " + detail + ".",
+        )
+        return True
+
+    st.session_state.replacement_update_feedback = (
+        "De woordenlijst is bijgewerkt; de uitgesloten woorden blijven uit de suggesties."
+    )
+    return True
 
 
 def clear_word_suggestions() -> None:
@@ -277,17 +349,30 @@ def process_upload() -> None:
 
 
 def render_replacement_form() -> None:
+    feedback = st.session_state.get("replacement_update_feedback")
+    if feedback:
+        st.success(feedback)
     solve_result = st.session_state.get("solve_result")
     if not isinstance(solve_result, dict) or not solve_result.get("moves"):
         return
+    update_active = replacement_update_active()
+    if update_active:
+        st.info(
+            "De nieuwe suggesties zijn al berekend. De woordenlijst wordt nog bijgewerkt; "
+            "dit invoerveld is daarom tijdelijk geblokkeerd."
+        )
     with st.form("replace_suggestion", clear_on_submit=True):
         word_to_replace = st.text_input(
             "Een suggestie vervangen",
             placeholder="Bijv. woord, ander woord, kruiswoord",
             help="Vul één of meer voorgestelde woorden of kruiswoorden in, gescheiden door komma's.",
+            disabled=update_active,
         )
-        submitted = st.form_submit_button("Vervang suggestie")
+        submitted = st.form_submit_button("Vervang suggestie", disabled=update_active)
     if not submitted:
+        return
+    if update_active:
+        st.info("Er wordt al een vervanging verwerkt; probeer het opnieuw zodra het veld weer beschikbaar is.")
         return
     state = current_state()
     entered_words = parse_comma_separated_words(word_to_replace)
@@ -303,24 +388,18 @@ def render_replacement_form() -> None:
             + "."
         )
         return
-    removed_words: list[str] = []
     try:
-        for entered_word in entered_words:
-            if remove_word_from_wordlist(entered_word, DEFAULT_WORDLIST):
-                removed_words.append(entered_word)
-    except OSError as error:
-        st.error(f"Het woord kon niet uit de woordenlijst worden verwijderd ({error}).")
-        return
-    if len(removed_words) != len(entered_words):
-        missing = [word for word in entered_words if word not in removed_words]
-        st.error("Deze woorden staan niet in de geconfigureerde woordenlijsten: " + ", ".join(missing) + ".")
-        return
-    try:
-        moves = solve_state(state)
+        # Exclude the submitted words in memory first. This reuses the current
+        # GADDAG and makes the replacement visible before the persistent file
+        # update has finished.
+        moves = solve_state(state, excluded_words=entered_words)
     except Exception as error:
         st.error(f"De vervangende suggestie kon niet worden berekend: {error}")
         return
     if not moves:
+        if not queue_wordlist_update(entered_words):
+            st.error(st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.")
+            return
         st.session_state.solve_result = None
         response("solve_error", error="Geen vervangende legale zet gevonden in de gekozen woordenlijst.")
         st.rerun()
@@ -333,8 +412,20 @@ def render_replacement_form() -> None:
             + "."
         )
         return
+    if not queue_wordlist_update(entered_words):
+        st.error(st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.")
+        return
     st.session_state.solve_result = next_solve_result
     st.rerun()
+
+
+@st.fragment(run_every=0.5)
+def render_wordlist_update_status() -> None:
+    """Poll a queued wordlist write without rerunning the whole app."""
+    if poll_wordlist_update():
+        st.rerun()
+    if replacement_update_active():
+        st.info("Woordenlijst wordt op de achtergrond bijgewerkt…")
 
 
 def render_word_suggestions() -> None:
@@ -373,6 +464,8 @@ def render_word_suggestions() -> None:
 
 
 initialise_session()
+if poll_wordlist_update():
+    st.rerun()
 st.title("Wordfeud-oplosser")
 st.caption("Een meeschalend, interactief bord: bewerk lokaal en laat Python de schermafbeelding, zetten en punten controleren.")
 st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
@@ -412,4 +505,6 @@ event = wordfeud_board(
 )
 handle_component_event(event)
 render_word_suggestions()
+if replacement_update_active():
+    render_wordlist_update_status()
 render_replacement_form()

@@ -8,6 +8,7 @@ import pickle
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import RLock
 import unicodedata
 from typing import BinaryIO, Literal, TypeAlias, TypedDict, TypeGuard, cast
 
@@ -27,6 +28,7 @@ Direction = Literal["H", "V"]
 # `array` only became subscriptable at runtime in Python 3.12; the element types
 # are quoted so this alias also evaluates on 3.11 without losing type information.
 GraphData: TypeAlias = tuple["array[int]", "array[int]", bytearray, bytearray, "array[int]", int]
+_WORDLIST_WRITE_LOCK = RLock()
 
 
 class _Node(TypedDict):
@@ -358,52 +360,69 @@ def suggest_words(words: Iterable[str], path: str | Path) -> list[str]:
 
 def add_words_to_wordlist(words: Iterable[str], path: str | Path) -> list[str]:
     """Append explicitly confirmed words to the configured word list."""
-    target = Path(path)
-    fresh = suggest_words(words, target)
-    if not fresh:
+    with _WORDLIST_WRITE_LOCK:
+        target = Path(path)
+        fresh = suggest_words(words, target)
+        if not fresh:
+            return []
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as handle:
+            for word in fresh:
+                _ = handle.write(word.lower() + "\n")
+        return fresh
+
+
+def remove_words_from_wordlist(words: Iterable[str], path: str | Path) -> list[str]:
+    """Remove many words in one atomic pass and return the words that were found."""
+    if isinstance(words, str):
+        words = (words,)
+    target_words: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        target_word = normalise_word(word)
+        if target_word and target_word not in seen:
+            seen.add(target_word)
+            target_words.append(target_word)
+    if not target_words:
         return []
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        for word in fresh:
-            _ = handle.write(word.lower() + "\n")
-    return fresh
-
-
-def remove_word_from_wordlist(word: str, path: str | Path) -> bool:
-    """Permanently remove every spelling of a word from one source list."""
-    target_word = normalise_word(word)
-    if not target_word:
-        return False
 
     source = Path(path)
     temporary_path: Path | None = None
-    removed = False
+    removed: set[str] = set()
     try:
-        try:
-            source_handle = source.open(encoding="utf-8")
-        except FileNotFoundError:
-            return False
-        with source_handle:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=source.parent,
-                prefix=source.name + ".",
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                for line in source_handle:
-                    if normalise_word(line) == target_word:
-                        removed = True
-                        continue
-                    _ = temporary.write(line)
-        if removed and temporary_path is not None:
-            _ = temporary_path.replace(source)
-            temporary_path = None
-        return removed
+        with _WORDLIST_WRITE_LOCK:
+            try:
+                source_handle = source.open(encoding="utf-8")
+            except FileNotFoundError:
+                return []
+            with source_handle:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=source.parent,
+                    prefix=source.name + ".",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    target_set = set(target_words)
+                    for line in source_handle:
+                        normalised = normalise_word(line)
+                        if normalised in target_set:
+                            removed.add(normalised)
+                            continue
+                        _ = temporary.write(line)
+            if removed and temporary_path is not None:
+                _ = temporary_path.replace(source)
+                temporary_path = None
+        return [word for word in target_words if word in removed]
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def remove_word_from_wordlist(word: str, path: str | Path) -> bool:
+    """Permanently remove every spelling of one word from a source list."""
+    return bool(remove_words_from_wordlist((word,), path))
 
 
 def board_words(state: BoardState) -> list[str]:
@@ -526,7 +545,12 @@ def _anchors(state: BoardState) -> list[tuple[int, int]]:
     return anchors
 
 
-def _cross_checks(state: BoardState, lexicon: Gaddag, direction: Direction) -> dict[tuple[int, int], set[str]]:
+def _cross_checks(
+    state: BoardState,
+    lexicon: Gaddag,
+    direction: Direction,
+    excluded_words: set[str],
+) -> dict[tuple[int, int], set[str]]:
     """Allowed letters per empty square, based on the perpendicular word."""
     pr, pc = (1, 0) if direction == "H" else (0, 1)
     allowed: dict[tuple[int, int], set[str]] = {}
@@ -538,10 +562,12 @@ def _cross_checks(state: BoardState, lexicon: Gaddag, direction: Direction) -> d
             if len(probe) == 1:
                 allowed[(row, col)] = set(LETTER_VALUES)
             else:
-                allowed[(row, col)] = {
-                    char for char in LETTER_VALUES
-                    if lexicon.contains(_word_at(state, row, col, pr, pc, char))
-                }
+                letters: set[str] = set()
+                for char in LETTER_VALUES:
+                    cross_word = _word_at(state, row, col, pr, pc, char)
+                    if cross_word not in excluded_words and lexicon.contains(cross_word):
+                        letters.add(char)
+                allowed[(row, col)] = letters
     return allowed
 
 
@@ -586,11 +612,20 @@ def _candidate_starts(state: BoardState, direction: Direction, rack_size: int) -
     return starts
 
 
-def generate_moves(state: BoardState, lexicon: Gaddag, limit: int = 6) -> list[Move]:
-    """Generate from line starts with a compact forward DAWG and cross checks."""
+def generate_moves(
+    state: BoardState,
+    lexicon: Gaddag,
+    limit: int = 6,
+    *,
+    excluded_words: Iterable[str] = (),
+) -> list[Move]:
+    """Generate moves, optionally omitting words without rebuilding the lexicon."""
     if limit <= 0:
         return []
+    excluded = {normalise_word(word) for word in excluded_words}
+    excluded.discard("")
     initial_rack = Counter(state.rack)
+    rack_size = sum(initial_rack.values())
     board_has_tiles = _has_tiles(state)
     best: list[Move] = []
 
@@ -614,18 +649,21 @@ def generate_moves(state: BoardState, lexicon: Gaddag, limit: int = 6) -> list[M
     for direction in directions:
         move_direction: Direction = direction
         dr, dc = (0, 1) if move_direction == "H" else (1, 0)
-        checks = _cross_checks(state, lexicon, move_direction)
-        for start_row, start_col in _candidate_starts(state, move_direction, sum(initial_rack.values())):
+        checks = _cross_checks(state, lexicon, move_direction, excluded)
+        for start_row, start_col in _candidate_starts(state, move_direction, rack_size):
             rack = initial_rack.copy()
 
             def walk(row: int, col: int, state_id: int, tiles: list[PlacedTile]) -> None:
                 # A word can end only before an empty square or at the board edge;
                 # an adjacent existing tile must be consumed as part of the word.
-                if lexicon.terminal(state_id) and (not _in_bounds(row, col) or not _letter(state, row, col)):
+                if (
+                    lexicon.terminal(state_id)
+                    and (not _in_bounds(row, col) or not _letter(state, row, col))
+                ):
                     word, word_row, word_col = _materialise_move(state, (start_row, start_col), move_direction, tiles)
                     connected = (_touches_board(state, tiles) if board_has_tiles
                                  else any(tile.row == 7 and tile.col == 7 for tile in tiles))
-                    if len(word) >= 2 and tiles and connected:
+                    if word not in excluded and len(word) >= 2 and tiles and connected:
                         score, cross_words = _score_move(state, word, word_row, word_col, move_direction, tiles)
                         consider(Move(word=word, row=word_row, col=word_col, direction=move_direction,
                                       score=score, tiles=tiles.copy(), cross_words=cross_words,
@@ -638,7 +676,7 @@ def generate_moves(state: BoardState, lexicon: Gaddag, limit: int = 6) -> list[M
                     if child is not None:
                         walk(row + dr, col + dc, child, tiles)
                     return
-                if len(tiles) >= sum(initial_rack.values()):
+                if len(tiles) >= rack_size:
                     return
                 for char, child in lexicon.children(state_id):
                     if char not in checks[(row, col)]:

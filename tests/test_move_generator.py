@@ -9,6 +9,7 @@ from wordfeud_analyzer.move_generator import (
     load_wordlist,
     parse_comma_separated_words,
     remove_word_from_wordlist,
+    remove_words_from_wordlist,
     suggest_words,
 )
 
@@ -140,6 +141,39 @@ def test_remove_word_from_wordlist_removes_diacritic_spelling(tmp_path: Path) ->
     assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
     assert not remove_word_from_wordlist("FACADE", source)
     assert not load_wordlist(source).contains("FACADE")
+
+
+def test_remove_words_from_wordlist_updates_a_bulk_selection_atomically(tmp_path: Path) -> None:
+    source = tmp_path / "lijst.txt"
+    _ = source.write_text("kat\nfaçade\nkamer\nGINS\n", encoding="utf-8")
+
+    removed = remove_words_from_wordlist(["FACADE", "gins", "gins", "niet aanwezig"], source)
+
+    assert removed == ["FACADE", "GINS"]
+    assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
+
+
+def test_generate_moves_can_exclude_main_words_without_rebuilding_lexicon() -> None:
+    state = empty_board(list("GINS"))
+    lexicon = Gaddag(["gin", "gins", "sing", "sign", "sin"])
+
+    moves = generate_moves(state, lexicon, limit=20, excluded_words=["GINS", "SIN"])
+
+    assert moves
+    assert all(move.word not in {"GINS", "SIN"} for move in moves)
+
+
+def test_generate_moves_can_exclude_cross_words_without_rebuilding_lexicon() -> None:
+    state = empty_board(["A"])
+    state.grid[7][7].letter = "B"
+    state.grid[6][8].letter = "C"
+    lexicon = Gaddag(["ba", "ca", "ab"])
+
+    moves = generate_moves(state, lexicon, limit=20, excluded_words=["CA"])
+
+    assert moves
+    assert all("CA" not in move.cross_words for move in moves)
+    assert not any(move.word == "BA" and move.direction == "H" for move in moves)
 
 
 def test_parse_comma_separated_words_normalises_and_deduplicates() -> None:

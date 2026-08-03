@@ -33,7 +33,7 @@ OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `fa�
 
 De app toont naast de beste zet vijf alternatieven. Selecteer een suggestie om het voorbeeld op het interactieve bord te wisselen; alleen de nieuwe stenen zijn groen gemarkeerd.
 
-Onder de suggesties kun je één of meer voorgestelde woorden of bijbehorende kruiswoorden, kommagescheiden, insturen om ze permanent uit de geconfigureerde woordenlijst te verwijderen. De app bouwt de woordenlijstcache opnieuw op en vult de suggesties daarna aan met de eerstvolgende legale zetten. Staat een woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
+Onder de suggesties kun je één of meer voorgestelde woorden of bijbehorende kruiswoorden, kommagescheiden, insturen om ze permanent uit de geconfigureerde woordenlijst te verwijderen. De app sluit alle opgegeven woorden eerst alleen tijdens de herberekening uit, zodat nieuwe suggesties direct zichtbaar worden zonder die woorden. Daarna verwijdert één achtergrondactie de woorden in bulk uit de woordenlijst en bouwt de cache pas bij een volgende berekening opnieuw op. Het invoerveld blijft tijdens die update tijdelijk geblokkeerd. Staat een woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
 
 Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Geef oplossingen weer`. De lokale route rapporteert gemeten zekerheid per uitlezing, niet langer een vaste waarde. Onder 80% toont de app expliciet een waarschuwing.
 
