@@ -173,38 +173,24 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           RELEASE_COMMIT: ${{ github.sha }}
-          SERVICE_PYTHON: ${{ vars.FEUTSOLVER_SERVICE_PYTHON || '' }}
         run: |
+          mkdir -p "$RUNNER_TEMP/merged-lexicon"
+          rsync -rtDz \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/data/opentaal-wordlist.txt" \
+            "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt"
+          APP_ENV=production FEUTSOLVER_RUNTIME_CACHE_WRITE=1 python -c \
+            'from sys import argv; from wordfeud_analyzer.move_generator import load_wordlist; load_wordlist(argv[1])' \
+            "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt"
+          test -s "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt.gaddag-cache-v3.json"
+          rsync -rlptDz --chmod=Fu=rw,Fg=r,Fo= \
+            "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt.gaddag-cache-v3.json" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${RELEASE_COMMIT}/data/"
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
              release='${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
-             service_python='${SERVICE_PYTHON}'
-             if [ -z \"\$service_python\" ]; then service_python='${DEPLOY_PATH}/venv/bin/python'; fi
-             if [ ! -x \"\$service_python\" ]; then
-               service_pid=\"\$(systemctl show --property=MainPID --value feutsolver.service)\"
-               case \"\$service_pid\" in
-                 ''|0|*[!0-9]*) service_python='' ;;
-                 *) service_python=\"\$(tr '\000' '\n' < \"/proc/\$service_pid/cmdline\" | sed -n '1p')\" ;;
-               esac
-             fi
-             case \"\${service_python##*/}\" in python|python[0-9]*) ;; *) service_python='' ;; esac
-             if [ ! -x \"\$service_python\" ]; then
-               service_exec=\"\$(systemctl show --property=ExecStart --value feutsolver.service | sed -n 's/^{ path=\([^ ;]*\).*/\1/p')\"
-               case \"\${service_exec##*/}\" in
-                 python|python[0-9]*) service_python=\"\$service_exec\" ;;
-                 *)
-                   service_shebang=\"\$(sed -n '1p' \"\$service_exec\" 2>/dev/null || true)\"
-                   case \"\$service_shebang\" in '#!'/*/python|'#!'/*/python[0-9]*) service_python=\"\${service_shebang#\#!}\" ;; esac
-                   ;;
-               esac
-             fi
-             case \"\$service_python\" in /*) ;; *) echo 'service interpreter resolution failed' >&2; exit 1 ;; esac
-             test -x \"\$service_python\"
              rm -f \"\$release/data/opentaal-wordlist.txt\"
              ln -s '../../../data/opentaal-wordlist.txt' \"\$release/data/opentaal-wordlist.txt\"
-             cd \"\$release\"
-             APP_ENV=production FEUTSOLVER_RUNTIME_CACHE_WRITE=1 \"\$service_python\" -c 'from wordfeud_analyzer.move_generator import load_wordlist; load_wordlist("data/opentaal-wordlist.txt")'
              test -s \"\$release/data/opentaal-wordlist.txt.gaddag-cache-v3.json\"
              echo 'Merged release lexicon cache built.'"
 
@@ -214,6 +200,7 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           RELEASE_COMMIT: ${{ github.sha }}
+          SERVICE_USER: ${{ vars.FEUTSOLVER_SERVICE_USER || 'www-data' }}
         run: |
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
@@ -222,6 +209,20 @@ jobs:
              test -s '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
              rm -f \"\$release/data/opentaal-wordlist.txt\"
              ln -s '../../../data/opentaal-wordlist.txt' \"\$release/data/opentaal-wordlist.txt\"
+             test -s \"\$release/app.py\"
+             test -s \"\$release/data/opentaal-wordlist.txt.gaddag-cache-v3.json\"
+             test \"\$(stat -c '%G' \"\$release/app.py\")\" = feutsolver-app
+             test \"\$(stat -c '%A' \"\$release/app.py\" | cut -c5)\" = r
+             lock_path='${DEPLOY_PATH}/.wordlist.lock'
+             test \"\$(stat -c '%a' \"\$lock_path\")\" = 664
+             service_user='${SERVICE_USER}'
+             if [ \"\$(id -un)\" = \"\$service_user\" ]; then
+               test -r \"\$lock_path\" && test -w \"\$lock_path\"
+               exec 9>>\"\$lock_path\"
+               flock -n 9
+             else
+               sudo -n -u \"\$service_user\" -- sh -c 'lock=\"\$1\"; test -r \"\$lock\" && test -w \"\$lock\"; exec 9>>\"\$lock\"; flock -n 9' sh \"\$lock_path\"
+             fi
              if [ -L '${DEPLOY_PATH}/current' ]; then
                ln -sfn \"\$(readlink '${DEPLOY_PATH}/current')\" '${DEPLOY_PATH}/current.previous.next'
                mv -Tf '${DEPLOY_PATH}/current.previous.next' '${DEPLOY_PATH}/current.previous'
