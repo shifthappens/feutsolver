@@ -74,6 +74,8 @@ Gebruik alleen bij `auto` of `openrouter` in de zijbalk `openai/gpt-4.1-mini` (s
 
 De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De workflow heeft alleen `workflow_dispatch`: een commit of push naar `main` start dus nooit een deploy. De workflow test de exacte commit, gebruikt de gehashte lockfiles, maakt een SBOM en schrijft naar `releases/<commit-sha>`. Pas na een geslaagde upload wordt de symlink `current` atomair omgeschakeld; `current.previous` en oudere releases blijven beschikbaar voor rollback.
 
+Voor directe werkzaamheden op de VPS staan host, rootgebruiker, lokale Andromeda-sleutel en belangrijke productiepaden in [`docs/production-vps.md`](docs/production-vps.md). Gebruik die runbookinformatie in volgende beheersessies in plaats van de verbinding opnieuw te reconstrueren.
+
 Configureer `feutsolver.service` met `WorkingDirectory=<DEPLOY_PATH>/current`, `EnvironmentFile=/etc/feutsolver/feutsolver.env` en Streamlit op `127.0.0.1:8501`; [`ops/feutsolver.env.example`](ops/feutsolver.env.example) legt de productie-defaults vast. Apache is de enige publieke ingang; directe externe toegang tot poort 8501 hoort door binding en firewall onmogelijk te zijn. De deploybestanden [`ops/feutsolver-auth-vhost.patch`](ops/feutsolver-auth-vhost.patch), [`ops/feutsolver-fail2ban.filter`](ops/feutsolver-fail2ban.filter) en [`ops/feutsolver-fail2ban.jail`](ops/feutsolver-fail2ban.jail) beschrijven identity-forwarding, logout, korte sessies, generieke loginfouten en brute-forceblokkade. Gebruik unieke Apache-accounts: alleen de exacte actor `feutsolver` mag in productie de woordenlijst wijzigen; een ontbrekende of onbetrouwbare identiteit is altijd read-only.
 
 De productiesessie heeft een absolute levensduur van drie dagen. Logout maakt de normale browsercookie direct onbruikbaar, maar `mod_session_crypto` bewaart geen server-side revocatiestatus: een eerder gekopieerde cookie blijft daarom maximaal tot die eindtijd bruikbaar. Kort de sessieduur verder in of migreer naar server-side sessieopslag als dit restrisico niet acceptabel is.
@@ -90,7 +92,7 @@ gh workflow run deploy.yml --repo shifthappens/feutsolver --ref main
 
 De opdracht geeft de URL van de nieuwe run terug. Volg die run tot hij klaar is met `gh run watch <run-id> --repo shifthappens/feutsolver --exit-status`; alleen een eindstatus `success` betekent dat de uitrol geslaagd is. De incident- en deploynotitie van de duurzame OCR-fix staat in [`docs/ocr-incident-deployment-2026-08.md`](docs/ocr-incident-deployment-2026-08.md). De route is op 2 augustus 2026 succesvol uitgevoerd voor commit `b2928f9`.
 
-Bewaar de SSH-sleutel, hostnaam/IP-adres, doelpad en gepinde hostkey alleen als GitHub-secrets of in de lokale SSH-configuratie. Zet ze niet in Git. Gebruik op de server de service `feutsolver.service`; controleer na een uitrol dat deze `active (running)` is.
+Bewaar private SSH-sleutels en de gepinde hostkey alleen als GitHub-secrets of in de lokale SSH-configuratie; zet ze nooit in Git. Het productie-endpoint en de lokale sleutelnaam zijn bewust gedocumenteerd in het VPS-runbook, maar de sleutelinhoud niet. Gebruik op de server de service `feutsolver.service`; controleer na een uitrol dat deze `active (running)` is.
 
 ## Woordenlijst
 
