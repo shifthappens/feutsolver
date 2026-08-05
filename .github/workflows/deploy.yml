@@ -221,7 +221,7 @@ jobs:
                exec 9>>\"\$lock_path\"
                flock -n 9
              else
-               sudo -n -u \"\$service_user\" -- sh -c 'lock=\"\$1\"; test -r \"\$lock\" && test -w \"\$lock\"; exec 9>>\"\$lock\"; flock -n 9' sh \"\$lock_path\"
+               sudo -n -u \"\$service_user\" -- /usr/local/sbin/feutsolver-lock-check
              fi
              if [ -L '${DEPLOY_PATH}/current' ]; then
                ln -sfn \"\$(readlink '${DEPLOY_PATH}/current')\" '${DEPLOY_PATH}/current.previous.next'
@@ -268,7 +268,7 @@ jobs:
                exec 9>>\"\$lock_path\"
                flock -n 9
              else
-               sudo -n -u \"\$service_user\" -- sh -c 'lock=\"\$1\"; test -r \"\$lock\" && test -w \"\$lock\"; exec 9>>\"\$lock\"; flock -n 9' sh \"\$lock_path\"
+               sudo -n -u \"\$service_user\" -- /usr/local/sbin/feutsolver-lock-check
              fi
              echo 'Deployment permissions verified'"
 
