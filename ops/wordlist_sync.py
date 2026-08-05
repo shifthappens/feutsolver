@@ -189,6 +189,7 @@ def merge_wordlist(deploy_path: str | Path) -> MergeReport:
     with _open_wordlist_lock(lock_path) as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         production = read_words(wordlist)
+        production_for_merge = production
         repository = read_words(incoming_repository)
         if previous_repository_path.is_file() and previous_merged_path.is_file():
             previous_repository = read_words(previous_repository_path)
@@ -196,12 +197,19 @@ def merge_wordlist(deploy_path: str | Path) -> MergeReport:
         else:
             previous_repository = read_words(initial_base)
             previous_merged = set(previous_repository)
+            # The legacy deploy deliberately omitted the large repository
+            # word list and left only words learned after the base revision on
+            # the server. During the first stateful deploy those words are
+            # additions, not evidence that every base word was deleted.
+            repository_additions = repository - previous_repository
+            if production == repository_additions:
+                production_for_merge = previous_merged | production
 
         merged, report = merge_word_sets(
             previous_repository,
             previous_merged,
             repository,
-            production,
+            production_for_merge,
         )
         if merged != production:
             _atomic_write(wordlist, merged)

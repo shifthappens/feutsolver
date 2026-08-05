@@ -1,6 +1,7 @@
 [feutsolver-auth]
 enabled = true
 filter = feutsolver-auth
+backend = polling
 port = http,https
 logpath = /var/log/apache2/error.log
 maxretry = 5

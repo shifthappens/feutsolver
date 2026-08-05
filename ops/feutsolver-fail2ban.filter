@@ -1,7 +1,6 @@
 [Definition]
-# Validate this filter against the target Apache auth_form log format before
-# enabling it. The patterns cover common auth_form/auth_basic messages; a
-# successful login must never match.
-failregex = ^.*\[auth_form:(?:info|notice|warn|error)\].*client <HOST>.*(?:authentication failure|login failed|not found).*\s*$
-            ^.*\[auth_basic:error\].*client <HOST>.*(?:authentication failure|user .* not found).*\s*$
+# Apache auth_form emits AH01807 for a bad password and AH01808 for an
+# unknown user. Restrict matches to the Feutsolver login handler so unrelated
+# authentication failures on the same virtual host cannot trigger this jail.
+failregex = ^.*\[auth_form:error\].*\[client <HOST>(?::[0-9]+)?\]\s+AH0180[78]:.*/feutsolver-login-submit.*$
 ignoreregex =

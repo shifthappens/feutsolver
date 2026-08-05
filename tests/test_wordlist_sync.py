@@ -70,3 +70,26 @@ def test_deploy_merge_updates_live_list_and_remembers_both_bases(tmp_path: Path)
     assert (sync / "previous-merged.txt").read_text(encoding="utf-8") == "basis\nlokaal\n"
     assert not (sync / "incoming-repository.txt").exists()
     assert (root / ".wordlist.lock").stat().st_mode & 0o777 == 0o664
+
+
+def test_first_merge_restores_wordlist_omitted_by_legacy_deploy(tmp_path: Path) -> None:
+    root = tmp_path / "release"
+    wordlist = root / "data" / "opentaal-wordlist.txt"
+    sync = root / ".wordlist-sync"
+    wordlist.parent.mkdir(parents=True)
+    sync.mkdir(parents=True)
+    wordlist.write_text("nieuw\n", encoding="utf-8")
+    (sync / "initial-repository.txt").write_text("ander\nbasis\n", encoding="utf-8")
+    (sync / "incoming-repository.txt").write_text(
+        "ander\nbasis\nnieuw\n",
+        encoding="utf-8",
+    )
+
+    report = merge_wordlist(root)
+
+    assert wordlist.read_text(encoding="utf-8") == "ander\nbasis\nnieuw\n"
+    assert (sync / "previous-merged.txt").read_text(encoding="utf-8") == (
+        "ander\nbasis\nnieuw\n"
+    )
+    assert report.production_before == 3
+    assert report.merged == 3
