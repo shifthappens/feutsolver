@@ -182,6 +182,11 @@
         if (main && scrollTop !== null) main.scrollTop = scrollTop;
       }, 0);
     }
+    function dismissKeyboard() {
+      keyboard.blur();
+      const activeElement = document.activeElement;
+      if (activeElement && typeof activeElement.blur === "function") activeElement.blur();
+    }
     function apply(action) {
       if (!editor || props.mode === "preview") return;
       const changesSnapshot = ["set_board", "clear_board", "backspace", "set_rack", "remove_rack"].includes(action.type);
@@ -345,10 +350,16 @@
       if (event.key === "Delete") { event.preventDefault(); apply(editor.selection.kind === "board" ? { type:"clear_board" } : { type:"remove_rack" }); return; }
       if (event.key === "Backspace") { event.preventDefault(); apply({ type:"backspace" }); }
     });
-      document.addEventListener("click", event => {
-        if (event.target.closest("input, select, textarea")) return;
-        if (event.target.closest(".panel")) focusKeyboard();
-      });
+      function dismissKeyboardForAction(event) {
+        const target = event.target instanceof Element ? event.target : null;
+        const button = target?.closest("button");
+        if (!button || button.matches("[data-row], [data-rack]")) return;
+        dismissKeyboard();
+      }
+      // Only board and rack buttons activate the hidden typing input. Action
+      // buttons (including save/load) must not open the mobile keyboard.
+      document.addEventListener("pointerdown", dismissKeyboardForAction, true);
+      document.addEventListener("click", dismissKeyboardForAction);
       Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, event => {
         props = event.detail.args || {};
         const incomingBoardVersion = Number(props.board_version);
