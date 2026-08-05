@@ -1,7 +1,13 @@
 name: Deploy Wordfeud Analyzer
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      wordlist_base_revision:
+        description: "Git-revisie van de laatste productie-deploy voor de eerste woordenlijst-merge"
+        required: true
+        default: "b2928f9"
+        type: string
 
 permissions:
   contents: read
@@ -18,21 +24,56 @@ jobs:
 
     steps:
       - name: Check out release revision
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Verify application
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install --upgrade 'pip>=26.1.2'
+          python -m pip install --require-hashes -r requirements-dev.txt
+          python ops/check_lockfiles.py
+          python -m pip check
           python -m pytest -q
+          node --test frontend/board.test.js
+          pip-audit -r requirements.txt --strict
+          # Requirements hashes are public package metadata, not credentials.
+          detect-secrets scan --all-files --force-use-all-plugins \
+            --exclude-files '(^|/)requirements(-dev)?\.txt$' > "$RUNNER_TEMP/secrets-scan.json"
+          python ops/check_secrets_scan.py "$RUNNER_TEMP/secrets-scan.json"
+
+      - name: Generate SBOM and release manifest
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          pip-audit -r requirements.txt --format cyclonedx-json --output "$RUNNER_TEMP/sbom.json"
+          python - <<'PY'
+          from hashlib import sha256
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path.cwd()
+          runner_temp = Path(os.environ["RUNNER_TEMP"])
+          manifest = {
+              "commit_sha": os.environ["RELEASE_COMMIT"],
+              "requirements_sha256": sha256((root / "requirements.txt").read_bytes()).hexdigest(),
+              "sbom": "sbom.json",
+          }
+          (runner_temp / "release-manifest.json").write_text(
+              json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
 
       - name: Install restricted deploy key
-        uses: webfactory/ssh-agent@v0.10.0
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
@@ -43,7 +84,52 @@ jobs:
           printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+      - name: Prepare mutable wordlist merge state
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          WORDLIST_BASE_REVISION: ${{ inputs.wordlist_base_revision }}
+        run: |
+          case "$WORDLIST_BASE_REVISION" in
+            ''|*[!0-9a-fA-F]*)
+              echo 'wordlist_base_revision must be a hexadecimal Git revision'
+              exit 1
+              ;;
+          esac
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -eu
+             mkdir -p '${DEPLOY_PATH}/.wordlist-sync'
+             chmod g+rwx '${DEPLOY_PATH}/.wordlist-sync'"
+          git show "${WORDLIST_BASE_REVISION}:data/opentaal-wordlist.txt" \
+            > "${RUNNER_TEMP}/wordlist-initial-repository.txt"
+          rsync -rlptDz --chmod=Fu=rw,Fg=rw,Fo= \
+            "${RUNNER_TEMP}/wordlist-initial-repository.txt" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/.wordlist-sync/initial-repository.txt"
+          rsync -rlptDz --chmod=Fu=rw,Fg=rw,Fo= \
+            data/opentaal-wordlist.txt \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/.wordlist-sync/incoming-repository.txt"
+
+      - name: Prepare immutable release directory
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -eu
+             mkdir -p '${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
+             chmod g+rwx '${DEPLOY_PATH}/releases' '${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'"
+
       - name: Sync application files only
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           # www-data runs the service; setgid keeps the project service group on new files.
           rsync -rlptDz --delete --chmod=Du=rwx,Dg=rxs,Do=,Fu=rw,Fg=r,Fo= \
@@ -53,17 +139,25 @@ jobs:
             --include='/frontend/index.html' \
             --include='/frontend/board.js' \
             --include='/frontend/streamlit-bridge.js' \
+            --include='/frontend/app.js' \
+            --include='/frontend/styles.css' \
             --include='/wordfeud_analyzer/' \
             --include='/wordfeud_analyzer/**' \
             --include='/data/' \
             --include='/data/voorbeeld_woorden.txt' \
+            --filter='P /data/opentaal-wordlist.txt' \
+            --filter='P /.wordlist-sync/**' \
+            --exclude='/data/opentaal-wordlist.txt' \
             --include='/app.py' \
             --include='/requirements.txt' \
             --exclude='*' \
             ./ \
-            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}"
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${RELEASE_COMMIT}"
+          rsync -rlptDz --chmod=Fu=rw,Fg=r,Fo= \
+            "$RUNNER_TEMP/sbom.json" "$RUNNER_TEMP/release-manifest.json" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${RELEASE_COMMIT}/"
 
-      - name: Re-assert and verify service-readable permissions
+      - name: Merge repository and production wordlists
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
@@ -71,19 +165,93 @@ jobs:
         run: |
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "python3 - '${DEPLOY_PATH}'" < ops/wordlist_sync.py
+
+      - name: Build the release lexicon cache from the merged wordlist
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          SERVICE_PYTHON: ${{ vars.FEUTSOLVER_SERVICE_PYTHON || '' }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
-             find '${DEPLOY_PATH}/wordfeud_analyzer' -type d -exec chmod g+rx,g+s {} +
-             find '${DEPLOY_PATH}/wordfeud_analyzer' -type f -exec chmod g+r {} +
-             chmod g+rx,g+s '${DEPLOY_PATH}' '${DEPLOY_PATH}/.streamlit' '${DEPLOY_PATH}/data'
-             chmod g+r '${DEPLOY_PATH}/app.py' '${DEPLOY_PATH}/requirements.txt' '${DEPLOY_PATH}/.streamlit/config.toml' '${DEPLOY_PATH}/data/voorbeeld_woorden.txt'
-             test \"\$(stat -c '%G' '${DEPLOY_PATH}/app.py')\" = feutsolver-app
-             test \"\$(stat -c '%A' '${DEPLOY_PATH}/app.py' | cut -c5)\" = r
+             release='${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
+             service_python='${SERVICE_PYTHON}'
+             if [ -z \"\$service_python\" ]; then service_python='${DEPLOY_PATH}/venv/bin/python'; fi
+             test -x \"\$service_python\"
+             rm -f \"\$release/data/opentaal-wordlist.txt\"
+             ln -s '../../../data/opentaal-wordlist.txt' \"\$release/data/opentaal-wordlist.txt\"
+             cd \"\$release\"
+             APP_ENV=production FEUTSOLVER_RUNTIME_CACHE_WRITE=1 \"\$service_python\" -c 'from wordfeud_analyzer.move_generator import load_wordlist; load_wordlist("data/opentaal-wordlist.txt")'
+             test -s \"\$release/data/opentaal-wordlist.txt.gaddag-cache-v3.json\"
+             echo 'Merged release lexicon cache built.'"
+
+      - name: Activate release atomically
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -eu
+             release='${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
+             test -s '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
+             rm -f \"\$release/data/opentaal-wordlist.txt\"
+             ln -s '../../../data/opentaal-wordlist.txt' \"\$release/data/opentaal-wordlist.txt\"
+             if [ -L '${DEPLOY_PATH}/current' ]; then
+               ln -sfn \"\$(readlink '${DEPLOY_PATH}/current')\" '${DEPLOY_PATH}/current.previous.next'
+               mv -Tf '${DEPLOY_PATH}/current.previous.next' '${DEPLOY_PATH}/current.previous'
+             fi
+             ln -sfn \"\$release\" '${DEPLOY_PATH}/current.next'
+             mv -Tf '${DEPLOY_PATH}/current.next' '${DEPLOY_PATH}/current'
+             test \"\$(readlink '${DEPLOY_PATH}/current')\" = \"\$release\"
+             echo 'Release activated; previous releases retained for rollback.'"
+
+      - name: Re-assert and verify service-readable permissions
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SERVICE_USER: ${{ vars.FEUTSOLVER_SERVICE_USER || 'www-data' }}
+        run: |
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "set -eu
+             active='${DEPLOY_PATH}/current'
+             find \"\$active/wordfeud_analyzer\" -type d -exec chmod g+rx,g+s {} +
+             find \"\$active/wordfeud_analyzer\" -type f -exec chmod g+r {} +
+             chmod g+rx,g+s '${DEPLOY_PATH}' '${DEPLOY_PATH}/releases' \"\$active\" \"\$active/.streamlit\" \"\$active/data\"
+             chmod g+r \"\$active/app.py\" \"\$active/requirements.txt\" \"\$active/.streamlit/config.toml\" \"\$active/data/voorbeeld_woorden.txt\" \"\$active/data/opentaal-wordlist.txt.gaddag-cache-v3.json\" '${DEPLOY_PATH}/data/opentaal-wordlist.txt' \"\$active/sbom.json\" \"\$active/release-manifest.json\"
+             chmod g+rx '${DEPLOY_PATH}/.wordlist-sync'
+             chmod g+r '${DEPLOY_PATH}/.wordlist-sync/previous-repository.txt' '${DEPLOY_PATH}/.wordlist-sync/previous-merged.txt'
+             lock_path='${DEPLOY_PATH}/.wordlist.lock'
+             test -e \"\$lock_path\"
+             test \"\$(stat -c '%a' \"\$lock_path\")\" = 664
+             test -s '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
+             test -s \"\$active/data/opentaal-wordlist.txt\"
+             test -s \"\$active/data/opentaal-wordlist.txt.gaddag-cache-v3.json\"
+             test -s '${DEPLOY_PATH}/.wordlist-sync/previous-repository.txt'
+             test -s '${DEPLOY_PATH}/.wordlist-sync/previous-merged.txt'
+             test \"\$(stat -c '%G' \"\$active/app.py\")\" = feutsolver-app
+             test \"\$(stat -c '%A' \"\$active/app.py\" | cut -c5)\" = r
              test \"\$(stat -c '%G' '${DEPLOY_PATH}')\" = feutsolver-app
              test \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c5)\" = r
              case \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c7)\" in x|s) ;; *) exit 1 ;; esac
+             service_user='${SERVICE_USER}'
+             if [ \"\$(id -un)\" = \"\$service_user\" ]; then
+               test -r \"\$lock_path\" && test -w \"\$lock_path\"
+               exec 9>>\"\$lock_path\"
+               flock -n 9
+             else
+               sudo -n -u \"\$service_user\" -- sh -c 'lock=\"\$1\"; test -r \"\$lock\" && test -w \"\$lock\"; exec 9>>\"\$lock\"; flock -n 9' sh \"\$lock_path\"
+             fi
              echo 'Deployment permissions verified'"
 
-      # The server's enabled feutsolver.path unit watches this deployment path and
-      # starts feutsolver-restart.service after a file change. That oneshot waits
-      # briefly for rsync to finish and then restarts the Streamlit service, so no
-      # privileged restart command or GitHub secret is needed here.
+      # Configure feutsolver.service to use DEPLOY_PATH/current and bind
+      # Streamlit to 127.0.0.1:8501. The previous symlink and every release
+      # directory remain available for a no-build rollback.

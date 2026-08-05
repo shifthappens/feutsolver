@@ -3,16 +3,27 @@ from __future__ import annotations
 
 from array import array
 from collections import Counter
-from collections.abc import Iterable
-import pickle
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 from threading import RLock
 import unicodedata
-from typing import BinaryIO, Literal, TypeAlias, TypedDict, TypeGuard, cast
+from typing import Literal, TypeAlias, TypedDict, TypeGuard, cast
 
 from .models import BoardState, Move, PlacedTile
+from .security import (
+    audit_wordlist_mutation,
+    file_version,
+    log_security_event,
+    may_mutate_production_wordlist,
+    new_correlation_id,
+)
 
 BOARD_SIZE = 15
 LETTER_VALUES = {
@@ -23,12 +34,61 @@ LETTER_VALUES = {
 }
 LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
-GADDAG_CACHE_VERSION = 5
+GADDAG_CACHE_VERSION = 6
+CACHE_SCHEMA_VERSION = 1
+MAX_CACHE_BYTES = 64 * 1024 * 1024
+MAX_CACHE_NODES = 10_000_000
+MAX_CACHE_WORDS = 2_000_000
+WORDLIST_LOCK_MODE = 0o664
+RUNTIME_CACHE_WRITE = os.getenv(
+    "FEUTSOLVER_RUNTIME_CACHE_WRITE",
+    "0" if os.getenv("APP_ENV", "production").strip().lower() == "production" else "1",
+).strip().lower() in {"1", "true", "yes"}
 Direction = Literal["H", "V"]
 # `array` only became subscriptable at runtime in Python 3.12; the element types
 # are quoted so this alias also evaluates on 3.11 without losing type information.
 GraphData: TypeAlias = tuple["array[int]", "array[int]", bytearray, bytearray, "array[int]", int]
 _WORDLIST_WRITE_LOCK = RLock()
+
+
+@contextmanager
+def _open_wordlist_lock(path: Path) -> Iterator[object]:
+    """Open the shared lock with group write permission regardless of umask."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, WORDLIST_LOCK_MODE)
+    try:
+        try:
+            os.fchmod(descriptor, WORDLIST_LOCK_MODE)
+        except PermissionError:
+            # Deployment may own a correctly-created lock while the app only
+            # has group access.  Ownership is not needed if the mode is right.
+            if os.fstat(descriptor).st_mode & 0o777 != WORDLIST_LOCK_MODE:
+                raise
+        with os.fdopen(descriptor, "a+", encoding="ascii") as handle:
+            descriptor = -1
+            yield handle
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+@contextmanager
+def _wordlist_file_lock(path: Path) -> Iterator[None]:
+    """Coordinate app writes with the deployment-side wordlist merge."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = path.resolve(strict=False)
+    if resolved.name == "opentaal-wordlist.txt" and resolved.parent.name == "data":
+        # The app may reach the mutable production list through
+        # releases/<sha>/data/opentaal-wordlist.txt, while deployment operates
+        # on <deploy>/data/opentaal-wordlist.txt. Lock their shared parent.
+        lock_path = resolved.parent.parent / ".wordlist.lock"
+    else:
+        lock_path = path.with_name(path.name + ".lock")
+    with _open_wordlist_lock(lock_path) as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class _Node(TypedDict):
@@ -263,7 +323,9 @@ def _is_plain_netherlands_word(word: str) -> bool:
 
 
 def _cache_path(path: Path) -> Path:
-    return path.with_name(path.name + ".gaddag-cache-v2")
+    # Deliberately use a new name: an older object cache is never opened, even
+    # as a migration source.
+    return path.with_name(path.name + ".gaddag-cache-v3.json")
 
 
 def _is_graph_data(value: object) -> TypeGuard[GraphData]:
@@ -283,24 +345,91 @@ def _is_graph_data(value: object) -> TypeGuard[GraphData]:
     )
 
 
-def _read_cached_data(handle: BinaryIO) -> tuple[int, tuple[int, ...], int, GraphData] | None:
-    loaded = cast(object, pickle.load(handle))
-    if not isinstance(loaded, tuple):
+def _as_bounded_int_list(value: object, *, maximum: int) -> list[int] | None:
+    if not isinstance(value, list) or len(value) > maximum:
         return None
-    values = cast(tuple[object, ...], loaded)
-    if len(values) != 4:
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
         return None
-    version, signature, count, graph = values
-    if not isinstance(version, int) or not isinstance(count, int):
+    return value
+
+
+def _read_cached_data(cache: Path) -> tuple[int, tuple[int, ...], str, int, GraphData] | None:
+    """Read and strictly validate the non-executable JSON cache format."""
+    try:
+        if cache.stat().st_size > MAX_CACHE_BYTES:
+            return None
+        with cache.open("rb") as handle:
+            raw = handle.read(MAX_CACHE_BYTES + 1)
+        if len(raw) > MAX_CACHE_BYTES:
+            return None
+        loaded = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
-    if not isinstance(signature, tuple):
+    if not isinstance(loaded, dict):
         return None
-    signature_values = cast(tuple[object, ...], signature)
-    if not signature_values or not all(isinstance(value, int) for value in signature_values):
+    required = {
+        "magic", "version", "schema_version", "source_sha256", "source_signature",
+        "payload_length", "payload_sha256", "payload",
+    }
+    if set(loaded) != required or loaded.get("magic") != "FEUTSOLVER-GADDAG":
         return None
-    if not _is_graph_data(graph):
+    if loaded.get("version") != GADDAG_CACHE_VERSION or loaded.get("schema_version") != CACHE_SCHEMA_VERSION:
         return None
-    return version, cast(tuple[int, ...], signature_values), count, graph
+    source_sha256 = loaded.get("source_sha256")
+    if not isinstance(source_sha256, str) or len(source_sha256) != 64:
+        return None
+    source_signature = _as_bounded_int_list(loaded.get("source_signature"), maximum=16)
+    if not source_signature:
+        return None
+    payload = loaded.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if set(payload) != {"count", "starts", "counts", "terminals", "labels", "targets", "root"}:
+        return None
+    encoded_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_length = loaded.get("payload_length")
+    payload_sha256 = loaded.get("payload_sha256")
+    if (
+        not isinstance(payload_length, int)
+        or isinstance(payload_length, bool)
+        or payload_length != len(encoded_payload)
+        or not isinstance(payload_sha256, str)
+        or len(payload_sha256) != 64
+        or hashlib.sha256(encoded_payload).hexdigest() != payload_sha256
+    ):
+        return None
+
+    count = payload.get("count")
+    root = payload.get("root")
+    starts = _as_bounded_int_list(payload.get("starts"), maximum=MAX_CACHE_NODES)
+    counts = _as_bounded_int_list(payload.get("counts"), maximum=MAX_CACHE_NODES)
+    terminals = _as_bounded_int_list(payload.get("terminals"), maximum=MAX_CACHE_NODES)
+    labels = _as_bounded_int_list(payload.get("labels"), maximum=MAX_CACHE_BYTES)
+    targets = _as_bounded_int_list(payload.get("targets"), maximum=MAX_CACHE_BYTES)
+    if (
+        not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= MAX_CACHE_WORDS
+        or not isinstance(root, int) or isinstance(root, bool)
+        or starts is None or counts is None or terminals is None or labels is None or targets is None
+        or len(starts) != len(counts) or len(starts) != len(terminals)
+        or len(labels) != len(targets) or not starts or not 0 <= root < len(starts)
+        or len(starts) > MAX_CACHE_NODES
+    ):
+        return None
+    node_count = len(starts)
+    edge_count = len(labels)
+    if any(start < 0 or size < 0 or size > 255 or start + size > edge_count for start, size in zip(starts, counts)):
+        return None
+    if any(value not in (0, 1) for value in terminals):
+        return None
+    if any(value < 65 or value > 90 for value in labels):
+        return None
+    if any(value < 0 or value >= node_count for value in targets):
+        return None
+    graph: GraphData = (
+        array("I", starts), array("B", counts), bytearray(terminals),
+        bytearray(labels), array("I", targets), root,
+    )
+    return GADDAG_CACHE_VERSION, tuple(source_signature), source_sha256, count, graph
 
 
 def _signature(paths: Iterable[Path]) -> tuple[int, ...]:
@@ -320,27 +449,70 @@ def load_wordlist(path: str | Path) -> Gaddag:
     """Load a packed, persistent GADDAG; build it only when the word list changed."""
     source = Path(path)
     signature = _signature([source])
+    source_hash = file_version(source) or hashlib.sha256(b"").hexdigest()
     cache = _cache_path(source)
-    try:
-        with cache.open("rb") as handle:
-            cached = _read_cached_data(handle)
-        if cached is not None:
-            version, cached_signature, count, graph = cached
-            if version == GADDAG_CACHE_VERSION and cached_signature == signature:
-                return Gaddag.from_cached_graph(count, graph)
-    except (OSError, EOFError, pickle.PickleError, ValueError):
-        pass
+    cache_reason = "missing" if not cache.exists() else "invalid_or_stale"
+    cached = _read_cached_data(cache)
+    if cached is not None:
+        version, cached_signature, cached_source_hash, count, graph = cached
+        if version == GADDAG_CACHE_VERSION and cached_signature == signature and cached_source_hash == source_hash:
+            return Gaddag.from_cached_graph(count, graph)
+        cache_reason = "invalid_or_stale"
 
     instance = Gaddag.from_wordlist(source)
-    try:
-        with tempfile.NamedTemporaryFile(dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
-            pickle.dump((GADDAG_CACHE_VERSION, signature, instance.count, instance.graph_data()),
-                        handle, protocol=pickle.HIGHEST_PROTOCOL)
-            temporary_cache = Path(handle.name)
-        _ = temporary_cache.replace(cache)
-    except OSError:
-        # A read-only local development word list still works; it simply is not cached.
-        pass
+    payload = {
+        "count": instance.count,
+        "starts": list(instance._starts),
+        "counts": list(instance._counts),
+        "terminals": list(instance._terminals),
+        "labels": list(instance._labels),
+        "targets": list(instance._targets),
+        "root": instance.root,
+    }
+    encoded_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    document = {
+        "magic": "FEUTSOLVER-GADDAG",
+        "version": GADDAG_CACHE_VERSION,
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "source_sha256": source_hash,
+        "source_signature": list(signature),
+        "payload_length": len(encoded_payload),
+        "payload_sha256": hashlib.sha256(encoded_payload).hexdigest(),
+        "payload": payload,
+    }
+    encoded_document = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    cache_written = False
+    if RUNTIME_CACHE_WRITE:
+        try:
+            temporary_cache: Path | None = None
+            with tempfile.NamedTemporaryFile(mode="wb", dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
+                temporary_cache = Path(handle.name)
+                _ = handle.write(encoded_document)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if temporary_cache is not None:
+                _ = temporary_cache.replace(cache)
+                try:
+                    directory_fd = os.open(cache.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+                cache_written = True
+        except OSError:
+            # A read-only local development word list still works; it simply is not cached.
+            if 'temporary_cache' in locals() and temporary_cache is not None:
+                temporary_cache.unlink(missing_ok=True)
+    log_security_event(
+        event="cache_rebuild",
+        correlation_id=new_correlation_id(),
+        action="gaddag",
+        result="success" if cache_written else "rebuilt_uncached",
+        error_category=cache_reason,
+        word_count=instance.count,
+    )
     return instance
 
 
@@ -358,42 +530,125 @@ def suggest_words(words: Iterable[str], path: str | Path) -> list[str]:
     return sorted({normalise_word(word) for word in words} - known - {""})
 
 
-def add_words_to_wordlist(words: Iterable[str], path: str | Path) -> list[str]:
-    """Append explicitly confirmed words to the configured word list."""
-    with _WORDLIST_WRITE_LOCK:
-        target = Path(path)
-        fresh = suggest_words(words, target)
+def _mutation_words(words: Iterable[str], *, maximum: int = 1000) -> list[str]:
+    if isinstance(words, str):
+        words = (words,)
+    result: list[str] = []
+    for word in words:
+        if len(result) >= maximum:
+            break
+        if not isinstance(word, str) or len(word) > 64:
+            continue
+        normalised = normalise_word(word)
+        if normalised and normalised not in result:
+            result.append(normalised)
+    return result
+
+
+def _deny_mutation(*, actor: str | None, action: str, path: Path, word_count: int, correlation_id: str) -> None:
+    version = file_version(path)
+    audit_wordlist_mutation(
+        actor=actor, action=action, word_count=word_count, result="denied",
+        correlation_id=correlation_id, version_before=version, version_after=version,
+    )
+    raise PermissionError("WORDLIST-DENIED")
+
+
+def _atomic_text_replace(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    version_before: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            _ = temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        _ = temporary_path.replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def add_words_to_wordlist(
+    words: Iterable[str], path: str | Path, *, actor: str | None = None, correlation_id: str | None = None,
+) -> list[str]:
+    """Atomically add explicitly confirmed words after server-side authorization."""
+    # Production releases expose the mutable list through a symlink. Resolve
+    # it before an atomic replace so the replace updates the shared data file,
+    # rather than replacing the release-local symlink itself.
+    target = Path(path).resolve(strict=False)
+    correlation_id = correlation_id or new_correlation_id()
+    requested = _mutation_words(words)
+    if not may_mutate_production_wordlist(actor):
+        _deny_mutation(actor=actor, action="add", path=target, word_count=len(requested), correlation_id=correlation_id)
+    with _WORDLIST_WRITE_LOCK, _wordlist_file_lock(target):
+        version_before = file_version(target)
+        fresh = suggest_words(requested, target)
         if not fresh:
+            audit_wordlist_mutation(
+                actor=actor, action="add", word_count=0, result="no_change",
+                correlation_id=correlation_id, version_before=version_before, version_after=version_before,
+            )
             return []
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as handle:
-            for word in fresh:
-                _ = handle.write(word.lower() + "\n")
+        try:
+            current = target.read_text(encoding="utf-8") if target.exists() else ""
+            if current and not current.endswith("\n"):
+                current += "\n"
+            _atomic_text_replace(target, current + "".join(word.lower() + "\n" for word in fresh))
+        except OSError:
+            version_after = file_version(target)
+            audit_wordlist_mutation(
+                actor=actor, action="add", word_count=len(fresh), result="error",
+                correlation_id=correlation_id, version_before=version_before, version_after=version_after,
+            )
+            raise
+        audit_wordlist_mutation(
+            actor=actor, action="add", word_count=len(fresh), result="success",
+            correlation_id=correlation_id, version_before=version_before, version_after=file_version(target),
+        )
         return fresh
 
 
-def remove_words_from_wordlist(words: Iterable[str], path: str | Path) -> list[str]:
-    """Remove many words in one atomic pass and return the words that were found."""
-    if isinstance(words, str):
-        words = (words,)
-    target_words: list[str] = []
-    seen: set[str] = set()
-    for word in words:
-        target_word = normalise_word(word)
-        if target_word and target_word not in seen:
-            seen.add(target_word)
-            target_words.append(target_word)
+def remove_words_from_wordlist(
+    words: Iterable[str], path: str | Path, *, actor: str | None = None, correlation_id: str | None = None,
+) -> list[str]:
+    """Remove many words in one atomic pass after server-side authorization."""
+    # See add_words_to_wordlist: never atomically replace the deployment
+    # symlink that points at the shared production wordlist.
+    source = Path(path).resolve(strict=False)
+    correlation_id = correlation_id or new_correlation_id()
+    target_words = _mutation_words(words)
+    if not may_mutate_production_wordlist(actor):
+        _deny_mutation(actor=actor, action="remove", path=source, word_count=len(target_words), correlation_id=correlation_id)
     if not target_words:
+        version = file_version(source)
+        audit_wordlist_mutation(
+            actor=actor, action="remove", word_count=0, result="no_change",
+            correlation_id=correlation_id, version_before=version, version_after=version,
+        )
         return []
 
-    source = Path(path)
     temporary_path: Path | None = None
     removed: set[str] = set()
     try:
-        with _WORDLIST_WRITE_LOCK:
+        with _WORDLIST_WRITE_LOCK, _wordlist_file_lock(source):
+            version_before = file_version(source)
             try:
                 source_handle = source.open(encoding="utf-8")
             except FileNotFoundError:
+                audit_wordlist_mutation(
+                    actor=actor, action="remove", word_count=0, result="no_change",
+                    correlation_id=correlation_id, version_before=version_before, version_after=version_before,
+                )
                 return []
             with source_handle:
                 with tempfile.NamedTemporaryFile(
@@ -411,18 +666,40 @@ def remove_words_from_wordlist(words: Iterable[str], path: str | Path) -> list[s
                             removed.add(normalised)
                             continue
                         _ = temporary.write(line)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
             if removed and temporary_path is not None:
-                _ = temporary_path.replace(source)
+                temporary_path.replace(source)
+                directory_fd = os.open(source.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
                 temporary_path = None
-        return [word for word in target_words if word in removed]
+            result = [word for word in target_words if word in removed]
+            audit_wordlist_mutation(
+                actor=actor, action="remove", word_count=len(result),
+                result="success" if result else "no_change", correlation_id=correlation_id,
+                version_before=version_before, version_after=file_version(source),
+            )
+        return result
+    except OSError:
+        version_after = file_version(source)
+        audit_wordlist_mutation(
+            actor=actor, action="remove", word_count=len(removed), result="error",
+                correlation_id=correlation_id, version_before=version_before, version_after=version_after,
+        )
+        raise
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
 
 
-def remove_word_from_wordlist(word: str, path: str | Path) -> bool:
+def remove_word_from_wordlist(
+    word: str, path: str | Path, *, actor: str | None = None, correlation_id: str | None = None,
+) -> bool:
     """Permanently remove every spelling of one word from a source list."""
-    return bool(remove_words_from_wordlist((word,), path))
+    return bool(remove_words_from_wordlist((word,), path, actor=actor, correlation_id=correlation_id))
 
 
 def board_words(state: BoardState) -> list[str]:

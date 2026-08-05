@@ -1,9 +1,12 @@
 [server]
+# Apache is the only public listener; block TCP/8501 at the host firewall too.
+address = "127.0.0.1"
+port = 8501
 # The server rejects oversized files before they consume app memory.
 maxUploadSize = 2
 maxMessageSize = 5
 # Keep a mobile browser session available while its app is briefly backgrounded.
-disconnectedSessionTTL = 600
+disconnectedSessionTTL = 60
 # Rerun the app as soon as Python or component files change on disk.
 runOnSave = true
 # The environment does not bundle watchdog on macOS; polling is the reliable

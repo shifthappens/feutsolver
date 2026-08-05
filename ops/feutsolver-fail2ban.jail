@@ -1,0 +1,11 @@
+[feutsolver-auth]
+enabled = true
+filter = feutsolver-auth
+port = http,https
+logpath = /var/log/apache2/error.log
+maxretry = 5
+findtime = 600
+bantime = 1800
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 86400

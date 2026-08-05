@@ -114,7 +114,7 @@ def test_words_seen_on_a_board_are_suggestions_until_explicitly_confirmed(tmp_pa
     assert suggest_words(["GINS"], source) == ["GINS"]
     assert "gins" not in source.read_text(encoding="utf-8").splitlines()
 
-    assert add_words_to_wordlist(["GINS"], source) == ["GINS"]
+    assert add_words_to_wordlist(["GINS"], source, actor="feutsolver") == ["GINS"]
     assert suggest_words(["GINS"], source) == []
 
     relearned = load_wordlist(source)
@@ -137,9 +137,9 @@ def test_remove_word_from_wordlist_removes_diacritic_spelling(tmp_path: Path) ->
     source = tmp_path / "lijst.txt"
     _ = source.write_text("kat\nfaçade\nkamer\n", encoding="utf-8")
 
-    assert remove_word_from_wordlist("FACADE", source)
+    assert remove_word_from_wordlist("FACADE", source, actor="feutsolver")
     assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
-    assert not remove_word_from_wordlist("FACADE", source)
+    assert not remove_word_from_wordlist("FACADE", source, actor="feutsolver")
     assert not load_wordlist(source).contains("FACADE")
 
 
@@ -147,10 +147,31 @@ def test_remove_words_from_wordlist_updates_a_bulk_selection_atomically(tmp_path
     source = tmp_path / "lijst.txt"
     _ = source.write_text("kat\nfaçade\nkamer\nGINS\n", encoding="utf-8")
 
-    removed = remove_words_from_wordlist(["FACADE", "gins", "gins", "niet aanwezig"], source)
+    removed = remove_words_from_wordlist(
+        ["FACADE", "gins", "gins", "niet aanwezig"], source, actor="feutsolver"
+    )
 
     assert removed == ["FACADE", "GINS"]
     assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
+
+
+def test_wordlist_mutations_follow_deployment_symlink(tmp_path: Path) -> None:
+    deploy_root = tmp_path / "deploy"
+    shared_wordlist = deploy_root / "data" / "opentaal-wordlist.txt"
+    release_wordlist = deploy_root / "releases" / "release-1" / "data" / "opentaal-wordlist.txt"
+    shared_wordlist.parent.mkdir(parents=True)
+    release_wordlist.parent.mkdir(parents=True)
+    shared_wordlist.write_text("kat\ngin\n", encoding="utf-8")
+    release_wordlist.symlink_to("../../../data/opentaal-wordlist.txt")
+
+    assert add_words_to_wordlist(["nieuw"], release_wordlist, actor="feutsolver") == ["NIEUW"]
+    assert release_wordlist.is_symlink()
+    assert "nieuw" in shared_wordlist.read_text(encoding="utf-8").splitlines()
+
+    assert remove_words_from_wordlist(["gin"], release_wordlist, actor="feutsolver") == ["GIN"]
+    assert release_wordlist.is_symlink()
+    assert "gin" not in shared_wordlist.read_text(encoding="utf-8").splitlines()
+    assert (deploy_root / ".wordlist.lock").stat().st_mode & 0o777 == 0o664
 
 
 def test_generate_moves_can_exclude_main_words_without_rebuilding_lexicon() -> None:
@@ -191,7 +212,7 @@ def test_removed_words_do_not_return_in_new_suggestions(tmp_path: Path) -> None:
     assert any(move.word == "GINS" for move in before)
 
     for word in parse_comma_separated_words("gins, gin"):
-        assert remove_word_from_wordlist(word, source)
+        assert remove_word_from_wordlist(word, source, actor="feutsolver")
 
     after = generate_moves(state, load_wordlist(source), limit=20)
     assert not any(word in {move.word, *move.cross_words} for move in after for word in {"GINS", "GIN"})
@@ -208,7 +229,7 @@ def test_a_confirmed_word_makes_a_move_possible_that_was_rejected_before(tmp_pat
 
     assert suggest_words(["ZQX", "GINS"], source) == ["GINS", "ZQX"]
     assert "gins" not in source.read_text(encoding="utf-8").splitlines()
-    _ = add_words_to_wordlist(["ZQX", "GINS"], source)
+    _ = add_words_to_wordlist(["ZQX", "GINS"], source, actor="feutsolver")
     after = load_wordlist(source)
     assert after.contains("ZQX")
     assert after.contains("GINS")

@@ -33,7 +33,7 @@ OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `fa�
 
 De app toont naast de beste zet vijf alternatieven. Selecteer een suggestie om het voorbeeld op het interactieve bord te wisselen; alleen de nieuwe stenen zijn groen gemarkeerd.
 
-Onder de suggesties kun je één of meer voorgestelde woorden of bijbehorende kruiswoorden, kommagescheiden, insturen om ze permanent uit de geconfigureerde woordenlijst te verwijderen. De app sluit alle opgegeven woorden eerst alleen tijdens de herberekening uit, zodat nieuwe suggesties direct zichtbaar worden zonder die woorden. Daarna verwijdert één achtergrondactie de woorden in bulk uit de woordenlijst en bouwt de cache pas bij een volgende berekening opnieuw op. Het invoerveld blijft tijdens die update tijdelijk geblokkeerd. Staat een woord ook in de lijst met geleerde bordwoorden, dan wordt die kopie eveneens verwijderd.
+Onder de suggesties kun je één of meer voorgestelde woorden of bijbehorende kruiswoorden, kommagescheiden, insturen om ze permanent uit de geconfigureerde woordenlijst te verwijderen. De app sluit alle opgegeven woorden eerst alleen tijdens de herberekening uit, zodat nieuwe suggesties direct zichtbaar worden zonder die woorden. Daarna verwijdert één achtergrondactie de woorden in bulk uit de woordenlijst en wordt de cache na een geslaagde mutatie direct ongeldig gemaakt; de deployment bouwt hem opnieuw op vóór de release actief wordt. Het invoerveld blijft tijdens die update tijdelijk geblokkeerd. De woordenlijstschrijfacties gebruiken dezelfde bestandslock als de deploymerge, zodat een productie-aanpassing niet midden in een deploy verloren gaat.
 
 Na het inladen van een schermafbeelding wordt niet automatisch een zet geplaatst: controleer eerst het zichtbare bord en kies daarna bewust `Geef oplossingen weer`. De lokale route rapporteert gemeten zekerheid per uitlezing, niet langer een vaste waarde. Onder 80% toont de app expliciet een waarschuwing.
 
@@ -72,9 +72,15 @@ Gebruik alleen bij `auto` of `openrouter` in de zijbalk `openai/gpt-4.1-mini` (s
 
 ## Productie-uitrol
 
-De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De workflow heeft alleen `workflow_dispatch`: een commit of push naar `main` start dus nooit een deploy. Op de server bewaakt de ingeschakelde systemd-unit `feutsolver.path` het deploypad; na een bestandswijziging start die `feutsolver-restart.service`, die na 20 seconden `feutsolver.service` herstart. Daarom heeft GitHub Actions geen restart-secret of sudo-rechten nodig.
+De productie-uitrol wordt uitsluitend handmatig gestart via de GitHub Actions-workflow `Deploy Wordfeud Analyzer`. De workflow heeft alleen `workflow_dispatch`: een commit of push naar `main` start dus nooit een deploy. De workflow test de exacte commit, gebruikt de gehashte lockfiles, maakt een SBOM en schrijft naar `releases/<commit-sha>`. Pas na een geslaagde upload wordt de symlink `current` atomair omgeschakeld; `current.previous` en oudere releases blijven beschikbaar voor rollback.
 
-De ondersteunde handmatige route is de GitHub CLI. Controleer eerst dat `gh auth status` een actieve GitHub-sessie toont en start vervolgens de workflow voor de gepushte `main`-branch:
+Configureer `feutsolver.service` met `WorkingDirectory=<DEPLOY_PATH>/current`, `EnvironmentFile=/etc/feutsolver/feutsolver.env` en Streamlit op `127.0.0.1:8501`; [`ops/feutsolver.env.example`](ops/feutsolver.env.example) legt de productie-defaults vast. Apache is de enige publieke ingang; directe externe toegang tot poort 8501 hoort door binding en firewall onmogelijk te zijn. De deploybestanden [`ops/feutsolver-auth-vhost.patch`](ops/feutsolver-auth-vhost.patch), [`ops/feutsolver-fail2ban.filter`](ops/feutsolver-fail2ban.filter) en [`ops/feutsolver-fail2ban.jail`](ops/feutsolver-fail2ban.jail) beschrijven identity-forwarding, logout, korte sessies, generieke loginfouten en brute-forceblokkade. Gebruik unieke Apache-accounts: alleen de exacte actor `feutsolver` mag in productie de woordenlijst wijzigen; een ontbrekende of onbetrouwbare identiteit is altijd read-only.
+
+De deployworkflow bouwt de lexiconcache met de interpreter van de service: standaard `<DEPLOY_PATH>/venv/bin/python`. Als de service een andere virtualenv gebruikt, zet dan repository-variable `FEUTSOLVER_SERVICE_PYTHON`; zet `FEUTSOLVER_SERVICE_USER` op de effectieve systemd-gebruiker als dat niet `www-data` is. De deploygebruiker moet die gebruiker zonder wachtwoord kunnen gebruiken voor de lock-schrijftest; zonder die controle wordt de deploy afgebroken.
+
+`data/opentaal-wordlist.txt` wordt niet als gewone releasefile gekopieerd. De deployworkflow staged de repositorylijst op de server en voert daar een deletion-aware three-way merge uit met de productieversie. De server bewaart hiervoor in `.wordlist-sync/` de vorige repository-invoer en de vorige samengevoegde productie-uitvoer. Nieuwe woorden uit beide kanten blijven behouden; verwijderingen uit beide kanten winnen, zodat een productie-uitsluiting niet bij een volgende deploy terugkomt. De workflow gebruikt alleen bij de eerste merge de handmatige input `wordlist_base_revision` (standaard de laatst gedocumenteerde productiecommit); daarna is de serverstatus leidend als merge-basis.
+
+Rollback zonder nieuwe build gebeurt door op de server een eerdere release te activeren, bijvoorbeeld met `ln -sfn releases/<commit-sha> <DEPLOY_PATH>/current.next && mv -Tf <DEPLOY_PATH>/current.next <DEPLOY_PATH>/current`. Controleer daarna de service en de release-manifest/SBOM. De ondersteunde handmatige route is de GitHub CLI. Controleer eerst dat `gh auth status` een actieve GitHub-sessie toont en start vervolgens de workflow voor de gepushte `main`-branch:
 
 ```bash
 gh workflow run deploy.yml --repo shifthappens/feutsolver --ref main
@@ -99,6 +105,11 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 ## Privacy en betrouwbaarheid
 
 - Bij de standaard lokale route verlaat de schermafbeelding de server niet. Alleen met `auto` na een lokale OCR-fout of met `openrouter` gaat het beeld naar het gekozen beeldmodel.
+- Uploads zijn begrensd op 2 MB en worden vóór OCR door de echte beelddecoder gecontroleerd op formaat, afmetingen, pixels en decoderwaarschuwingen. Het beeld wordt één keer naar een metadata-vrije interne RGB-PNG genormaliseerd; tijdelijke bestanden worden ook na fouten en timeouts verwijderd.
+- Externe OCR vereist een expliciete toestemming in de app. Alleen de noodzakelijke genormaliseerde afbeelding wordt verstuurd; externe requests hebben een timeout, requestbudget en kosten-/tokenbegrenzing.
+- Browseropslag is per geauthenticeerde actor gescopeerd; een sessie zonder betrouwbare identiteit krijgt een eigen tijdelijke namespace en deelt geen opgeslagen spellen. De knop `Lokale gegevens wissen` verwijdert de opgeslagen spellen van die browsernamespace; logout beëindigt de Apache-sessie en maakt de appinhoud niet-cachebaar.
+- De productiecache voor de GADDAG wordt tijdens deployment opgebouwd en is tijdens runtime read-only. Bij beschadiging wordt veilig in geheugen herbouwd en volgt een auditlog; de volgende release bouwt de persistente cache opnieuw.
+- De Apache-sessie gebruikt een versleutelde clientcookie met een maximale levensduur van drie dagen. Logout expireert die cookie; een gekopieerde cookie kan door deze client-side sessieopzet niet tussentijds server-side worden ingetrokken en blijft daarom maximaal binnen die termijn geldig.
 - Zet de sleutel in een omgevingsvariabele of Streamlit secrets, nooit in Git. `.env` staat in `.gitignore`.
 - De app gebruikt een bezet bord pas wanneer de lokale geometrie en glyph-uitlezing volledig zijn. Blijf het getoonde bord vergelijken met je schermafbeelding voordat je een zet speelt: een verkeerd gelezen bonusvak geeft vanzelfsprekend een verkeerd puntenaantal.
 
@@ -107,6 +118,7 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 ```bash
 python -m pytest -q
 node --test frontend/board.test.js
+python ops/check_lockfiles.py
 ```
 
-De Python-tests controleren onder andere de standaardbonusindeling, lege rekken, zettoepassing, rekverbruik, blanco's, verouderde oplossingsresultaten en atomische vervanging na het inladen. De JavaScript-tests controleren de bord- en rekbewerker, richting, wissen, voorbeeldvergrendeling en de opslagfuncties voor de browseropslag.
+De Python-tests controleren onder andere de standaardbonusindeling, lege rekken, zettoepassing, rekverbruik, blanco's, verouderde oplossingsresultaten, actor-autorisatie, corrupte/te grote uploads, begrensde OCR-budgetten, cache-integriteit en atomische vervanging na het inladen. De JavaScript-tests controleren de bord- en rekbewerker, richting, wissen, voorbeeldvergrendeling en de opslagfuncties voor de per-actor gescopeerde browseropslag.

@@ -116,6 +116,20 @@ test("save CRUD enforces unique names and skips corrupt records", () => {
   assert.equal(WF.deleteSave(storage, first.record.id).ok, true);
 });
 
+test("saved games are isolated by authenticated storage namespace", () => {
+  const storage = memoryStorage();
+  assert.equal(WF.saveSnapshot(storage, "A", snapshot(["A"]), null, "alice").ok, true);
+  assert.equal(WF.saveSnapshot(storage, "B", snapshot(["B"]), null, "bob").ok, true);
+  assert.equal(WF.readSaves(storage, "alice").records.length, 1);
+  assert.equal(WF.readSaves(storage, "alice").records[0].name, "A");
+  assert.equal(WF.readSaves(storage, "bob").records[0].name, "B");
+  assert.notEqual(WF.scopedKey(WF.STORAGE_KEY, "alice"), WF.scopedKey(WF.STORAGE_KEY, "bob"));
+
+  assert.equal(WF.clearSaves(storage, "alice").ok, true);
+  assert.equal(WF.readSaves(storage, "alice").records.length, 0);
+  assert.equal(WF.readSaves(storage, "bob").records.length, 1);
+});
+
 test("save reload restores the complete snapshot and rejects malformed storage safely", () => {
   const storage = memoryStorage();
   const source = snapshot(["?", "A"]);

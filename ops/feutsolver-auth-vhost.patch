@@ -1,6 +1,6 @@
 --- /etc/apache2/sites-available/coen.at-le-ssl.conf
 +++ /etc/apache2/sites-available/coen.at-le-ssl.conf
-@@ -14,6 +14,34 @@
+@@ -14,6 +14,75 @@
 -    <Location /feutsolver/>
 -        AuthType Basic
 -        AuthName "Wordfeud Analyzer"
@@ -8,10 +8,21 @@
 -        Require valid-user
 -    </Location>
 +    Alias /feutsolver-login /var/lib/feutsolver/feutsolver-login.html
++    Alias /feutsolver-login.css /var/lib/feutsolver/feutsolver-login.css
 +
 +    <Location /feutsolver-login>
++        Header always set Cache-Control "no-store"
 +        Require all granted
 +    </Location>
++
++    # Remove browser-supplied identity aliases before authentication.  The
++    # canonical header is set later from Apache's authenticated REMOTE_USER.
++    RequestHeader unset X-Authenticated-User early
++    RequestHeader unset Remote-User early
++    RequestHeader unset X-Remote-User early
++    RequestHeader unset X-Auth-User early
++    RequestHeader unset X-User early
++    LogLevel auth_form:info auth_basic:info
 +
 +    <Location /feutsolver-login-submit>
 +        SetHandler form-login-handler
@@ -22,10 +33,30 @@
 +        AuthFormLoginRequiredLocation "/feutsolver-login"
 +        AuthFormLoginSuccessLocation "/feutsolver/"
 +        Session On
-+        SessionMaxAge 2592000
-+        SessionCookieName feutsolver_session path=/feutsolver/;httponly;secure;samesite=lax
++        SessionMaxAge 259200
++        # mod_session stores this encrypted session client-side; the short TTL
++        # limits the window for a copied cookie because there is no server-side
++        # token-revocation store in this vhost.
++        SessionCookieName feutsolver_session path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
 +        SessionCookieRemove On
++        Header always set Cache-Control "no-store"
++    </Location>
++
++    <Location /feutsolver-logout>
++        SetHandler form-logout-handler
++        AuthType form
++        AuthName "feutsolver"
++        AuthFormLogoutLocation "/feutsolver-login"
++        Session On
++        # Make a logout response authoritative immediately; the browser also
++        # receives an explicit expired cookie from mod_session.
++        SessionMaxAge 1
++        SessionCookieName feutsolver_session path=/;httponly;secure;samesite=lax
++        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
++        SessionCookieRemove On
++        Header always set Cache-Control "no-store"
++        Require all granted
 +    </Location>
 +
 +    <Location /feutsolver/>
@@ -35,9 +66,19 @@
 +        AuthName "feutsolver"
 +        AuthFormLoginRequiredLocation "/feutsolver-login"
 +        Session On
-+        SessionMaxAge 2592000
-+        SessionCookieName feutsolver_session path=/feutsolver/;httponly;secure;samesite=lax
++        SessionMaxAge 259200
++        SessionCookieName feutsolver_session path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
 +        SessionCookieRemove On
++        RequestHeader set X-Authenticated-User expr=%{REMOTE_USER}
++        Header always set Cache-Control "no-store"
++        # Start in report-only mode, review Streamlit/websocket reports, then
++        # promote this same policy to Content-Security-Policy enforcement.
++        Header always set Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss: https:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
++        Header always set Strict-Transport-Security "max-age=31536000"
++        Header always set X-Content-Type-Options "nosniff"
++        Header always set Referrer-Policy "strict-origin-when-cross-origin"
++        Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
 +        Require valid-user
 +    </Location>
++

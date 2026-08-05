@@ -1,0 +1,5 @@
+# Development and CI tools. The production lock remains the deploy boundary.
+-r requirements-prod.in
+pip-audit==2.10.0
+detect-secrets==1.5.0
+pytest==9.1.1

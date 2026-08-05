@@ -4,8 +4,10 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
+import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -25,6 +27,16 @@ from wordfeud_analyzer.move_generator import (
     remove_words_from_wordlist,
     suggest_words,
 )
+from wordfeud_analyzer.security import (
+    ResourceLimitError,
+    authenticated_actor,
+    file_version,
+    log_security_event,
+    may_mutate_production_wordlist,
+    new_correlation_id,
+    redact_text,
+    resource_slot,
+)
 from wordfeud_analyzer.state import (
     InvalidSolveRequest,
     StaleSolveRequest,
@@ -35,13 +47,17 @@ from wordfeud_analyzer.state import (
     replace_from_upload,
     validate_snapshot,
 )
-from wordfeud_analyzer.vision import VisionExtractionError, extract_board
+from wordfeud_analyzer.vision import ImageValidationError, VisionExtractionError, extract_board
+
+LOGGER = logging.getLogger("feutsolver.app")
 
 st.set_page_config(page_title="Wordfeud-oplosser", page_icon="🔤", layout="wide")
 
 configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wordlist.txt"))
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
+MAX_COMPONENT_MESSAGE_BYTES = 256 * 1024
+ALLOWED_COMPONENT_EVENTS = {"new_board", "solve_request", "cancel", "load", "place_request"}
 FRONTEND = Path(__file__).parent / "frontend"
 wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
 
@@ -56,27 +72,27 @@ def secret_or_env(name: str, default: str = "") -> str:
         return default
 
 
-@st.cache_resource(show_spinner=False)
-def get_lexicon(path: str, source_signature: tuple[int, ...]) -> Gaddag:
+@st.cache_resource(show_spinner=False, max_entries=1)
+def get_lexicon(path: str, source_signature: tuple[object, ...]) -> Gaddag:
     _ = source_signature
     return load_wordlist(path)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def wordlist_update_executor() -> ThreadPoolExecutor:
     """Serialize dictionary writes without blocking suggestion rendering."""
     return ThreadPoolExecutor(max_workers=1, thread_name_prefix="wordfeud-wordlist")
 
 
-def lexicon_signature() -> tuple[int, ...]:
-    values: list[int] = []
+def lexicon_signature() -> tuple[object, ...]:
+    values: list[object] = []
     for path in (DEFAULT_WORDLIST,):
         try:
             stat = path.stat()
         except OSError:
-            values.extend((0, 0))
+            values.extend((0, 0, ""))
         else:
-            values.extend((stat.st_mtime_ns, stat.st_size))
+            values.extend((stat.st_mtime_ns, stat.st_size, file_version(path) or ""))
     return tuple(values)
 
 
@@ -86,6 +102,24 @@ def configured_lexicon() -> Gaddag:
 
 
 def initialise_session() -> None:
+    actor = current_actor()
+    if st.session_state.get("_actor_initialized", False) and st.session_state.get("authenticated_actor") != actor:
+        # Never reuse board state or solve results after an identity change or
+        # an authenticated reconnect.
+        st.session_state.working_state = standard_board().model_dump(mode="json")
+        st.session_state.solve_result = None
+        st.session_state.confidence = None
+        st.session_state.word_suggestions = []
+        st.session_state.component_response = None
+        st.session_state.upload_signature = None
+        st.session_state.upload_error_signature = None
+        st.session_state.upload_feedback = None
+        st.session_state.external_ocr_consent = False
+        st.session_state.pop("external_ocr_consent_checkbox", None)
+        st.session_state.anonymous_storage_namespace = uuid4().hex
+        st.session_state.board_version = st.session_state.get("board_version", 0) + 1
+    st.session_state.authenticated_actor = actor
+    st.session_state._actor_initialized = True
     if "working_state" not in st.session_state:
         st.session_state.working_state = standard_board().model_dump(mode="json")
     st.session_state.setdefault("solve_result", None)
@@ -101,6 +135,9 @@ def initialise_session() -> None:
     st.session_state.setdefault("replacement_update_future", None)
     st.session_state.setdefault("replacement_update_words", [])
     st.session_state.setdefault("replacement_update_feedback", None)
+    st.session_state.setdefault("replacement_update_feedback_error", False)
+    st.session_state.setdefault("external_ocr_consent", False)
+    st.session_state.setdefault("anonymous_storage_namespace", uuid4().hex)
 
 
 def current_state() -> BoardState:
@@ -115,8 +152,40 @@ def response(kind: str, **payload: Any) -> None:
     st.session_state.component_response = {"kind": kind, **payload}
 
 
+def current_actor() -> str | None:
+    try:
+        # Keep StreamlitHeaders intact: dict() collapses repeated headers and
+        # would make duplicate identity headers indistinguishable from one.
+        return authenticated_actor(st.context.headers)
+    except Exception:
+        return None
+
+
+def safe_error_code(error: BaseException, default: str) -> str:
+    code = getattr(error, "code", None)
+    return str(code) if isinstance(code, str) and code else default
+
+
+def public_error(code: str, correlation_id: str, explanation: str = "Er is een interne fout opgetreden.") -> str:
+    """Return a browser-safe error without exception text or implementation details."""
+    return f"{explanation} Foutcode {code}; correlatie-ID {correlation_id}."
+
+
+def log_failure(*, event: str, correlation_id: str, actor: str | None, action: str, error: BaseException) -> None:
+    log_security_event(
+        event=event,
+        correlation_id=correlation_id,
+        actor=actor,
+        action=action,
+        result="error",
+        error_category=type(error).__name__,
+        error_reason=redact_text(error),
+    )
+
+
 def solve_state(state: BoardState, excluded_words: Iterable[str] = ()) -> list[Move]:
-    return generate_moves(state, configured_lexicon(), limit=6, excluded_words=excluded_words)
+    with resource_slot("solver", timeout_seconds=0.5):
+        return generate_moves(state, configured_lexicon(), limit=6, excluded_words=excluded_words)
 
 
 def replacement_update_active() -> bool:
@@ -124,25 +193,38 @@ def replacement_update_active() -> bool:
     return st.session_state.get("replacement_update_future") is not None
 
 
-def queue_wordlist_update(words: Iterable[str]) -> bool:
+def queue_wordlist_update(words: Iterable[str], *, actor: str | None) -> bool:
     """Write replacement exclusions in the background after solving them out."""
     if replacement_update_active():
         return False
+    correlation_id = new_correlation_id()
     normalised_words = tuple(words)
+    if not may_mutate_production_wordlist(actor):
+        st.session_state.replacement_update_feedback_error = True
+        st.session_state.replacement_update_feedback = public_error(
+            "WORDLIST-DENIED", correlation_id,
+            "Je mag de productiewoordenlijst niet wijzigen.",
+        )
+        return False
     try:
         future = wordlist_update_executor().submit(
             remove_words_from_wordlist,
             normalised_words,
             DEFAULT_WORDLIST,
+            actor=actor,
+            correlation_id=correlation_id,
         )
     except Exception as error:
-        st.session_state.replacement_update_feedback = (
-            f"De woordenlijst kon niet worden bijgewerkt ({error})."
+        st.session_state.replacement_update_feedback_error = True
+        log_failure(event="wordlist_update_queue", correlation_id=correlation_id, actor=actor, action="remove", error=error)
+        st.session_state.replacement_update_feedback = public_error(
+            "WORDLIST-QUEUE", correlation_id, "De woordenlijst kon niet worden bijgewerkt.",
         )
         return False
     st.session_state.replacement_update_future = future
     st.session_state.replacement_update_words = list(normalised_words)
     st.session_state.replacement_update_feedback = None
+    st.session_state.replacement_update_feedback_error = False
     return True
 
 
@@ -158,9 +240,15 @@ def poll_wordlist_update() -> bool:
     try:
         removed = set(cast(list[str], future.result()))
     except Exception as error:
+        correlation_id = new_correlation_id()
+        log_failure(event="wordlist_update", correlation_id=correlation_id, actor=current_actor(), action="remove", error=error)
         get_lexicon.clear()
         st.session_state.solve_result = None
-        response("solve_error", error=f"De woordenlijst kon niet worden bijgewerkt ({error}).")
+        response(
+            "solve_error",
+            error=public_error(safe_error_code(error, "WORDLIST-UPDATE"), correlation_id),
+        )
+        st.session_state.replacement_update_feedback_error = True
         return True
 
     get_lexicon.clear()
@@ -177,6 +265,7 @@ def poll_wordlist_update() -> bool:
     st.session_state.replacement_update_feedback = (
         "De woordenlijst is bijgewerkt; de uitgesloten woorden blijven uit de suggesties."
     )
+    st.session_state.replacement_update_feedback_error = False
     return True
 
 
@@ -188,18 +277,34 @@ def handle_component_event(event: object) -> None:
     if not isinstance(event, dict):
         return
     message = cast(dict[str, object], event)
+    kind = message.get("type")
+    if not isinstance(kind, str) or kind not in ALLOWED_COMPONENT_EVENTS:
+        return
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return
     # Streamlit can replay the last component value after a rerun. Deduplicate
     # the complete message rather than only the client id: a remounted iframe
     # may restart its local counter, while a new event can legitimately reuse
     # that number.
-    event_signature = json.dumps(message, sort_keys=True, separators=(",", ":"))
+    try:
+        event_signature = json.dumps(message, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return
+    if len(event_signature.encode("utf-8")) > MAX_COMPONENT_MESSAGE_BYTES:
+        correlation_id = new_correlation_id()
+        log_security_event(
+            event="component_message",
+            correlation_id=correlation_id,
+            actor=current_actor(),
+            action=kind,
+            result="rejected",
+            error_category="payload_too_large",
+        )
+        return
     if event_signature == st.session_state.last_component_event_signature:
         return
     st.session_state.last_component_event_signature = event_signature
-    kind = message.get("type")
-    payload = message.get("payload")
-    if not isinstance(payload, dict):
-        payload = {}
     event_version = payload.get("boardVersion")
     if not is_current_board_version(event_version, st.session_state.board_version):
         return
@@ -234,8 +339,13 @@ def handle_component_event(event: object) -> None:
                 st.rerun()
             moves = solve_state(state)
         except Exception as error:
+            correlation_id = new_correlation_id()
+            log_failure(event="solve", correlation_id=correlation_id, actor=current_actor(), action="solve", error=error)
             st.session_state.solve_result = None
-            response("solve_error", error=f"De zetten konden niet worden berekend: {error}")
+            response(
+                "solve_error",
+                error=public_error(safe_error_code(error, "SOLVER-ERROR"), correlation_id),
+            )
             st.rerun()
         if not moves:
             st.session_state.solve_result = None
@@ -266,16 +376,32 @@ def handle_component_event(event: object) -> None:
         try:
             committed = apply_place_request(state, solve_result, payload)
         except StaleSolveRequest as error:
+            correlation_id = new_correlation_id()
+            log_failure(event="place_request", correlation_id=correlation_id, actor=current_actor(), action="stale", error=error)
             st.session_state.solve_result = None
-            response("place_result", ok=False, error=str(error))
+            response(
+                "place_result", ok=False,
+                error=public_error("PLACE-STALE", correlation_id, "Deze zet is verouderd; kies opnieuw een suggestie."),
+            )
             st.rerun()
         except InvalidSolveRequest as error:
+            correlation_id = new_correlation_id()
+            log_failure(event="place_request", correlation_id=correlation_id, actor=current_actor(), action="invalid", error=error)
             st.session_state.solve_result = None
-            response("place_result", ok=False, error=str(error))
+            response(
+                "place_result", ok=False,
+                error=public_error("PLACE-INVALID", correlation_id, "De geselecteerde zet was ongeldig."),
+            )
             st.rerun()
         except ValueError as error:
+            correlation_id = new_correlation_id()
+            log_failure(event="place_request", correlation_id=correlation_id, actor=current_actor(), action="place", error=error)
             st.session_state.solve_result = None
-            response("place_result", ok=False, error=f"De zet kon niet worden geplaatst: {error}")
+            response(
+                "place_result",
+                ok=False,
+                error=public_error("PLACE-INVALID", correlation_id, "De zet kon niet worden geplaatst."),
+            )
             st.rerun()
         set_state(committed)
         st.session_state.solve_result = None
@@ -288,7 +414,39 @@ def process_upload() -> None:
     upload = st.session_state.get("current_upload")
     if upload is None:
         return
+    correlation_id = new_correlation_id()
+    actor = current_actor()
+    if int(getattr(upload, "size", 0) or 0) > MAX_UPLOAD_BYTES:
+        signature = (str(upload.name), int(upload.size), str(getattr(upload, "file_id", "")), "oversize")
+        if signature == st.session_state.upload_error_signature:
+            return
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = "Foutcode IMG-SIZE: deze schermafbeelding is groter dan 2 MB."
+        log_security_event(
+            event="upload",
+            correlation_id=correlation_id,
+            actor=actor,
+            action="decode",
+            result="rejected",
+            error_category="byte_limit",
+        )
+        return
     upload_bytes = upload.getvalue()
+    if len(upload_bytes) > MAX_UPLOAD_BYTES:
+        signature = (str(upload.name), len(upload_bytes), str(getattr(upload, "file_id", "")), "oversize")
+        if signature == st.session_state.upload_error_signature:
+            return
+        st.session_state.upload_error_signature = signature
+        st.session_state.upload_feedback = "Foutcode IMG-SIZE: deze schermafbeelding is groter dan 2 MB."
+        log_security_event(
+            event="upload",
+            correlation_id=correlation_id,
+            actor=actor,
+            action="decode",
+            result="rejected",
+            error_category="byte_limit",
+        )
+        return
     signature = (
         str(upload.name),
         int(upload.size),
@@ -297,26 +455,21 @@ def process_upload() -> None:
     )
     if signature in {st.session_state.upload_signature, st.session_state.upload_error_signature}:
         return
-    if upload.size > MAX_UPLOAD_BYTES:
-        st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = "Deze schermafbeelding is groter dan 2 MB. Exporteer of deel hem kleiner en probeer opnieuw."
-        return
     ocr_backend = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
     api_key = secret_or_env("OPENROUTER_API_KEY")
     if ocr_backend not in {"local", "auto", "openrouter"}:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = (
-            f"Onbekende OCR-backend `{ocr_backend}`. Gebruik local, auto of openrouter."
-        )
+        st.session_state.upload_feedback = "Foutcode OCR-CONFIG: de OCR-backend is niet geldig geconfigureerd."
         return
     if ocr_backend == "openrouter" and not api_key:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = "De OpenRouter API-sleutel is niet op de server geconfigureerd."
+        st.session_state.upload_feedback = "Foutcode OCR-CONFIG: externe OCR is niet beschikbaar."
         return
-    suffix = Path(cast(str, upload.name)).suffix or ".png"
     temporary_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
+        # No client-controlled suffix is used. The vision module verifies the
+        # actual decoder format and creates its own normalized internal PNG.
+        with tempfile.NamedTemporaryFile(prefix="feutsolver-upload-", delete=False) as temporary:
             temporary.write(upload_bytes)
             temporary_path = Path(temporary.name)
         extraction = extract_board(
@@ -324,6 +477,10 @@ def process_upload() -> None:
             api_key=api_key,
             model=secret_or_env("OPENROUTER_VISION_MODEL", "openai/gpt-4.1-mini"),
             backend=ocr_backend,
+            allow_external=bool(st.session_state.get("external_ocr_consent", False)),
+            # External OCR must be attributable to the authenticated actor;
+            # never turn a missing identity into a synthetic requester.
+            requester=actor,
         )
         # Replace the complete working state only after extraction succeeds.
         set_state(replace_from_upload(current_state(), extraction))
@@ -339,19 +496,39 @@ def process_upload() -> None:
         st.session_state.upload_feedback = "Schermafbeelding geladen; controleer het bord en vul zo nodig handmatig aan."
     except VisionExtractionError as error:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = str(error)
+        error_code = safe_error_code(error, "OCR-REJECTED")
+        log_failure(event="upload", correlation_id=correlation_id, actor=actor, action="ocr", error=error)
+        st.session_state.upload_feedback = public_error(
+            error_code, correlation_id, "De schermafbeelding kon niet worden verwerkt.",
+        )
+    except ResourceLimitError as error:
+        st.session_state.upload_error_signature = signature
+        error_code = safe_error_code(error, "OCR-LIMIT")
+        log_failure(event="upload", correlation_id=correlation_id, actor=actor, action="ocr", error=error)
+        st.session_state.upload_feedback = public_error(
+            error_code, correlation_id, "De OCR-resources zijn tijdelijk begrensd.",
+        )
     except Exception as error:
         st.session_state.upload_error_signature = signature
-        st.session_state.upload_feedback = f"De schermafbeelding kon niet worden verwerkt: {error}"
+        log_failure(event="upload", correlation_id=correlation_id, actor=actor, action="ocr", error=error)
+        st.session_state.upload_feedback = public_error(
+            "OCR-INTERNAL", correlation_id, "De schermafbeelding kon niet worden verwerkt.",
+        )
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
 
 
 def render_replacement_form() -> None:
+    actor = current_actor()
+    if not may_mutate_production_wordlist(actor):
+        return
     feedback = st.session_state.get("replacement_update_feedback")
     if feedback:
-        st.success(feedback)
+        if st.session_state.get("replacement_update_feedback_error", False):
+            st.error(feedback)
+        else:
+            st.success(feedback)
     solve_result = st.session_state.get("solve_result")
     if not isinstance(solve_result, dict) or not solve_result.get("moves"):
         return
@@ -394,10 +571,12 @@ def render_replacement_form() -> None:
         # update has finished.
         moves = solve_state(state, excluded_words=entered_words)
     except Exception as error:
-        st.error(f"De vervangende suggestie kon niet worden berekend: {error}")
+        correlation_id = new_correlation_id()
+        log_failure(event="replacement_solve", correlation_id=correlation_id, actor=actor, action="solve", error=error)
+        st.error(public_error("SOLVER-ERROR", correlation_id, "De vervangende suggestie kon niet worden berekend."))
         return
     if not moves:
-        if not queue_wordlist_update(entered_words):
+        if not queue_wordlist_update(entered_words, actor=actor):
             st.error(st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.")
             return
         st.session_state.solve_result = None
@@ -412,7 +591,7 @@ def render_replacement_form() -> None:
             + "."
         )
         return
-    if not queue_wordlist_update(entered_words):
+    if not queue_wordlist_update(entered_words, actor=actor):
         st.error(st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.")
         return
     st.session_state.solve_result = next_solve_result
@@ -429,6 +608,9 @@ def render_wordlist_update_status() -> None:
 
 
 def render_word_suggestions() -> None:
+    actor = current_actor()
+    if not may_mutate_production_wordlist(actor):
+        return
     suggestions = list(st.session_state.get("word_suggestions", []))
     if not suggestions:
         return
@@ -450,10 +632,16 @@ def render_word_suggestions() -> None:
         st.warning("Selecteer minstens één woord om toe te voegen.")
         return
     try:
-        added = add_words_to_wordlist(selected, DEFAULT_WORDLIST)
-    except OSError as error:
-        st.error(f"De geselecteerde woorden konden niet worden toegevoegd ({error}).")
+        added = add_words_to_wordlist(selected, DEFAULT_WORDLIST, actor=actor, correlation_id=new_correlation_id())
+    except Exception as error:
+        correlation_id = new_correlation_id()
+        log_failure(
+            event="wordlist_mutation", correlation_id=correlation_id, actor=actor,
+            action="add", error=error,
+        )
+        st.error(public_error(safe_error_code(error, "WORDLIST-ADD"), correlation_id, "De woordenlijst kon niet worden bijgewerkt."))
         return
+    get_lexicon.clear()
     st.session_state.word_suggestions = suggest_words(suggestions, DEFAULT_WORDLIST)
     st.session_state.solve_result = None
     if added:
@@ -466,7 +654,13 @@ def render_word_suggestions() -> None:
 initialise_session()
 if poll_wordlist_update():
     st.rerun()
+actor = current_actor()
 st.title("Wordfeud-oplosser")
+if actor:
+    st.caption(f"Ingelogd als {actor}.")
+else:
+    st.warning("Foutcode AUTH-001: betrouwbare identiteit ontbreekt; alleen lezen en oplossen is beschikbaar.")
+st.link_button("Uitloggen", "/feutsolver-logout")
 st.caption("Een meeschalend, interactief bord: bewerk lokaal en laat Python de schermafbeelding, zetten en punten controleren.")
 st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
@@ -477,6 +671,21 @@ upload = st.file_uploader(
     key=f"current_upload_{st.session_state.upload_key}",
 )
 st.session_state.current_upload = upload
+ocr_backend_for_notice = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
+if ocr_backend_for_notice in {"auto", "openrouter"}:
+    consent = st.checkbox(
+        "Ik geef toestemming voor optionele externe OCR via OpenRouter.",
+        value=False,
+        key="external_ocr_consent_checkbox",
+        help=(
+            "Als lokale OCR niet volstaat, wordt alleen de genormaliseerde bord-/rekafbeelding "
+            "naar OpenRouter gestuurd voor letterherkenning. Dit is optioneel; de provider en "
+            "bewaartermijn vallen onder het beleid van OpenRouter. De afbeelding wordt daarna verwijderd."
+        ),
+    )
+    st.session_state.external_ocr_consent = consent
+else:
+    st.session_state.external_ocr_consent = False
 process_upload()
 
 state = current_state()
@@ -500,6 +709,7 @@ event = wordfeud_board(
     mode="preview" if st.session_state.solve_result else "edit",
     solve_result=st.session_state.solve_result,
     response=component_response,
+    storage_namespace=actor or st.session_state.anonymous_storage_namespace,
     default=None,
     key="wordfeud-board",
 )

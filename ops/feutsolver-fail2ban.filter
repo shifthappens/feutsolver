@@ -1,0 +1,7 @@
+[Definition]
+# Validate this filter against the target Apache auth_form log format before
+# enabling it. The patterns cover common auth_form/auth_basic messages; a
+# successful login must never match.
+failregex = ^.*\[auth_form:(?:info|notice|warn|error)\].*client <HOST>.*(?:authentication failure|login failed|not found).*\s*$
+            ^.*\[auth_basic:error\].*client <HOST>.*(?:authentication failure|user .* not found).*\s*$
+ignoreregex =

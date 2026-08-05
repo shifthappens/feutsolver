@@ -5,23 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="robots" content="noindex,nofollow">
     <title>Wordfeud Analyzer — inloggen</title>
-    <style>
-      :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-      body { display: grid; min-height: 100vh; margin: 0; place-items: center; background: #17191d; color: #f5f6f7; }
-      main { width: min(360px, calc(100% - 48px)); }
-      h1 { margin-bottom: .35rem; font-size: 1.55rem; }
-      p { color: #b7bcc4; line-height: 1.5; }
-      form { display: grid; gap: 14px; margin-top: 28px; }
-      label { display: grid; gap: 6px; font-size: .9rem; }
-      input, button { box-sizing: border-box; min-height: 46px; border-radius: 9px; font: inherit; }
-      input { border: 1px solid #4b515b; padding: 0 12px; background: #252932; color: inherit; }
-      button { border: 0; background: #2d8cff; color: white; font-weight: 700; }
-    </style>
+    <link rel="stylesheet" href="/feutsolver-login.css">
   </head>
   <body>
     <main>
       <h1>Wordfeud Analyzer</h1>
-      <p>Log één keer in. Je sessie blijft op dit apparaat bewaard.</p>
+      <p>Log in om de solver te gebruiken. Sessiegegevens blijven beperkt geldig.</p>
       <form method="post" action="/feutsolver-login-submit" autocomplete="on">
         <label>Gebruikersnaam <input name="httpd_username" autocomplete="username" required autofocus></label>
         <label>Wachtwoord <input type="password" name="httpd_password" autocomplete="current-password" required></label>

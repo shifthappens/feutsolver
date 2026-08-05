@@ -19,25 +19,50 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import time
+import warnings
 from collections import Counter
 from copy import deepcopy
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+from threading import RLock
 from typing import NamedTuple, TypeAlias, cast
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL.Image import DecompressionBombError, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .models import BoardState
 from .move_generator import LETTER_VALUES
+from .security import OCRBudget, ResourceLimitError, SlidingWindowRateLimiter, resource_slot
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 BOARD_SIZE = 15
 Rgb: TypeAlias = tuple[int, int, int]
+SUPPORTED_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "WEBP"})
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_WIDTH = 8_000
+MAX_IMAGE_HEIGHT = 8_000
+MAX_IMAGE_PIXELS = 20_000_000
+MAX_NORMALIZED_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_EXTERNAL_IMAGE_BYTES = 1_500_000
+MAX_EXTERNAL_REQUESTS_PER_WINDOW = 5
+EXTERNAL_REQUEST_WINDOW_SECONDS = 10 * 60
+MAX_EXTERNAL_ESTIMATED_COST_USD = 0.10
+EXTERNAL_INPUT_COST_PER_MILLION_TOKENS = 1.0
+EXTERNAL_OUTPUT_COST_PER_MILLION_TOKENS = 4.0
+MAX_OCR_SECONDS = 30
+MAX_OCR_ATTEMPTS = 4
+_EXTERNAL_OCR_LIMITER = SlidingWindowRateLimiter(
+    limit=MAX_EXTERNAL_REQUESTS_PER_WINDOW,
+    window_seconds=EXTERNAL_REQUEST_WINDOW_SECONDS,
+)
+_IMAGE_DECODER_WARNING_LOCK = RLock()
 
 EXTRACTION_PROMPT = """You read letters from Wordfeud tile crops. Do not solve the game.
 
@@ -169,6 +194,14 @@ class VisionExtractionError(RuntimeError):
     pass
 
 
+class ImageValidationError(VisionExtractionError):
+    """The upload is not a bounded, decoder-verified supported image."""
+
+    def __init__(self, code: str, technical_reason: str) -> None:
+        self.code = code
+        super().__init__(technical_reason)
+
+
 class LocalOCRUnavailable(VisionExtractionError):
     """The optional local OCR dependency is not installed on this machine."""
 
@@ -218,6 +251,109 @@ class BoardExtraction(NamedTuple):
 
     state: BoardState
     confidence: float
+
+
+def validate_and_normalize_image(
+    source_path: str | Path,
+    destination_path: str | Path,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_width: int = MAX_IMAGE_WIDTH,
+    max_height: int = MAX_IMAGE_HEIGHT,
+    max_pixels: int = MAX_IMAGE_PIXELS,
+) -> Path:
+    """Verify an upload with the real decoder, then write one safe RGB PNG.
+
+    The first open is verification-only and is closed before the second open used
+    for conversion.  Extension and browser MIME values are intentionally ignored.
+    Pillow warnings (including decompression-bomb warnings) are treated as a hard
+    rejection rather than being allowed to turn into an unstable later failure.
+    """
+    source = Path(source_path)
+    destination = Path(destination_path)
+    try:
+        if source.stat().st_size > max_bytes:
+            raise ImageValidationError("IMG-SIZE", "upload exceeds the byte limit")
+    except OSError as exc:
+        raise ImageValidationError("IMG-READ", "upload could not be read") from exc
+
+    def verify_open() -> None:
+        # Python's warnings filter is process-global. Serialize the tiny decoder
+        # critical section so concurrent OCR workers cannot hide each other's
+        # decompression-bomb warnings.
+        with _IMAGE_DECODER_WARNING_LOCK, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                with Image.open(source) as probe:
+                    actual_format = (probe.format or "").upper()
+                    if actual_format not in SUPPORTED_IMAGE_FORMATS:
+                        raise ImageValidationError("IMG-FORMAT", "unsupported decoded image format")
+                    width, height = probe.size
+                    if (
+                        width <= 0 or height <= 0 or width > max_width or height > max_height
+                        or width * height > max_pixels
+                    ):
+                        raise ImageValidationError("IMG-DIMENSIONS", "decoded image dimensions exceed the limit")
+                    probe.verify()
+            except ImageValidationError:
+                raise
+            except (DecompressionBombError, UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+                raise ImageValidationError("IMG-CORRUPT", "image verification failed") from exc
+            if caught:
+                raise ImageValidationError("IMG-WARNING", "decoder emitted a warning")
+
+    verify_open()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with _IMAGE_DECODER_WARNING_LOCK, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                # A second independent open is intentional: verify() invalidates
+                # the decoder state and must never be followed by processing.
+                if source.stat().st_size > max_bytes:
+                    raise ImageValidationError("IMG-SIZE", "upload exceeds the byte limit")
+                with Image.open(source) as opened:
+                    actual_format = (opened.format or "").upper()
+                    if actual_format not in SUPPORTED_IMAGE_FORMATS:
+                        raise ImageValidationError("IMG-FORMAT", "unsupported decoded image format")
+                    if (
+                        opened.width <= 0 or opened.height <= 0
+                        or opened.width > max_width or opened.height > max_height
+                        or opened.width * opened.height > max_pixels
+                    ):
+                        raise ImageValidationError("IMG-DIMENSIONS", "decoded image dimensions exceed the limit")
+                    opened.load()
+                    normalized = opened.convert("RGB")
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=destination.parent, prefix=destination.name + ".", suffix=".png", delete=False,
+                ) as target:
+                    temporary = Path(target.name)
+                    normalized.save(target, format="PNG", optimize=True)
+                    target.flush()
+                    os.fsync(target.fileno())
+                normalized.close()
+            except ImageValidationError:
+                raise
+            except (DecompressionBombError, UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+                raise ImageValidationError("IMG-CORRUPT", "image decoding failed") from exc
+            if caught:
+                raise ImageValidationError("IMG-WARNING", "decoder emitted a warning")
+        if temporary is None:
+            raise ImageValidationError("IMG-NORMALIZE", "image normalization failed")
+        normalized_size = temporary.stat().st_size
+        if normalized_size > MAX_NORMALIZED_IMAGE_BYTES:
+            raise ImageValidationError("IMG-NORMALIZED-SIZE", "normalized image exceeds the internal limit")
+        temporary.replace(destination)
+        temporary = None
+        return destination
+    except ImageValidationError:
+        raise
+    except OSError as exc:
+        raise ImageValidationError("IMG-NORMALIZE", "image normalization failed") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _rgb_pixel(image: Image.Image, x: int, y: int) -> Rgb:
@@ -565,9 +701,22 @@ def tile_contact_sheet(
 
 def _image_data_url(image: Image.Image) -> str:
     """JPEG is substantially smaller than a PNG screenshot, without losing tile glyphs."""
-    output = BytesIO()
-    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
-    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    working = image.convert("RGB")
+    try:
+        for _ in range(4):
+            output = BytesIO()
+            working.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
+            encoded = output.getvalue()
+            if len(encoded) <= MAX_EXTERNAL_IMAGE_BYTES:
+                return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
+            next_size = (max(1, round(working.width * 0.75)), max(1, round(working.height * 0.75)))
+            if next_size == working.size:
+                break
+            working = working.resize(next_size, Image.Resampling.LANCZOS)
+        raise ImageValidationError("OCR-IMAGE-SIZE", "external OCR image exceeds the request budget")
+    finally:
+        if working is not image:
+            working.close()
 
 
 def _remove_trailing_commas(text: str) -> str:
@@ -791,8 +940,17 @@ def _request_reading(
     images: list[str],
     expected_indexes: list[int],
     timeout_seconds: int,
+    budget: OCRBudget | None = None,
+    requester: str | None = None,
 ) -> tuple[TileReading, dict[int, str]]:
     """Run one OCR pass and validate identities, count, glyph shape, and confidence."""
+    requester_key = requester.strip() if isinstance(requester, str) else ""
+    if not requester_key:
+        raise ResourceLimitError("OCR-IDENTITY", "external OCR requires a requester identity")
+    if not _EXTERNAL_OCR_LIMITER.allow(requester_key):
+        raise ResourceLimitError("OCR-RATE", "external OCR request rate exceeded")
+    if budget is not None:
+        budget.consume_attempt()
     payload: dict[str, JsonValue] = {
         "model": model,
         "temperature": 0,
@@ -810,12 +968,33 @@ def _request_reading(
             },
         },
     }
+    if len(json.dumps(payload, separators=(",", ":"))) > 8 * 1024 * 1024:
+        raise ResourceLimitError("OCR-PAYLOAD", "external OCR request is too large")
+    estimated_input_tokens = max(
+        1,
+        (len(prompt) + 3) // 4
+        + sum(max(1, (len(url) + 999) // 1000) for url in images),
+    )
+    estimated_cost = (
+        estimated_input_tokens * EXTERNAL_INPUT_COST_PER_MILLION_TOKENS
+        + _max_response_tokens(len(expected_indexes)) * EXTERNAL_OUTPUT_COST_PER_MILLION_TOKENS
+    ) / 1_000_000
+    if estimated_cost > MAX_EXTERNAL_ESTIMATED_COST_USD:
+        raise ResourceLimitError("OCR-COST", "external OCR estimated cost exceeds the request budget")
+    request_timeout = max(0.1, min(float(timeout_seconds), 20.0))
+    if budget is not None:
+        budget.check()
+        request_timeout = min(request_timeout, budget.remaining_seconds())
+        if request_timeout < 0.1:
+            raise ResourceLimitError("OCR-TIMEOUT", "OCR deadline exceeded")
     response = requests.post(
         OPENROUTER_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json=payload,
-        timeout=timeout_seconds,
+        timeout=request_timeout,
     )
+    if budget is not None:
+        budget.check()
     response.raise_for_status()
     reading = _parse_content(_response_content(response))
     letters = _tile_letters_by_index(reading, expected_indexes)
@@ -1305,10 +1484,14 @@ class LocalGlyphReading(NamedTuple):
     confidence: float
 
 
-def _local_glyph_readings(cells: list[Image.Image], *, rack: bool) -> list[LocalGlyphReading]:
+def _local_glyph_readings(
+    cells: list[Image.Image], *, rack: bool, budget: OCRBudget | None = None,
+) -> list[LocalGlyphReading]:
     """Read cells using checked-in Wordfeud profiles and measured confidence."""
     readings: list[LocalGlyphReading] = []
     for cell in cells:
+        if budget is not None:
+            budget.check()
         glyph, point_value = _tile_glyph(cell)
         if glyph is None:
             if rack:
@@ -1341,8 +1524,10 @@ def _local_glyph_readings(cells: list[Image.Image], *, rack: bool) -> list[Local
     return readings
 
 
-def _extract_board_local(image_path: str | Path) -> BoardExtraction:
+def _extract_board_local(image_path: str | Path, *, budget: OCRBudget | None = None) -> BoardExtraction:
     """Extract a screenshot without a network call or a language model."""
+    if budget is not None:
+        budget.check()
     if detect_pending_move(image_path):
         raise PendingMoveError
     board_image, rack_image = _wordfeud_crop_images(image_path)
@@ -1351,10 +1536,10 @@ def _extract_board_local(image_path: str | Path) -> BoardExtraction:
     if loose:
         raise LooseTilesError(len(loose))
     bonuses = detect_visible_bonuses(image_path)
-    board_readings = _local_glyph_readings(_tile_cells(board_image, tiles), rack=False)
+    board_readings = _local_glyph_readings(_tile_cells(board_image, tiles), rack=False, budget=budget)
     empty_colour = _empty_cell_colour(_cell_colours(board_image))
     rack_cells = [rack_image.crop(box) for box in _rack_boxes(rack_image, empty_colour)]
-    rack_readings = _local_glyph_readings(rack_cells, rack=True)
+    rack_readings = _local_glyph_readings(rack_cells, rack=True, budget=budget)
     readings = board_readings + rack_readings
     confidence = min(reading.confidence for reading in readings) if readings else 99.0
     return BoardExtraction(
@@ -1375,6 +1560,8 @@ def _extract_board_openrouter(
     model: str | None = None,
     retries: int = 1,
     timeout_seconds: int = 45,
+    budget: OCRBudget | None = None,
+    requester: str | None = None,
 ) -> BoardExtraction:
     """Extract and validate a board; retry answers that do not fit the tiles we cut.
 
@@ -1384,6 +1571,10 @@ def _extract_board_openrouter(
     """
     api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
     model = model or os.environ.get("OPENROUTER_VISION_MODEL", "openai/gpt-4.1-mini")
+    retries = max(0, min(retries, 1))
+    timeout_seconds = max(1, min(timeout_seconds, 20))
+    if budget is not None:
+        budget.check()
     if not api_key:
         raise VisionExtractionError("OPENROUTER_API_KEY ontbreekt. Zet hem in .env of Streamlit secrets.")
 
@@ -1411,6 +1602,7 @@ def _extract_board_openrouter(
             reading, _ = _request_reading(
                 api_key=api_key, model=model, prompt=prompt, images=[rack_url],
                 expected_indexes=[], timeout_seconds=timeout_seconds,
+                budget=budget, requester=requester,
             )
             return BoardExtraction(_to_board_state([], [], reading.rack, bonuses), reading.confidence)
         except LowConfidenceError:
@@ -1443,6 +1635,7 @@ def _extract_board_openrouter(
             passes.append(_request_reading(
                 api_key=api_key, model=model, prompt=pass_prompt, images=pass_images,
                 expected_indexes=indexes, timeout_seconds=timeout_seconds,
+                budget=budget, requester=requester,
             ))
         except LowConfidenceError:
             raise
@@ -1486,6 +1679,7 @@ def _extract_board_openrouter(
             deciding_reading, deciding_letters = _request_reading(
                 api_key=api_key, model=model, prompt=recovery_prompt, images=recovery_images,
                 expected_indexes=target_indexes, timeout_seconds=timeout_seconds,
+                budget=budget, requester=requester,
             )
             known = primary if primary is not None else verification
             assert known is not None
@@ -1535,40 +1729,57 @@ def extract_board(
     retries: int = 1,
     timeout_seconds: int = 45,
     backend: str | None = None,
+    allow_external: bool = False,
+    requester: str | None = None,
 ) -> BoardExtraction:
     """Extract a board locally by default in the app, with an explicit AI fallback.
 
-    ``openrouter`` remains the default here for backwards compatibility with callers
-    and tests that already provide a mocked API key. The Streamlit app explicitly
-    selects ``local`` so a normal upload never waits for a network round trip.
+    Local OCR is the default and external OCR is opt-in both in the app and at this
+    API boundary. A requester identity is required for every external request.
     ``auto`` tries local OCR first and uses OpenRouter only when local OCR cannot read
     the screenshot and a key is available.
     """
-    selected = (backend or os.environ.get("WORDFEUD_OCR_BACKEND", "openrouter")).strip().lower()
+    selected = (backend or os.environ.get("WORDFEUD_OCR_BACKEND", "local")).strip().lower()
     if selected not in {"local", "auto", "openrouter"}:
         raise VisionExtractionError(
             f"Onbekende OCR-backend `{selected}`. Gebruik local, auto of openrouter."
         )
-    if selected == "openrouter":
-        return _extract_board_openrouter(
-            image_path,
-            api_key=api_key,
-            model=model,
-            retries=retries,
-            timeout_seconds=timeout_seconds,
-        )
-    try:
-        return _extract_board_local(image_path)
-    except (PendingMoveError, LooseTilesError):
-        raise
-    except (LocalOCRUnavailable, LocalOCRFailure) as local_error:
-        resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-        if selected == "auto" and resolved_key:
-            return _extract_board_openrouter(
-                image_path,
-                api_key=resolved_key,
-                model=model,
-                retries=retries,
-                timeout_seconds=timeout_seconds,
-            )
-        raise local_error
+    if selected in {"openrouter", "auto"} and not allow_external:
+        if selected == "openrouter":
+            raise VisionExtractionError("OCR-CONSENT: externe OCR is niet toegestaan zonder toestemming")
+        selected = "local"
+    if selected == "openrouter" and not isinstance(requester, str):
+        raise VisionExtractionError("OCR-IDENTITY: externe OCR vereist een geldige aanvrager")
+
+    budget = OCRBudget.start(timeout_seconds=MAX_OCR_SECONDS, max_attempts=MAX_OCR_ATTEMPTS)
+    with tempfile.TemporaryDirectory(prefix="feutsolver-image-") as directory:
+        normalized_path = Path(directory) / "normalized.png"
+        with resource_slot("ocr", timeout_seconds=0.5):
+            validate_and_normalize_image(image_path, normalized_path)
+            if selected == "openrouter":
+                return _extract_board_openrouter(
+                    normalized_path,
+                    api_key=api_key,
+                    model=model,
+                    retries=retries,
+                    timeout_seconds=timeout_seconds,
+                    budget=budget,
+                    requester=requester,
+                )
+            try:
+                return _extract_board_local(normalized_path, budget=budget)
+            except (PendingMoveError, LooseTilesError):
+                raise
+            except (LocalOCRUnavailable, LocalOCRFailure) as local_error:
+                resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+                if selected == "auto" and resolved_key and allow_external:
+                    return _extract_board_openrouter(
+                        normalized_path,
+                        api_key=resolved_key,
+                        model=model,
+                        retries=retries,
+                        timeout_seconds=timeout_seconds,
+                        budget=budget,
+                        requester=requester,
+                    )
+                raise local_error

@@ -229,14 +229,20 @@
       Array.isArray(record.tilePlacement) && Array.isArray(record.blankFlags));
   }
 
-  function readSaves(storage) {
+  function scopedKey(key, namespace) {
+    if (namespace === undefined || namespace === null || namespace === "") return key;
+    const clean = String(namespace).slice(0, 128);
+    return `${key}:${encodeURIComponent(clean)}`;
+  }
+
+  function readSaves(storage, namespace) {
     const source = storage || (typeof localStorage !== "undefined" ? localStorage : null);
     if (!source) {
       const error = "localStorage is niet beschikbaar.";
       return { records: [], warnings: [error], ok: false, error };
     }
     try {
-      const raw = source.getItem(STORAGE_KEY);
+      const raw = source.getItem(scopedKey(STORAGE_KEY, namespace));
       if (!raw) return { records: [], warnings: [], ok: true };
       const envelope = JSON.parse(raw);
       if (!envelope || envelope.schemaVersion !== SCHEMA_VERSION || !Array.isArray(envelope.records)) {
@@ -261,76 +267,88 @@
     }
   }
 
-  function writeSaves(storage, records) {
+  function writeSaves(storage, records, namespace) {
     const source = storage || (typeof localStorage !== "undefined" ? localStorage : null);
     if (!source) return { ok: false, error: "localStorage is niet beschikbaar." };
     try {
-      source.setItem(STORAGE_KEY, JSON.stringify({ schemaVersion: SCHEMA_VERSION, records }));
+      source.setItem(scopedKey(STORAGE_KEY, namespace), JSON.stringify({ schemaVersion: SCHEMA_VERSION, records }));
       return { ok: true };
     } catch (_error) {
       return { ok: false, error: "De lokale opslag is niet beschikbaar of vol." };
     }
   }
 
-  function readActiveSaveId(storage) {
+  function readActiveSaveId(storage, namespace) {
     const source = storage || (typeof localStorage !== "undefined" ? localStorage : null);
     if (!source) return { ok: false, id: null, error: "localStorage is niet beschikbaar." };
     try {
-      return { ok: true, id: source.getItem(ACTIVE_STORAGE_KEY) };
+      return { ok: true, id: source.getItem(scopedKey(ACTIVE_STORAGE_KEY, namespace)) };
     } catch (_error) {
       return { ok: false, id: null, error: "De actieve spelopslag kon niet worden gelezen." };
     }
   }
 
-  function setActiveSaveId(storage, id) {
+  function setActiveSaveId(storage, id, namespace) {
     const source = storage || (typeof localStorage !== "undefined" ? localStorage : null);
     if (!source) return { ok: false, error: "localStorage is niet beschikbaar." };
     try {
-      if (id) source.setItem(ACTIVE_STORAGE_KEY, id);
-      else source.removeItem(ACTIVE_STORAGE_KEY);
+      if (id) source.setItem(scopedKey(ACTIVE_STORAGE_KEY, namespace), id);
+      else source.removeItem(scopedKey(ACTIVE_STORAGE_KEY, namespace));
       return { ok: true };
     } catch (_error) {
       return { ok: false, error: "De koppeling met de actieve spelopslag kon niet worden opgeslagen." };
     }
   }
 
-  function saveSnapshot(storage, name, snapshot, activeId) {
+  function saveSnapshot(storage, name, snapshot, activeId, namespace) {
     const cleanName = String(name || "").trim();
     if (!cleanName) return { ok: false, error: "Geef het spel een naam." };
-    const loaded = readSaves(storage);
+    const loaded = readSaves(storage, namespace);
     if (!loaded.ok) return { ok: false, error: loaded.error || "Opgeslagen spellen konden niet veilig worden gewijzigd." };
     const duplicate = loaded.records.find(record => record.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase() && record.id !== activeId);
     if (duplicate) return { ok: false, error: "Die naam bestaat al." };
     const previous = loaded.records.find(record => record.id === activeId);
     const record = recordFromSnapshot(cleanName, snapshot, previous);
     const records = previous ? loaded.records.map(item => item.id === previous.id ? record : item) : [...loaded.records, record];
-    const written = writeSaves(storage, records);
+    const written = writeSaves(storage, records, namespace);
     return written.ok ? { ok: true, record } : written;
   }
 
-  function deleteSave(storage, id) {
-    const loaded = readSaves(storage);
+  function deleteSave(storage, id, namespace) {
+    const loaded = readSaves(storage, namespace);
     if (!loaded.ok) return { ok: false, error: loaded.error || "Opgeslagen spellen konden niet veilig worden gewijzigd." };
     const records = loaded.records.filter(record => record.id !== id);
     if (records.length === loaded.records.length) return { ok: false, error: "Opgeslagen spel niet gevonden." };
-    return writeSaves(storage, records);
+    return writeSaves(storage, records, namespace);
   }
 
-  function autosaveSnapshot(storage, name, snapshot, activeId) {
-    const saved = saveSnapshot(storage, name, snapshot, activeId);
+  function autosaveSnapshot(storage, name, snapshot, activeId, namespace) {
+    const saved = saveSnapshot(storage, name, snapshot, activeId, namespace);
     if (!saved.ok) return { ...saved, saved:false };
-    const linked = setActiveSaveId(storage, saved.record.id);
+    const linked = setActiveSaveId(storage, saved.record.id, namespace);
     if (!linked.ok) return { ok:false, saved:true, record:saved.record, error:linked.error };
     return { ok:true, saved:true, record:saved.record };
   }
 
-  function autosaveExistingSnapshot(storage, snapshot, activeId) {
+  function autosaveExistingSnapshot(storage, snapshot, activeId, namespace) {
     if (!activeId) return { ok:true, saved:false, skipped:true };
-    const loaded = readSaves(storage);
+    const loaded = readSaves(storage, namespace);
     if (!loaded.ok) return { ok:false, saved:false, error:loaded.error || "Opgeslagen spellen konden niet veilig worden gelezen." };
     const active = loaded.records.find(record => record.id === activeId);
     if (!active) return { ok:true, saved:false, skipped:true };
-    return autosaveSnapshot(storage, active.name, snapshot, activeId);
+    return autosaveSnapshot(storage, active.name, snapshot, activeId, namespace);
+  }
+
+  function clearSaves(storage, namespace) {
+    const source = storage || (typeof localStorage !== "undefined" ? localStorage : null);
+    if (!source) return { ok: false, error: "localStorage is niet beschikbaar." };
+    try {
+      source.removeItem(scopedKey(STORAGE_KEY, namespace));
+      source.removeItem(scopedKey(ACTIVE_STORAGE_KEY, namespace));
+      return { ok: true };
+    } catch (_error) {
+      return { ok: false, error: "Lokale gegevens konden niet worden gewist." };
+    }
   }
 
   return {
@@ -339,6 +357,6 @@
     setRackTile, removeRackTile, selectBoard, selectRack, suggestionSelection, moveSelection, reduceEditor,
     gridPlacement, recordFromSnapshot, snapshotFromRecord, isValidRecord, readSaves,
     writeSaves, readActiveSaveId, setActiveSaveId, saveSnapshot, deleteSave, autosaveSnapshot,
-    autosaveExistingSnapshot,
+    autosaveExistingSnapshot, clearSaves, scopedKey,
   };
 });

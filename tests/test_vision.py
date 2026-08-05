@@ -218,9 +218,19 @@ def test_a_strong_profile_can_reject_a_bad_tiny_point_reading() -> None:
 def test_local_backend_does_not_require_an_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = _screenshot(tmp_path / "local.png", DARK_THEME)
     expected = BoardExtraction(_to_board_state([], [], [], [["NORMAL"] * BOARD_SIZE for _ in range(BOARD_SIZE)]), 98.0)
-    monkeypatch.setattr("wordfeud_analyzer.vision._extract_board_local", lambda _: expected)
+    monkeypatch.setattr("wordfeud_analyzer.vision._extract_board_local", lambda _, budget=None: expected)
 
     assert extract_board(path, backend="local") is expected
+
+
+def test_external_backend_requires_a_real_requester_identity(tmp_path: Path) -> None:
+    with pytest.raises(VisionExtractionError, match="OCR-IDENTITY"):
+        extract_board(
+            tmp_path / "missing.png",
+            backend="openrouter",
+            allow_external=True,
+            api_key="test-key",
+        )
 
 
 def test_recovery_sheet_enlarges_and_numbers_a_dense_tile_sequence(tmp_path: Path) -> None:
@@ -372,7 +382,7 @@ def test_a_confident_reading_becomes_a_board(tmp_path: Path, monkeypatch: pytest
     path = _screenshot(tmp_path / "board.png", LIGHT_THEME, {(7, 7), (7, 8), (7, 9)})
     calls = _stub_openrouter(monkeypatch, _tile_payload("KAt", ["R", "E"], 96))
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert extraction.confidence == 96
     assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "A", "T"]
@@ -390,7 +400,7 @@ def test_an_uncertain_reading_is_rejected_instead_of_retried(
     calls = _stub_openrouter(monkeypatch, _tile_payload("KA", ["R"], 72))
 
     with pytest.raises(LowConfidenceError) as raised:
-        _ = extract_board(path, api_key="test-key")
+        _ = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert raised.value.confidence == 72
     assert "72%" in str(raised.value)
@@ -408,7 +418,7 @@ def test_a_wrong_number_of_letters_is_retried_with_the_expected_count(
         _tile_payload("KAT", ["R"], 96),
     )
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert extraction.state.grid[7][9].letter == "T"
     assert len(calls) == 3
@@ -437,7 +447,7 @@ def test_a_missing_tile_index_is_retried_instead_of_shifting_following_letters(
         _tile_payload("KAT", ["R"], 96),
     )
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert extraction.state.grid[7][9].letter == "T"
     assert len(calls) == 3
@@ -456,7 +466,7 @@ def test_disagreeing_crop_orders_are_resolved_without_shifting_the_board(
         _tile_payload("KAT", ["R"], 98),  # enlarged deciding crops
     )
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "A", "T"]
     assert extraction.confidence == 96
@@ -475,7 +485,7 @@ def test_only_disputed_non_contiguous_ids_are_read_a_third_time(
         _tile_payload("A", ["R"], 98, indexes=[2]),
     )
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "A", "T"]
     assert "exact printed IDs to return are: 2" in _sent_prompt(calls[2])
@@ -496,7 +506,7 @@ def test_tile_point_values_are_not_requested_or_required(
         second,
     )
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert [extraction.state.grid[7][col].letter for col in (7, 8, 9)] == ["K", "I", "T"]
     assert extraction.confidence == 98
@@ -511,7 +521,7 @@ def test_a_persistent_mismatch_reports_a_readable_message(
     _ = _stub_openrouter(monkeypatch, _tile_payload("K", ["R"], 96))
 
     with pytest.raises(VisionExtractionError) as raised:
-        _ = extract_board(path, api_key="test-key")
+        _ = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     message = str(raised.value)
     assert message.startswith("Het bord kon niet worden uitgelezen")
@@ -524,7 +534,7 @@ def test_an_empty_board_asks_only_for_the_rack(tmp_path: Path, monkeypatch: pyte
     path = _screenshot(tmp_path / "board.png", LIGHT_THEME)
     calls = _stub_openrouter(monkeypatch, _tile_payload([], ["R", "E", "?"], 97))
 
-    extraction = extract_board(path, api_key="test-key")
+    extraction = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert extraction.state.rack == ["R", "E", "?"]
     assert all(cell.letter is None for row in extraction.state.grid for cell in row)
@@ -570,7 +580,7 @@ def test_a_move_that_is_not_played_yet_is_refused(
     calls = _stub_openrouter(monkeypatch, _tile_payload("KA", ["R"], 99))
 
     with pytest.raises(PendingMoveError, match="nog niet gespeeld"):
-        _ = extract_board(path, api_key="test-key")
+        _ = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert calls == []
 
@@ -585,7 +595,7 @@ def test_the_play_button_marks_a_move_that_is_still_being_composed(
     calls = _stub_openrouter(monkeypatch, _tile_payload("KA", ["R"], 99))
 
     with pytest.raises(PendingMoveError):
-        _ = extract_board(path, api_key="test-key")
+        _ = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert calls == []
 
@@ -616,7 +626,7 @@ def test_a_loose_word_stops_the_extraction_before_any_model_call(
     calls = _stub_openrouter(monkeypatch, _tile_payload("KAJLOE", ["R"], 99))
 
     with pytest.raises(LooseTilesError, match="los van de rest"):
-        _ = extract_board(path, api_key="test-key")
+        _ = extract_board(path, api_key="test-key", backend="openrouter", allow_external=True, requester=str(path))
 
     assert calls == []
 
