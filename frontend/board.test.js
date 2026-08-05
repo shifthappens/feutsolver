@@ -52,6 +52,39 @@ test("rack typing advances through the slots and stops at the last slot", () => 
 
   assert.deepEqual(editor.snapshot.rack, ["A", "B", "C", "D", "E", "F", "G"]);
   assert.equal(editor.selection.index, 6);
+  assert.equal(editor.selection.caret, 7);
+});
+
+test("rack backspace removes the previous typed tile and moves the caret back", () => {
+  let editor = WF.createEditor(snapshot());
+  editor = WF.reduceEditor(editor, { type:"select_rack", index:0 });
+  editor = WF.reduceEditor(editor, { type:"set_rack", tile:"A" });
+  editor = WF.reduceEditor(editor, { type:"set_rack", tile:"B" });
+
+  editor = WF.reduceEditor(editor, { type:"backspace" });
+  assert.deepEqual(editor.snapshot.rack, ["A"]);
+  assert.equal(editor.selection.index, 1);
+
+  editor = WF.reduceEditor(editor, { type:"backspace" });
+  assert.deepEqual(editor.snapshot.rack, []);
+  assert.equal(editor.selection.index, 0);
+
+  const unchanged = WF.reduceEditor(editor, { type:"backspace" });
+  assert.deepEqual(unchanged.snapshot.rack, []);
+  assert.equal(unchanged.selection.index, 0);
+});
+
+test("rack backspace removes the last tile after filling the rack", () => {
+  let editor = WF.createEditor(snapshot());
+  editor = WF.reduceEditor(editor, { type:"select_rack", index:0 });
+  for (const tile of ["A", "B", "C", "D", "E", "F", "G"]) {
+    editor = WF.reduceEditor(editor, { type:"set_rack", tile });
+  }
+
+  editor = WF.reduceEditor(editor, { type:"backspace" });
+  assert.deepEqual(editor.snapshot.rack, ["A", "B", "C", "D", "E", "F"]);
+  assert.equal(editor.selection.index, 6);
+  assert.equal(editor.selection.caret, 6);
 });
 
 test("preview mode locks reducer edits", () => {

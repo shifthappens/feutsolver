@@ -83,6 +83,7 @@
     const next = clone(editor);
     next.snapshot.rack.splice(index, 1);
     next.selection.index = Math.max(0, Math.min(index, next.snapshot.rack.length));
+    if (next.selection.kind === "rack") next.selection.caret = next.selection.index;
     next.revision += 1;
     return next;
   }
@@ -91,6 +92,7 @@
     if (!editor || editor.selection.kind !== "rack") return editor;
     const next = clone(editor);
     next.selection.index = Math.min(index + 1, MAX_RACK - 1);
+    next.selection.caret = Math.min(index + 1, MAX_RACK);
     return next;
   }
 
@@ -109,7 +111,7 @@
   function selectRack(editor, index) {
     if (!editor || index < 0 || index >= MAX_RACK) return editor;
     const next = clone(editor);
-    next.selection = { kind: "rack", row: 0, col: 0, index };
+    next.selection = { kind: "rack", row: 0, col: 0, index, caret: index };
     return next;
   }
 
@@ -152,7 +154,10 @@
     }
     if (action.type === "remove_rack") return removeRackTile(editor, editor.selection.index);
     if (action.type === "backspace") {
-      if (editor.selection.kind === "rack") return removeRackTile(editor, editor.selection.index);
+      if (editor.selection.kind === "rack") {
+        const cursor = Math.min(editor.selection.caret ?? editor.selection.index, editor.snapshot.rack.length);
+        return cursor > 0 ? removeRackTile(editor, cursor - 1) : editor;
+      }
       const current = editor.snapshot.grid[editor.selection.row][editor.selection.col];
       if (current.letter) return previousSelection(clearBoardCell(editor, editor.selection.row, editor.selection.col));
       const previous = previousSelection(editor);
