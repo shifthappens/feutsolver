@@ -229,7 +229,7 @@ def test_external_backend_requires_a_real_requester_identity(tmp_path: Path) -> 
             tmp_path / "missing.png",
             backend="openrouter",
             allow_external=True,
-            api_key="test-key",
+            api_key="test-key",  # pragma: allowlist secret
         )
 
 

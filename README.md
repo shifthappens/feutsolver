@@ -61,7 +61,7 @@ De standaard is lokale OCR (`WORDFEUD_OCR_BACKEND=local`), waardoor een API-sleu
 Een blijvende, lokale optie is `.streamlit/secrets.toml` (dit bestand staat in `.gitignore`):
 
 ```toml
-OPENROUTER_API_KEY = "jouw-sleutel"
+OPENROUTER_API_KEY = "jouw-sleutel"  # pragma: allowlist secret
 OPENROUTER_VISION_MODEL = "openai/gpt-4.1-mini"
 WORDFEUD_OCR_BACKEND = "local"
 ```

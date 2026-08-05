@@ -46,7 +46,7 @@ jobs:
           pip-audit -r requirements.txt --strict
           # Requirements hashes are public package metadata, not credentials.
           detect-secrets scan --all-files --force-use-all-plugins \
-            --exclude-files '(^|/)requirements(-dev)?\.txt$' > "$RUNNER_TEMP/secrets-scan.json"
+            --exclude-files '(^|/)(requirements(-dev)?\.txt|\.pytest_cache/)' > "$RUNNER_TEMP/secrets-scan.json"
           python ops/check_secrets_scan.py "$RUNNER_TEMP/secrets-scan.json"
 
       - name: Generate SBOM and release manifest
