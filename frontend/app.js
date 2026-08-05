@@ -17,6 +17,8 @@
     let autosaveTimer = null;
     let autosaveDirty = false;
     let localChangesPending = false;
+    let focusVisibilityFrame = null;
+    let focusVisibilityTimers = [];
 
     function storage() { try { return window.localStorage; } catch (_error) { return null; } }
     function storageNamespace() { return String(props.storage_namespace || "unauthenticated"); }
@@ -113,20 +115,106 @@
       });
     }
     function showNotice(message, kind) { notice = message ? { message, kind: kind || "" } : null; render(); }
-    function focusKeyboard() {
-      let main = null;
-      let scrollTop = null;
-      try {
-        main = window.parent.document.querySelector("section.stMain");
-        scrollTop = main?.scrollTop ?? null;
-      } catch (_error) { /* cross-origin hosts may not expose the parent DOM */ }
-      keyboard.focus({ preventScroll:true });
-      // Chromium may scroll Streamlit's main pane to keep a focused iframe
-      // visible. Restore the user's position instead of jumping to the app top.
-      setTimeout(() => {
-        if (main && scrollTop !== null) main.scrollTop = scrollTop;
-      }, 0);
+    function selectedFocusTarget() {
+      if (editor?.selection?.kind === "board") return document.querySelector(".cell.selected");
+      if (editor?.selection?.kind === "rack") return document.querySelector(".rack-slot.selected");
+      return null;
     }
+    function parentContext() {
+      try {
+        const parentWindow = window.parent && window.parent !== window ? window.parent : window;
+        return {
+          window: parentWindow,
+          document: parentWindow.document,
+          frame: window.frameElement,
+          main: parentWindow.document.querySelector("section.stMain"),
+        };
+      } catch (_error) {
+        return { window, document, frame: null, main: null };
+      }
+    }
+    function visibleViewport(context) {
+      const viewport = context.window.visualViewport;
+      const top = viewport?.offsetTop ?? 0;
+      const height = viewport?.height ?? context.window.innerHeight;
+      return { top, bottom: top + height };
+    }
+    function targetRectInParent(target, frame) {
+      const targetRect = target.getBoundingClientRect();
+      if (!frame) return targetRect;
+      const frameRect = frame.getBoundingClientRect();
+      return {
+        top: frameRect.top + targetRect.top,
+        bottom: frameRect.top + targetRect.bottom,
+        left: frameRect.left + targetRect.left,
+        right: frameRect.left + targetRect.right,
+      };
+    }
+    function scrollParentBy(context, amount) {
+      let remaining = amount;
+      const candidates = [context.main, context.document.scrollingElement, context.document.documentElement]
+        .filter((candidate, index, all) => candidate && all.indexOf(candidate) === index);
+      for (const candidate of candidates) {
+        const before = candidate.scrollTop;
+        candidate.scrollTop = before + remaining;
+        remaining -= candidate.scrollTop - before;
+        if (Math.abs(remaining) < 1) return;
+      }
+      if (Math.abs(remaining) >= 1 && typeof context.window.scrollBy === "function") {
+        context.window.scrollBy(0, remaining);
+      }
+    }
+    function keepFocusTargetVisible() {
+      const target = selectedFocusTarget();
+      if (!target) return;
+      const context = parentContext();
+      const viewport = visibleViewport(context);
+      const rect = targetRectInParent(target, context.frame);
+      const mainRect = context.main?.getBoundingClientRect();
+      const top = Math.max(viewport.top + 12, (mainRect?.top ?? viewport.top) + 12);
+      const bottom = Math.min(viewport.bottom - 12, (mainRect?.bottom ?? viewport.bottom) - 12);
+      let amount = 0;
+      if (rect.bottom > bottom) amount = rect.bottom - bottom;
+      else if (rect.top < top) amount = rect.top - top;
+      if (amount) scrollParentBy(context, amount);
+    }
+    function scheduleFocusVisibility() {
+      if (focusVisibilityFrame !== null) window.cancelAnimationFrame(focusVisibilityFrame);
+      focusVisibilityTimers.forEach(timer => window.clearTimeout(timer));
+      focusVisibilityTimers = [];
+      const check = () => {
+        focusVisibilityFrame = null;
+        if (document.activeElement === keyboard) keepFocusTargetVisible();
+      };
+      focusVisibilityFrame = window.requestAnimationFrame(check);
+      [100, 300, 600].forEach(delay => {
+        focusVisibilityTimers.push(window.setTimeout(check, delay));
+      });
+    }
+    function focusKeyboard() {
+      const target = selectedFocusTarget();
+      if (target) {
+        // Keep the real focus anchor next to the selected board/rack control.
+        // Mobile browsers then use the right part of the iframe when opening
+        // the keyboard instead of trying to reveal the iframe's top edge.
+        const rect = target.getBoundingClientRect();
+        keyboard.style.left = `${Math.max(0, rect.left + rect.width / 2)}px`;
+        keyboard.style.top = `${Math.max(0, rect.top + rect.height / 2)}px`;
+      }
+      keyboard.focus({ preventScroll:true });
+      scheduleFocusVisibility();
+    }
+    function handleViewportChange() {
+      if (document.activeElement === keyboard) scheduleFocusVisibility();
+    }
+    window.visualViewport?.addEventListener("resize", handleViewportChange);
+    window.visualViewport?.addEventListener("scroll", handleViewportChange);
+    try {
+      if (window.parent !== window && window.parent.visualViewport) {
+        window.parent.visualViewport.addEventListener("resize", handleViewportChange);
+        window.parent.visualViewport.addEventListener("scroll", handleViewportChange);
+      }
+    } catch (_error) { /* cross-origin hosts may not expose the parent viewport */ }
     function dismissKeyboard() {
       keyboard.blur();
       const activeElement = document.activeElement;
