@@ -181,6 +181,12 @@ jobs:
              release='${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
              service_python='${SERVICE_PYTHON}'
              if [ -z \"\$service_python\" ]; then service_python='${DEPLOY_PATH}/venv/bin/python'; fi
+             if [ ! -x \"\$service_python\" ]; then
+               service_pid=\"\$(systemctl show --property=MainPID --value feutsolver.service)\"
+               case \"\$service_pid\" in ''|0|*[!0-9]*) exit 1 ;; esac
+               service_python=\"\$(tr '\000' '\n' < \"/proc/\$service_pid/cmdline\" | sed -n '1p')\"
+             fi
+             case \"\$service_python\" in /*) ;; *) exit 1 ;; esac
              test -x \"\$service_python\"
              rm -f \"\$release/data/opentaal-wordlist.txt\"
              ln -s '../../../data/opentaal-wordlist.txt' \"\$release/data/opentaal-wordlist.txt\"
