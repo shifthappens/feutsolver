@@ -101,8 +101,8 @@ def test_solve_and_place_request_is_bound_to_the_exact_snapshot_and_move() -> No
         score=1,
         tiles=[PlacedTile(row=7, col=7, letter="A")],
     )
-    result = make_solve_result(state, [move] * 7, "solve-1")
-    assert len(result["moves"]) == 6
+    result = make_solve_result(state, [move] * 13, "solve-1")
+    assert len(result["moves"]) == 12
 
     payload = {"solveToken": "solve-1", "stateHash": result["state_hash"], "selectedMove": result["moves"][0]}
     committed = apply_place_request(state, result, payload)

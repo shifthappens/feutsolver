@@ -13,7 +13,7 @@ Een Nederlandse Wordfeud-oplosser met twee strikt gescheiden onderdelen:
 
 De startpagina opent met een leeg standaard-Wordfeudbord van 15×15 vakken. Je kunt het bord en het rek handmatig invullen, of een schermafbeelding inladen. Een succesvolle inlezing vervangt in één keer het bord, de effectieve bonusvakken, de rekletters, blanco-toewijzingen en de zekerheidsmetadata. Bij een afgewezen inlezing blijft de huidige stand behouden.
 
-Klik op `Geef oplossingen weer` om maximaal zes zetten te laten berekenen. De Python-oplosser blijft daarbij leidend voor geldigheid, kruiswoorden en punten. De eerste suggestie wordt groen als voorbeeld op het bord gelegd; kies een andere suggestie om het voorbeeld te wisselen. `Annuleren` verlaat het voorbeeld zonder de stand te wijzigen. `Zet plaatsen` past uitsluitend een nog geldige suggestie toe en verbruikt de gebruikte rekletters precies één keer, inclusief blanco's.
+Klik op `Geef oplossingen weer` om maximaal twaalf zetten te laten berekenen. De Python-oplosser blijft daarbij leidend voor geldigheid, kruiswoorden en punten. De eerste suggestie wordt groen als voorbeeld op het bord gelegd; kies een andere suggestie om het voorbeeld te wisselen. `Annuleren` verlaat het voorbeeld zonder de stand te wijzigen. `Zet plaatsen` past uitsluitend een nog geldige suggestie toe en verbruikt de gebruikte rekletters precies één keer, inclusief blanco's.
 
 Het rek mag leeg zijn, maar `Geef oplossingen weer` blijft dan uitgeschakeld met een uitleg. Handmatig ingevoerde letters zijn gewone tegels; blanco's die uit een schermafbeelding komen behouden hun blanco-status. Tijdens een voorbeeld zijn bord, rek en handelingen die de opslag wijzigen vergrendeld. De verborgen invoer houdt typen en mobiele schermtoetsenborden bruikbaar; pijltjes verplaatsen de selectie, een tweede klik wisselt horizontaal/verticaal en de terugtoets gaat terug en wist.
 
@@ -31,7 +31,7 @@ Los daarvan geldt een stelling over het bord zelf: in een geldige stand hangen a
 
 OpenTaal-woorden met diacritieken worden gevouwen in plaats van weggegooid: `façade` wordt `FACADE`, `abituriënt` wordt `ABITURIENT`. Dat scheelt ruim drieduizend woorden die eerder volledig ontbraken.
 
-De app toont naast de beste zet vijf alternatieven. Selecteer een suggestie om het voorbeeld op het interactieve bord te wisselen; alleen de nieuwe stenen zijn groen gemarkeerd.
+De app toont naast de beste zet elf alternatieven. Selecteer een suggestie om het voorbeeld op het interactieve bord te wisselen; alleen de nieuwe stenen zijn groen gemarkeerd.
 
 Onder de suggesties kun je één of meer voorgestelde woorden of bijbehorende kruiswoorden, kommagescheiden, insturen om ze permanent uit de geconfigureerde woordenlijst te verwijderen. De app sluit alle opgegeven woorden eerst alleen tijdens de herberekening uit, zodat nieuwe suggesties direct zichtbaar worden zonder die woorden. Daarna verwijdert één achtergrondactie de woorden in bulk uit de woordenlijst en wordt de cache na een geslaagde mutatie direct ongeldig gemaakt; de deployment bouwt hem opnieuw op vóór de release actief wordt. Het invoerveld blijft tijdens die update tijdelijk geblokkeerd. De woordenlijstschrijfacties gebruiken dezelfde bestandslock als de deploymerge, zodat een productie-aanpassing niet midden in een deploy verloren gaat.
 

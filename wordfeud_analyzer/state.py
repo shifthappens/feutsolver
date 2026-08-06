@@ -7,6 +7,8 @@ from typing import Any, Iterable
 
 from .models import BOARD_SIZE, BoardState, Move
 
+MAX_SUGGESTIONS = 12
+
 
 class StaleSolveRequest(ValueError):
     """The browser is trying to place a result for an older board snapshot."""
@@ -128,7 +130,7 @@ def make_solve_result(state: BoardState, moves: Iterable[Move], token: str) -> d
     return {
         "token": token,
         "state_hash": snapshot_hash(state),
-        "moves": [move.model_dump(mode="json") for move in list(moves)[:6]],
+        "moves": [move.model_dump(mode="json") for move in list(moves)[:MAX_SUGGESTIONS]],
     }
 
 

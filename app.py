@@ -37,6 +37,7 @@ from wordfeud_analyzer.security import (
 )
 from wordfeud_analyzer.state import (
     InvalidSolveRequest,
+    MAX_SUGGESTIONS,
     StaleSolveRequest,
     apply_place_request,
     is_current_board_version,
@@ -187,7 +188,7 @@ def log_failure(*, event: str, correlation_id: str, actor: str | None, action: s
 
 def solve_state(state: BoardState, excluded_words: Iterable[str] = ()) -> list[Move]:
     with resource_slot("solver", timeout_seconds=0.5):
-        return generate_moves(state, configured_lexicon(), limit=6, excluded_words=excluded_words)
+        return generate_moves(state, configured_lexicon(), limit=MAX_SUGGESTIONS, excluded_words=excluded_words)
 
 
 def replacement_update_active() -> bool:

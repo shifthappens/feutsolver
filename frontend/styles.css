@@ -14,9 +14,10 @@
     .cell.existing { background:#f6d37c; color:#473215; box-shadow:inset 0 0 0 1px #bd9140; }
     .cell.new { background:#a9e4a3; color:#173a1b; box-shadow:inset 0 0 0 3px #25833a; }
     .cell.blank { font-style:italic; }
-    .cell.selected { outline:3px solid #153f2d; outline-offset:-3px; z-index:1; }
-    .cell.selected-v::after { content:""; position:absolute; width:3px; height:28%; background:#153f2d; border-radius:2px; }
     .cell { position:relative; }
+    .cell.direction-row::before, .cell.direction-column::before { content:""; position:absolute; inset:0; border-radius:inherit; background:rgba(25,91,66,.26); box-shadow:0 0 0 1px rgba(25,91,66,.22); pointer-events:none; }
+    .cell-label { position:relative; z-index:1; }
+    .cell.selected { outline:3px solid #153f2d; outline-offset:-3px; z-index:1; }
     .board-tools, .actions, .save-actions, .rack { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
     .board-tools { justify-content:space-between; margin:.7rem 0 .35rem; color:var(--muted); font-size:.88rem; }
     .actions { margin-top:1rem; }

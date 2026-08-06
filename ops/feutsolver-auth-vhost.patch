@@ -30,14 +30,15 @@
 +        AuthUserFile /etc/apache2/.htpasswd-feutsolver
 +        AuthType form
 +        AuthName "feutsolver"
-+        AuthFormLoginRequiredLocation "/feutsolver-login"
++        AuthFormLoginRequiredLocation "/feutsolver-login#login-error"
 +        AuthFormLoginSuccessLocation "/feutsolver/"
++        Require valid-user
 +        Session On
 +        SessionMaxAge 259200
 +        # mod_session stores this encrypted session client-side; the short TTL
 +        # limits the window for a copied cookie because there is no server-side
 +        # token-revocation store in this vhost.
-+        SessionCookieName feutsolver_session path=/;httponly;secure;samesite=lax
++        SessionCookieName feutsolver_session_v2 path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
 +        SessionCookieRemove On
 +        Header always set Cache-Control "no-store"
@@ -52,7 +53,7 @@
 +        # Make a logout response authoritative immediately; the browser also
 +        # receives an explicit expired cookie from mod_session.
 +        SessionMaxAge 1
-+        SessionCookieName feutsolver_session path=/;httponly;secure;samesite=lax
++        SessionCookieName feutsolver_session_v2 path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
 +        SessionCookieRemove On
 +        Header always set Cache-Control "no-store"
@@ -67,7 +68,7 @@
 +        AuthFormLoginRequiredLocation "/feutsolver-login"
 +        Session On
 +        SessionMaxAge 259200
-+        SessionCookieName feutsolver_session path=/;httponly;secure;samesite=lax
++        SessionCookieName feutsolver_session_v2 path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
 +        SessionCookieRemove On
 +        RequestHeader set X-Authenticated-User expr=%{REMOTE_USER}

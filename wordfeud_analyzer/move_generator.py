@@ -867,31 +867,14 @@ def _cross_checks(
     return allowed
 
 
-def _materialise_move(state: BoardState, anchor: tuple[int, int], direction: Direction,
-                      tiles: list[PlacedTile]) -> tuple[str, int, int]:
-    """Read the completed main word from the board plus the proposed tiles."""
-    dr, dc = (0, 1) if direction == "H" else (1, 0)
-    new = {(tile.row, tile.col): tile.letter for tile in tiles}
-    row, col = anchor
-    while _in_bounds(row - dr, col - dc) and (
-        _letter(state, row - dr, col - dc) or (row - dr, col - dc) in new
-    ):
-        row, col = row - dr, col - dc
-    start_row, start_col = row, col
-    letters: list[str] = []
-    while _in_bounds(row, col) and (_letter(state, row, col) or (row, col) in new):
-        letters.append(new.get((row, col)) or _letter(state, row, col) or "")
-        row, col = row + dr, col + dc
-    return "".join(letters), start_row, start_col
-
-
-def _candidate_starts(state: BoardState, direction: Direction, rack_size: int) -> list[tuple[int, int]]:
+def _candidate_starts(state: BoardState, direction: Direction, rack_size: int,
+                      anchors: set[tuple[int, int]] | None = None) -> list[tuple[int, int]]:
     """Line starts that can reach an existing tile or perpendicular anchor."""
     dr, dc = (0, 1) if direction == "H" else (1, 0)
     if not _has_tiles(state):
         return ([(7, col) for col in range(max(0, 8 - rack_size), 8)] if direction == "H"
                 else [(row, 7) for row in range(max(0, 8 - rack_size), 8)])
-    anchors = set(_anchors(state))
+    anchors = anchors if anchors is not None else set(_anchors(state))
     starts: list[tuple[int, int]] = []
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
@@ -911,7 +894,7 @@ def _candidate_starts(state: BoardState, direction: Direction, rack_size: int) -
 def generate_moves(
     state: BoardState,
     lexicon: Gaddag,
-    limit: int = 6,
+    limit: int = 12,
     *,
     excluded_words: Iterable[str] = (),
 ) -> list[Move]:

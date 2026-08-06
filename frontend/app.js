@@ -312,10 +312,14 @@
       for (let row = 0; row < WF.SIZE; row += 1) for (let col = 0; col < WF.SIZE; col += 1) {
         const cell = snapshot.grid[row][col];
         const tile = overlay.get(`${row}:${col}`);
-        const selected = props.mode !== "preview" && editor?.selection.kind === "board" && editor.selection.row === row && editor.selection.col === col;
+        const boardSelection = props.mode !== "preview" && editor?.selection?.kind === "board";
+        const selected = boardSelection && editor.selection.row === row && editor.selection.col === col;
+        const directionRow = boardSelection && editor.direction === "H" && editor.selection.row === row;
+        const directionColumn = boardSelection && editor.direction === "V" && editor.selection.col === col;
         const classes = ["cell", (tile ? "new" : cell.letter ? "existing" : (cell.bonus || "NORMAL").toLowerCase()),
-          tile?.is_blank || cell.is_blank ? "blank" : "", selected ? "selected" : "", selected && editor.direction === "V" ? "selected-v" : ""].filter(Boolean).join(" ");
-        buttons.push(`<button class="${classes}" data-row="${row}" data-col="${col}" aria-label="Rij ${row + 1}, kolom ${col + 1}${cell.letter ? `, ${cell.letter}` : ""}">${boardLabel(row, col, cell, tile)}</button>`);
+          tile?.is_blank || cell.is_blank ? "blank" : "", directionRow ? "direction-row" : "", directionColumn ? "direction-column" : "", selected ? "selected" : ""].filter(Boolean).join(" ");
+        const directionLabel = selected ? (editor.direction === "H" ? ", actieve horizontale rij" : ", actieve verticale kolom") : "";
+        buttons.push(`<button class="${classes}" data-row="${row}" data-col="${col}" aria-label="Rij ${row + 1}, kolom ${col + 1}${cell.letter ? `, ${cell.letter}` : ""}${directionLabel}"><span class="cell-label">${boardLabel(row, col, cell, tile)}</span></button>`);
       }
       return `<div class="board" role="grid">${buttons.join("")}</div>`;
     }
@@ -367,7 +371,7 @@
         <div class="hint">Klik een vakje; klik nogmaals om de richting te wisselen. Typ A–Z. Gebruik Wissen of Terug om te wissen. Pijltjes verplaatsen de selectie.</div>
         ${renderRack(editor.snapshot)}
         ${notification}</section>
-        <section><section class="panel"><h3>Suggesties</h3>${props.mode === "preview" ? renderSuggestions(props.solve_result) : '<p class="empty">Bewerk het bord en kies Geef oplossingen weer voor maximaal zes suggesties.</p>'}</section>${renderSaves(editing)}</section>`;
+        <section><section class="panel"><h3>Suggesties</h3>${props.mode === "preview" ? renderSuggestions(props.solve_result) : '<p class="empty">Bewerk het bord en kies Geef oplossingen weer voor maximaal twaalf suggesties.</p>'}</section>${renderSaves(editing)}</section>`;
       bindEvents();
       Streamlit.setFrameHeight(document.body.scrollHeight + 16);
     }

@@ -3,6 +3,8 @@ body { display: grid; min-height: 100vh; margin: 0; place-items: center; backgro
 main { width: min(360px, calc(100% - 48px)); }
 h1 { margin-bottom: .35rem; font-size: 1.55rem; }
 p { color: #b7bcc4; line-height: 1.5; }
+.login-error { display: none; margin: 16px 0 0; border-left: 3px solid #f0a43a; padding-left: 12px; color: #ffd59a; }
+.login-error:target { display: block; }
 form { display: grid; gap: 14px; margin-top: 28px; }
 label { display: grid; gap: 6px; font-size: .9rem; }
 input, button { box-sizing: border-box; min-height: 46px; border-radius: 9px; font: inherit; }
