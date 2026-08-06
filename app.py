@@ -4,10 +4,8 @@ from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
-import logging
 import os
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -47,9 +45,7 @@ from wordfeud_analyzer.state import (
     replace_from_upload,
     validate_snapshot,
 )
-from wordfeud_analyzer.vision import ImageValidationError, VisionExtractionError, extract_board
-
-LOGGER = logging.getLogger("feutsolver.app")
+from wordfeud_analyzer.vision import VisionExtractionError, extract_board
 
 st.set_page_config(page_title="Wordfeud-oplosser", page_icon="🔤", layout="wide")
 
@@ -73,9 +69,19 @@ def secret_or_env(name: str, default: str = "") -> str:
 
 
 @st.cache_resource(show_spinner=False, max_entries=1)
-def get_lexicon(path: str, source_signature: tuple[object, ...]) -> Gaddag:
-    _ = source_signature
+def lexicon_preload_executor() -> ThreadPoolExecutor:
+    """Keep the first lexicon build off the Streamlit script thread."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="wordfeud-lexicon")
+
+
+def _build_lexicon(path: str) -> Gaddag:
     return load_wordlist(path)
+
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def get_lexicon(path: str, source_signature: tuple[object, ...]) -> Future[Gaddag]:
+    _ = source_signature
+    return lexicon_preload_executor().submit(_build_lexicon, path)
 
 
 @st.cache_resource(show_spinner=False, max_entries=1)
@@ -85,20 +91,16 @@ def wordlist_update_executor() -> ThreadPoolExecutor:
 
 
 def lexicon_signature() -> tuple[object, ...]:
-    values: list[object] = []
-    for path in (DEFAULT_WORDLIST,):
-        try:
-            stat = path.stat()
-        except OSError:
-            values.extend((0, 0, ""))
-        else:
-            values.extend((stat.st_mtime_ns, stat.st_size, file_version(path) or ""))
-    return tuple(values)
+    try:
+        stat = DEFAULT_WORDLIST.stat()
+    except OSError:
+        return (0, 0, "")
+    return (stat.st_mtime_ns, stat.st_size, file_version(DEFAULT_WORDLIST) or "")
 
 
 def configured_lexicon() -> Gaddag:
     """Load the configured word list without learning from the current board."""
-    return get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature())
+    return get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature()).result()
 
 
 def initialise_session() -> None:
@@ -654,6 +656,9 @@ def render_word_suggestions() -> None:
 initialise_session()
 if poll_wordlist_update():
     st.rerun()
+# Start loading the production lexicon while the upload/board UI is rendered.
+# The solve request then waits only for work that is still in progress.
+_ = get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature())
 actor = current_actor()
 st.title("Wordfeud-oplosser")
 if actor:

@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 from threading import RLock
 import unicodedata
-from typing import Literal, TypeAlias, TypedDict, TypeGuard, cast
+from typing import Literal, NamedTuple, TypeAlias, TypedDict, TypeGuard, cast
 
 from .models import BoardState, Move, PlacedTile
 from .security import (
@@ -32,6 +32,7 @@ LETTER_VALUES = {
     "Q": 10, "R": 2, "S": 2, "T": 2, "U": 2, "V": 4, "W": 5, "X": 8,
     "Y": 8, "Z": 5,
 }
+ALL_LETTERS = frozenset(LETTER_VALUES)
 LETTER_MULTIPLIER = {"NORMAL": 1, "DL": 2, "TL": 3, "DW": 1, "TW": 1}
 WORD_MULTIPLIER = {"NORMAL": 1, "DL": 1, "TL": 1, "DW": 2, "TW": 3}
 GADDAG_CACHE_VERSION = 6
@@ -48,6 +49,29 @@ Direction = Literal["H", "V"]
 # `array` only became subscriptable at runtime in Python 3.12; the element types
 # are quoted so this alias also evaluates on 3.11 without losing type information.
 GraphData: TypeAlias = tuple["array[int]", "array[int]", bytearray, bytearray, "array[int]", int]
+
+
+class _InternalTile(NamedTuple):
+    """Lightweight tile data used while exploring the search tree."""
+
+    row: int
+    col: int
+    letter: str
+    is_blank: bool
+
+
+class _Candidate(NamedTuple):
+    """A scored candidate before its public Pydantic model is created."""
+
+    word: str
+    row: int
+    col: int
+    direction: Direction
+    score: int
+    tiles: tuple[_InternalTile, ...]
+    cross_words: tuple[str, ...]
+
+
 _WORDLIST_WRITE_LOCK = RLock()
 
 
@@ -139,11 +163,11 @@ class Gaddag:
                             word = normalise_word(line)
                             if not 2 <= len(word) <= BOARD_SIZE:
                                 continue
-                            _ = target.write(word + "\n")
+                            target.write(word + "\n")
             # External sorting keeps peak memory bounded for the complete OpenTaal
             # list; -u collapses the duplicates that folding diacritics creates, and
             # any overlap between the two lists.
-            _ = subprocess.run(["sort", "-u", str(unsorted_path), "-o", str(sorted_path)], check=True)
+            subprocess.run(["sort", "-u", str(unsorted_path), "-o", str(sorted_path)], check=True)
             counted = 0
 
             def sequences_from(handle: Iterable[str]) -> Iterable[str]:
@@ -245,8 +269,8 @@ class Gaddag:
             reindexed[old_id] = new_id
             old = nodes[old_id]
             old_children = old["children"]
-            _ = starts.append(len(labels))
-            _ = terminals.append(bool(old["terminal"]))
+            starts.append(len(labels))
+            terminals.append(bool(old["terminal"]))
             ordered_children = sorted(old_children.items())
             counts.append(len(ordered_children))
             # Reserve this state's contiguous edge range before recursively
@@ -487,11 +511,11 @@ def load_wordlist(path: str | Path) -> Gaddag:
             temporary_cache: Path | None = None
             with tempfile.NamedTemporaryFile(mode="wb", dir=cache.parent, prefix=cache.name + ".", delete=False) as handle:
                 temporary_cache = Path(handle.name)
-                _ = handle.write(encoded_document)
+                handle.write(encoded_document)
                 handle.flush()
                 os.fsync(handle.fileno())
             if temporary_cache is not None:
-                _ = temporary_cache.replace(cache)
+                temporary_cache.replace(cache)
                 try:
                     directory_fd = os.open(cache.parent, os.O_RDONLY)
                     try:
@@ -563,10 +587,10 @@ def _atomic_text_replace(path: Path, content: str) -> None:
             mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
-            _ = temporary.write(content)
+            temporary.write(content)
             temporary.flush()
             os.fsync(temporary.fileno())
-        _ = temporary_path.replace(path)
+        temporary_path.replace(path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -665,7 +689,7 @@ def remove_words_from_wordlist(
                         if normalised in target_set:
                             removed.add(normalised)
                             continue
-                        _ = temporary.write(line)
+                        temporary.write(line)
                     temporary.flush()
                     os.fsync(temporary.fileno())
             if removed and temporary_path is not None:
@@ -738,28 +762,25 @@ def _word_at(state: BoardState, row: int, col: int, dr: int, dc: int, center: st
     """Return the full cross word through (row, col), using center as the new tile."""
     before: list[str] = []
     r, c = row - dr, col - dc
-    while _in_bounds(r, c) and _letter(state, r, c):
-        before.append(_letter(state, r, c) or "")
+    while _in_bounds(r, c):
+        letter = _letter(state, r, c)
+        if letter is None:
+            break
+        before.append(letter)
         r, c = r - dr, c - dc
     after: list[str] = []
     r, c = row + dr, col + dc
-    while _in_bounds(r, c) and _letter(state, r, c):
-        after.append(_letter(state, r, c) or "")
+    while _in_bounds(r, c):
+        letter = _letter(state, r, c)
+        if letter is None:
+            break
+        after.append(letter)
         r, c = r + dr, c + dc
     return "".join(reversed(before)) + center + "".join(after)
 
 
-def _touches_board(state: BoardState, tiles: list[PlacedTile]) -> bool:
-    for tile in tiles:
-        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            r, c = tile.row + dr, tile.col + dc
-            if _in_bounds(r, c) and _letter(state, r, c):
-                return True
-    return False
-
-
 def _score_move(state: BoardState, word: str, row: int, col: int, direction: Direction,
-                tiles: list[PlacedTile]) -> tuple[int, list[str]]:
+                tiles: tuple[_InternalTile, ...]) -> tuple[int, list[str]]:
     dr, dc = (0, 1) if direction == "H" else (1, 0)
     newly = {(tile.row, tile.col): tile for tile in tiles}
     main_sum, main_multiplier = 0, 1
@@ -767,7 +788,7 @@ def _score_move(state: BoardState, word: str, row: int, col: int, direction: Dir
         r, c = row + dr * index, col + dc * index
         existing = state.grid[r][c]
         tile = newly.get((r, c))
-        if tile:
+        if tile is not None:
             value = 0 if tile.is_blank else LETTER_VALUES[char]
             bonus = state.effective_bonus(r, c)
             main_sum += value * LETTER_MULTIPLIER[bonus]
@@ -776,17 +797,15 @@ def _score_move(state: BoardState, word: str, row: int, col: int, direction: Dir
             main_sum += 0 if existing.is_blank else LETTER_VALUES[char]
     score = main_sum * main_multiplier
     cross_words: list[str] = []
+    cross_dr, cross_dc = (1, 0) if direction == "H" else (0, 1)
     for tile in tiles:
-        pr, pc = (1, 0) if direction == "H" else (0, 1)
-        cross = _word_at(state, tile.row, tile.col, pr, pc, tile.letter)
+        cross = _word_at(state, tile.row, tile.col, cross_dr, cross_dc, tile.letter)
         if len(cross) > 1:
             cross_words.append(cross)
             bonus = state.effective_bonus(tile.row, tile.col)
             # Existing cross letters were previously placed, so their bonuses never apply.
-            old_sum = sum(
-                0 if state.grid[r][c].is_blank else LETTER_VALUES[state.grid[r][c].letter or "A"]
-                for r, c in _cross_existing_positions(state, tile.row, tile.col, pr, pc)
-            )
+            old_sum = sum(0 if state.grid[r][c].is_blank else LETTER_VALUES[state.grid[r][c].letter or "A"]
+                          for r, c in _cross_existing_positions(state, tile.row, tile.col, cross_dr, cross_dc))
             new_value = 0 if tile.is_blank else LETTER_VALUES[tile.letter] * LETTER_MULTIPLIER[bonus]
             score += (old_sum + new_value) * WORD_MULTIPLIER[bonus]
     if len(tiles) == 7:
@@ -837,7 +856,7 @@ def _cross_checks(
                 continue
             probe = _word_at(state, row, col, pr, pc, "A")
             if len(probe) == 1:
-                allowed[(row, col)] = set(LETTER_VALUES)
+                allowed[(row, col)] = set(ALL_LETTERS)
             else:
                 letters: set[str] = set()
                 for char in LETTER_VALUES:
@@ -903,55 +922,54 @@ def generate_moves(
     excluded.discard("")
     initial_rack = Counter(state.rack)
     rack_size = sum(initial_rack.values())
-    board_has_tiles = _has_tiles(state)
-    best: list[Move] = []
+    best: list[_Candidate] = []
+    connection_squares = set(_anchors(state))
 
-    def rank(move: Move) -> tuple[int, str, int, int, str]:
+    def rank(move: _Candidate) -> tuple[int, str, int, int, str]:
         return (-move.score, move.word, move.row, move.col, move.direction)
 
-    def consider(move: Move) -> None:
-        key = (move.word, move.row, move.col, move.direction)
-        for index, current in enumerate(best):
-            if (current.word, current.row, current.col, current.direction) == key:
-                if rank(move) < rank(current):
-                    best[index] = move
-                    best.sort(key=rank)
-                return
-        if len(best) < limit or rank(move) < rank(best[-1]):
-            best.append(move)
+    def consider(word: str, row: int, col: int, direction: Direction, score: int,
+                 tiles: list[_InternalTile], cross_words: list[str]) -> None:
+        candidate = _Candidate(word, row, col, direction, score, tuple(tiles), tuple(cross_words))
+        if any(
+            (current.word, current.row, current.col, current.direction)
+            == (candidate.word, candidate.row, candidate.col, candidate.direction)
+            for current in best
+        ):
+            return
+        if len(best) < limit or rank(candidate) < rank(best[-1]):
+            best.append(candidate)
             best.sort(key=rank)
             del best[limit:]
 
     directions: tuple[Direction, ...] = ("H", "V")
     for direction in directions:
-        move_direction: Direction = direction
-        dr, dc = (0, 1) if move_direction == "H" else (1, 0)
-        checks = _cross_checks(state, lexicon, move_direction, excluded)
-        for start_row, start_col in _candidate_starts(state, move_direction, rack_size):
+        dr, dc = (0, 1) if direction == "H" else (1, 0)
+        checks = _cross_checks(state, lexicon, direction, excluded)
+        for start_row, start_col in _candidate_starts(state, direction, rack_size, connection_squares):
             rack = initial_rack.copy()
 
-            def walk(row: int, col: int, state_id: int, tiles: list[PlacedTile]) -> None:
+            def walk(row: int, col: int, state_id: int, tiles: list[_InternalTile],
+                     word_letters: list[str], connected: bool) -> None:
                 # A word can end only before an empty square or at the board edge;
                 # an adjacent existing tile must be consumed as part of the word.
                 if (
                     lexicon.terminal(state_id)
                     and (not _in_bounds(row, col) or not _letter(state, row, col))
                 ):
-                    word, word_row, word_col = _materialise_move(state, (start_row, start_col), move_direction, tiles)
-                    connected = (_touches_board(state, tiles) if board_has_tiles
-                                 else any(tile.row == 7 and tile.col == 7 for tile in tiles))
+                    word = "".join(word_letters)
                     if word not in excluded and len(word) >= 2 and tiles and connected:
-                        score, cross_words = _score_move(state, word, word_row, word_col, move_direction, tiles)
-                        consider(Move(word=word, row=word_row, col=word_col, direction=move_direction,
-                                      score=score, tiles=tiles.copy(), cross_words=cross_words,
-                                      bingo=len(tiles) == 7))
+                        score, cross_words = _score_move(state, word, start_row, start_col, direction, tuple(tiles))
+                        consider(word, start_row, start_col, direction, score, tiles, cross_words)
                 if not _in_bounds(row, col):
                     return
                 existing = _letter(state, row, col)
                 if existing:
                     child = lexicon.transition(state_id, existing)
                     if child is not None:
-                        walk(row + dr, col + dc, child, tiles)
+                        word_letters.append(existing)
+                        walk(row + dr, col + dc, child, tiles, word_letters, connected)
+                        word_letters.pop()
                     return
                 if len(tiles) >= rack_size:
                     return
@@ -960,16 +978,31 @@ def generate_moves(
                         continue
                     if rack[char] > 0:
                         rack[char] -= 1
-                        tiles.append(PlacedTile(row=row, col=col, letter=char))
-                        walk(row + dr, col + dc, child, tiles)
-                        _ = tiles.pop()
+                        tiles.append(_InternalTile(row, col, char, False))
+                        word_letters.append(char)
+                        walk(row + dr, col + dc, child, tiles, word_letters,
+                             connected or (row, col) in connection_squares)
+                        word_letters.pop()
+                        tiles.pop()
                         rack[char] += 1
                     if rack["?"] > 0:
                         rack["?"] -= 1
-                        tiles.append(PlacedTile(row=row, col=col, letter=char, is_blank=True))
-                        walk(row + dr, col + dc, child, tiles)
-                        _ = tiles.pop()
+                        tiles.append(_InternalTile(row, col, char, True))
+                        word_letters.append(char)
+                        walk(row + dr, col + dc, child, tiles, word_letters,
+                             connected or (row, col) in connection_squares)
+                        word_letters.pop()
+                        tiles.pop()
                         rack["?"] += 1
 
-            walk(start_row, start_col, lexicon.root, [])
-    return best
+            walk(start_row, start_col, lexicon.root, [], [], False)
+    return [
+        Move(
+            word=candidate.word, row=candidate.row, col=candidate.col, direction=candidate.direction,
+            score=candidate.score,
+            tiles=[PlacedTile(row=tile.row, col=tile.col, letter=tile.letter, is_blank=tile.is_blank)
+                   for tile in candidate.tiles],
+            cross_words=list(candidate.cross_words), bingo=len(candidate.tiles) == 7,
+        )
+        for candidate in best
+    ]

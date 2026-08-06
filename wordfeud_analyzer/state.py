@@ -192,8 +192,7 @@ def apply_place_request(
     return apply_move(state, move)
 
 
-def replace_from_upload(current: BoardState, extracted: object) -> BoardState:
+def replace_from_upload(_current: BoardState, extracted: object) -> BoardState:
     """Validate an upload replacement before the caller swaps working state."""
-    _ = current
     candidate = getattr(extracted, "state", extracted)
     return validate_snapshot(candidate.model_dump(mode="json") if isinstance(candidate, BoardState) else candidate)
