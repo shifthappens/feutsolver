@@ -334,7 +334,13 @@
       nameInput?.addEventListener("input", event => { saveName = event.target.value; saveNameDirty = true; });
       document.getElementById("save-button")?.addEventListener("click", () => {
         const name = (nameInput?.value || saveName || "").trim();
-        const result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId, storageNamespace());
+        let result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId, storageNamespace());
+        if (!result.ok && result.duplicateId && !activeSaveId) {
+          if (!window.confirm(`Er bestaat al een opgeslagen spel met de naam “${result.duplicateName}”. Wil je dit spel overschrijven?`)) {
+            return showNotice("Opslaan geannuleerd; het bestaande spel is niet gewijzigd.", "");
+          }
+          result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId, storageNamespace(), result.duplicateId);
+        }
         if (!result.ok) return showNotice(result.error, "error");
         resetAutosave();
         const link = setActive(result.record.id, result.record.name);

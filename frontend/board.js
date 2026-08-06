@@ -300,14 +300,22 @@
     }
   }
 
-  function saveSnapshot(storage, name, snapshot, activeId, namespace) {
+  function saveSnapshot(storage, name, snapshot, activeId, namespace, overwriteId) {
     const cleanName = String(name || "").trim();
     if (!cleanName) return { ok: false, error: "Geef het spel een naam." };
     const loaded = readSaves(storage, namespace);
     if (!loaded.ok) return { ok: false, error: loaded.error || "Opgeslagen spellen konden niet veilig worden gewijzigd." };
     const duplicate = loaded.records.find(record => record.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase() && record.id !== activeId);
-    if (duplicate) return { ok: false, error: "Die naam bestaat al." };
-    const previous = loaded.records.find(record => record.id === activeId);
+    if (duplicate && duplicate.id !== overwriteId) {
+      return {
+        ok: false,
+        error: "Die naam bestaat al.",
+        duplicateId: duplicate.id,
+        duplicateName: duplicate.name,
+      };
+    }
+    const previous = loaded.records.find(record => record.id === (overwriteId || activeId));
+    if (overwriteId && !previous) return { ok: false, error: "Het te overschrijven spel is niet meer beschikbaar." };
     const record = recordFromSnapshot(cleanName, snapshot, previous);
     const records = previous ? loaded.records.map(item => item.id === previous.id ? record : item) : [...loaded.records, record];
     const written = writeSaves(storage, records, namespace);

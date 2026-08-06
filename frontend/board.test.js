@@ -99,11 +99,18 @@ test("a new solve token resets the selected suggestion", () => {
   assert.equal(WF.suggestionSelection("solve-1", "solve-1", 6, 6), 0);
 });
 
-test("save CRUD enforces unique names and skips corrupt records", () => {
+test("save CRUD requires explicit overwrite permission for duplicate names", () => {
   const storage = memoryStorage();
   const first = WF.saveSnapshot(storage, "Eerste", snapshot(["A"]));
   assert.equal(first.ok, true);
-  assert.equal(WF.saveSnapshot(storage, "eerste", snapshot(), null).ok, false);
+  const duplicate = WF.saveSnapshot(storage, "eerste", snapshot(), null);
+  assert.equal(duplicate.ok, false);
+  assert.equal(duplicate.duplicateId, first.record.id);
+  assert.equal(duplicate.duplicateName, "Eerste");
+  const overwritten = WF.saveSnapshot(storage, "eerste", snapshot(["?"]), null, undefined, duplicate.duplicateId);
+  assert.equal(overwritten.ok, true);
+  assert.equal(overwritten.record.id, first.record.id);
+  assert.deepEqual(WF.snapshotFromRecord(WF.readSaves(storage).records[0]).rack, ["?"]);
   const updated = WF.saveSnapshot(storage, "Eerste", snapshot(["?"]), first.record.id);
   assert.equal(updated.ok, true);
   const raw = JSON.parse(storage.getItem(WF.STORAGE_KEY));
