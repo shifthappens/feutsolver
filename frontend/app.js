@@ -19,10 +19,73 @@
     let localChangesPending = false;
     let focusVisibilityFrame = null;
     let focusVisibilityTimers = [];
+    const DRAFT_STORAGE_KEY = "wordfeud-board-draft-v1";
 
     function storage() { try { return window.localStorage; } catch (_error) { return null; } }
+    function draftStorage() { try { return window.sessionStorage; } catch (_error) { return null; } }
     function storageNamespace() { return String(props.storage_namespace || "unauthenticated"); }
     function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+    function draftStorageKey() {
+      const namespace = encodeURIComponent(storageNamespace()).slice(0, 128);
+      return `${DRAFT_STORAGE_KEY}:${namespace}:${boardVersion}`;
+    }
+    function validSelection(selection) {
+      if (!selection || typeof selection !== "object") return null;
+      if (selection.kind === "board" && Number.isInteger(selection.row) && Number.isInteger(selection.col) &&
+          selection.row >= 0 && selection.row < WF.SIZE && selection.col >= 0 && selection.col < WF.SIZE) {
+        return { kind: "board", row: selection.row, col: selection.col, index: 0 };
+      }
+      if (selection.kind === "rack" && Number.isInteger(selection.index) &&
+          selection.index >= 0 && selection.index < WF.MAX_RACK) {
+        const caret = Number.isInteger(selection.caret) ? Math.max(0, Math.min(WF.MAX_RACK, selection.caret)) : selection.index;
+        return { kind: "rack", row: 0, col: 0, index: selection.index, caret };
+      }
+      return null;
+    }
+    function clearDraft() {
+      const source = draftStorage();
+      if (!source) return;
+      try { source.removeItem(draftStorageKey()); } catch (_error) { /* sessionStorage is best effort */ }
+    }
+    function persistDraft() {
+      if (!editor || props.mode === "preview" || !WF.isSnapshot(editor.snapshot)) return;
+      const source = draftStorage();
+      if (!source) return;
+      try {
+        source.setItem(draftStorageKey(), JSON.stringify({
+          schemaVersion: 1,
+          snapshot: editor.snapshot,
+          selection: editor.selection,
+          direction: editor.direction,
+        }));
+      } catch (_error) { /* sessionStorage is best effort */ }
+    }
+    function restoreDraft() {
+      if (props.mode === "preview") {
+        clearDraft();
+        return false;
+      }
+      const source = draftStorage();
+      if (!source) return false;
+      let draft;
+      try {
+        const raw = source.getItem(draftStorageKey());
+        draft = raw ? JSON.parse(raw) : null;
+      } catch (_error) {
+        clearDraft();
+        return false;
+      }
+      const selection = validSelection(draft?.selection);
+      if (draft?.schemaVersion !== 1 || !WF.isSnapshot(draft?.snapshot) || !selection) {
+        if (draft) clearDraft();
+        return false;
+      }
+      editor = WF.createEditor(draft.snapshot);
+      editor.selection = selection;
+      editor.direction = draft.direction === "V" ? "V" : "H";
+      localChangesPending = !same(editor.snapshot, props.snapshot);
+      return true;
+    }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[character]));
     }
@@ -227,6 +290,7 @@
       // reruns Streamlit and can blur this input on mobile browsers.
       if (changesSnapshot) localChangesPending = true;
       editor = WF.reduceEditor(editor, action);
+      persistDraft();
       render();
       if (changesSnapshot) {
         markAutosaveDirty();
@@ -308,11 +372,12 @@
       Streamlit.setFrameHeight(document.body.scrollHeight + 16);
     }
     function bindEvents() {
-      document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); render(); scheduleAutosave(); focusKeyboard(); }));
-      document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); render(); scheduleAutosave(); focusKeyboard(); }));
+      document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); persistDraft(); render(); scheduleAutosave(); focusKeyboard(); }));
+      document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); persistDraft(); render(); scheduleAutosave(); focusKeyboard(); }));
       document.querySelectorAll("[data-suggestion]").forEach(button => button.addEventListener("click", () => { selectedSuggestion = Number(button.dataset.suggestion); render(); }));
       document.getElementById("new-button")?.addEventListener("click", () => {
         resetAutosave();
+        clearDraft();
         localChangesPending = false;
         const link = setActive(null, "");
         if (!link.ok) return showNotice(`Nieuw bord kon niet worden geopend omdat de actieve spelopslag niet kon worden gewist: ${link.error}`, "error");
@@ -353,6 +418,7 @@
         const snapshot = record && WF.snapshotFromRecord(record);
         if (!snapshot) return showNotice("Dit opgeslagen spel is ongeldig of niet meer beschikbaar.", "error");
         resetAutosave();
+        clearDraft();
         localChangesPending = false;
         const link = setActive(record.id, record.name);
         if (!link.ok) return showNotice(`Opgeslagen spel kon niet worden geladen omdat de actieve spelopslag niet kon worden opgeslagen: ${link.error}`, "error");
@@ -383,6 +449,7 @@
       document.getElementById("clear-local-button")?.addEventListener("click", () => {
         if (!window.confirm("Alle lokaal opgeslagen spellen en voorkeuren op dit apparaat wissen?")) return;
         resetAutosave();
+        clearDraft();
         const cleared = WF.clearSaves(storage(), storageNamespace());
         if (!cleared.ok) return showNotice(cleared.error, "error");
         activeSaveId = null; activeSaveName = ""; saveName = ""; saveNameDirty = false;
@@ -413,13 +480,17 @@
         const boardWasReplaced = Number.isFinite(incomingBoardVersion) && incomingBoardVersion !== boardVersion;
         if (Number.isFinite(incomingBoardVersion)) boardVersion = incomingBoardVersion;
         if (boardWasReplaced) {
+          clearDraft();
           closeActiveSave();
           localChangesPending = false;
         }
         let restoredActive = false;
-        if (!initialized) { restoredActive = restoreActive(); initialized = true; }
+        const firstRender = !initialized;
+        if (firstRender) { restoredActive = restoreActive(); initialized = true; restoreDraft(); }
+        if (props.mode === "preview") clearDraft();
         const incomingSnapshotChanged = Boolean(editor) && !same(editor.snapshot, props.snapshot);
         if (!editor || (!restoredActive && incomingSnapshotChanged && !localChangesPending)) {
+          if (incomingSnapshotChanged && !localChangesPending) clearDraft();
           editor = WF.createEditor(props.snapshot);
           localChangesPending = false;
           if (incomingSnapshotChanged && !restoredActive && !boardWasReplaced) markAutosaveDirty();
@@ -433,6 +504,7 @@
           editor = WF.createEditor(response.snapshot); props.mode = "edit";
           localChangesPending = false;
           resetAutosave();
+          clearDraft();
           if (activeSaveId) {
             const saved = WF.autosaveSnapshot(storage(), activeSaveName, response.snapshot, activeSaveId, storageNamespace());
             if (saved.ok) showAutosaveSuccess(saved.record);
