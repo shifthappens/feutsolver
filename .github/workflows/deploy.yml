@@ -87,6 +87,7 @@ jobs:
       - name: Prepare mutable wordlist merge state
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           WORDLIST_BASE_REVISION: ${{ inputs.wordlist_base_revision }}
@@ -97,28 +98,29 @@ jobs:
               exit 1
               ;;
           esac
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
              mkdir -p '${DEPLOY_PATH}/.wordlist-sync'
              chmod g+rwx '${DEPLOY_PATH}/.wordlist-sync'"
           git show "${WORDLIST_BASE_REVISION}:data/opentaal-wordlist.txt" \
             > "${RUNNER_TEMP}/wordlist-initial-repository.txt"
-          rsync -rlptDz --chmod=Fu=rw,Fg=rw,Fo= \
+          rsync -rlptDz --chmod=Fu=rw,Fg=rw,Fo= -e "ssh -p ${DEPLOY_PORT}" \
             "${RUNNER_TEMP}/wordlist-initial-repository.txt" \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/.wordlist-sync/initial-repository.txt"
-          rsync -rlptDz --chmod=Fu=rw,Fg=rw,Fo= \
+          rsync -rlptDz --chmod=Fu=rw,Fg=rw,Fo= -e "ssh -p ${DEPLOY_PORT}" \
             data/opentaal-wordlist.txt \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/.wordlist-sync/incoming-repository.txt"
 
       - name: Prepare immutable release directory
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
              mkdir -p '${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
@@ -127,12 +129,13 @@ jobs:
       - name: Sync application files only
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           # www-data runs the service; setgid keeps the project service group on new files.
-          rsync -rlptDz --delete --chmod=Du=rwx,Dg=rxs,Do=,Fu=rw,Fg=r,Fo= \
+          rsync -rlptDz --delete --chmod=Du=rwx,Dg=rxs,Do=,Fu=rw,Fg=r,Fo= -e "ssh -p ${DEPLOY_PORT}" \
             --include='/.streamlit/' \
             --include='/.streamlit/config.toml' \
             --include='/frontend/' \
@@ -153,39 +156,41 @@ jobs:
             --exclude='*' \
             ./ \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${RELEASE_COMMIT}"
-          rsync -rlptDz --chmod=Fu=rw,Fg=r,Fo= \
+          rsync -rlptDz --chmod=Fu=rw,Fg=r,Fo= -e "ssh -p ${DEPLOY_PORT}" \
             "$RUNNER_TEMP/sbom.json" "$RUNNER_TEMP/release-manifest.json" \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${RELEASE_COMMIT}/"
 
       - name: Merge repository and production wordlists
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "python3 - '${DEPLOY_PATH}'" < ops/wordlist_sync.py
 
       - name: Build the release lexicon cache from the merged wordlist
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/merged-lexicon"
-          rsync -rtDz \
+          rsync -rtDz -e "ssh -p ${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/data/opentaal-wordlist.txt" \
             "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt"
           APP_ENV=production FEUTSOLVER_RUNTIME_CACHE_WRITE=1 python -c \
             'from sys import argv; from wordfeud_analyzer.move_generator import load_wordlist; load_wordlist(argv[1])' \
             "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt"
           test -s "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt.gaddag-cache-v3.json"
-          rsync -rlptDz --chmod=Fu=rw,Fg=r,Fo= \
+          rsync -rlptDz --chmod=Fu=rw,Fg=r,Fo= -e "ssh -p ${DEPLOY_PORT}" \
             "$RUNNER_TEMP/merged-lexicon/opentaal-wordlist.txt.gaddag-cache-v3.json" \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/releases/${RELEASE_COMMIT}/data/"
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
              release='${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
@@ -197,12 +202,13 @@ jobs:
       - name: Activate release atomically
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           RELEASE_COMMIT: ${{ github.sha }}
           SERVICE_USER: ${{ vars.FEUTSOLVER_SERVICE_USER || 'www-data' }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
              release='${DEPLOY_PATH}/releases/${RELEASE_COMMIT}'
@@ -235,11 +241,12 @@ jobs:
       - name: Re-assert and verify service-readable permissions
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           SERVICE_USER: ${{ vars.FEUTSOLVER_SERVICE_USER || 'www-data' }}
         run: |
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "${DEPLOY_PORT}" \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "set -eu
              active='${DEPLOY_PATH}/current'

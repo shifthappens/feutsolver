@@ -10,3 +10,6 @@ data/*.txt
 data/*.gaddag-cache-*
 !data/voorbeeld_woorden.txt
 !data/opentaal-wordlist.txt
+
+# Runbook with server access details — kept local, not published to this public repo.
+docs/production-vps.md
