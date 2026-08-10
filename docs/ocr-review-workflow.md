@@ -17,7 +17,7 @@ ten onrechte als productieresultaat geldt.
    gekalibreerde betrouwbaarheid tot een schijnbaar onafhankelijke bevestiging.
 5. Voeg een regressietest toe voor zowel het foutpaar als de productie-invariant
    (geen host-fontafhankelijkheid, gevalideerde fixtures en geen vaste zekerheid).
-   Voer vervolgens `python -m pytest -q` en `node --test frontend/board.test.js` uit.
+   Voer vervolgens `python -m pytest -q` en `node --test frontend/*.test.js` uit.
 6. Laat Claude Opus de wijziging reviewen: maximaal zes rondes, de eerste twee met
    `--effort high` en daarna `--effort medium`. Geef per ronde de fout, de diff,
    testresultaten en open risico's mee. Alleen een expliciet `APPROVED` telt als

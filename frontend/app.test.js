@@ -1,0 +1,210 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const WF = require("./board.js");
+
+function snapshot(rack = []) {
+  const grid = Array.from({ length: 15 }, () => Array.from({ length: 15 }, () => ({
+    letter: null,
+    bonus: "NORMAL",
+    is_blank: false,
+  })));
+  return { grid, rack };
+}
+
+function memoryStorage() {
+  const values = new Map();
+  return {
+    getItem: key => values.get(key) || null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: key => values.delete(key),
+  };
+}
+
+class FakeElement {
+  constructor(document, tagName, attributes = {}) {
+    this.ownerDocument = document;
+    this.tagName = tagName.toUpperCase();
+    this.attributes = attributes;
+    this.dataset = {};
+    this.id = attributes.id || "";
+    this.className = attributes.class || "";
+    this.style = {};
+    this.listeners = new Map();
+    for (const [key, value] of Object.entries(attributes)) {
+      if (key.startsWith("data-")) this.dataset[key.slice(5)] = value;
+    }
+  }
+
+  addEventListener(type, handler) {
+    const handlers = this.listeners.get(type) || [];
+    handlers.push(handler);
+    this.listeners.set(type, handlers);
+  }
+
+  dispatchEvent(event) {
+    event.target ||= this;
+    for (const handler of this.listeners.get(event.type) || []) handler(event);
+    return true;
+  }
+
+  click() { this.dispatchEvent({ type: "click", target: this }); }
+
+  focus() { this.ownerDocument.activeElement = this; }
+
+  blur() {
+    if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body;
+  }
+
+  getBoundingClientRect() {
+    return { top: 0, bottom: 20, left: 0, right: 20, width: 20, height: 20 };
+  }
+
+  closest(selector) { return selector === "button" && this.tagName === "BUTTON" ? this : null; }
+
+  matches(selector) {
+    if (selector === "[data-row], [data-rack]") return "row" in this.dataset || "rack" in this.dataset;
+    return false;
+  }
+}
+
+class FakeApp extends FakeElement {
+  set innerHTML(value) {
+    this.children = [];
+    const elements = /<(button|input|select)\b([^>]*)>/g;
+    for (const match of value.matchAll(elements)) {
+      const attributes = {};
+      for (const attribute of match[2].matchAll(/([\w-]+)="([^"]*)"/g)) attributes[attribute[1]] = attribute[2];
+      this.children.push(new FakeElement(this.ownerDocument, match[1], attributes));
+    }
+  }
+
+  querySelectorAll(selector) { return this.ownerDocument.querySelectorAll(selector); }
+}
+
+class FakeDocument {
+  constructor() {
+    this.body = { scrollHeight: 500 };
+    this.activeElement = this.body;
+    this.listeners = new Map();
+    this.keyboard = new FakeElement(this, "input", { id: "keyboard" });
+    this.app = new FakeApp(this, "main", { id: "app" });
+  }
+
+  addEventListener(type, handler) {
+    const handlers = this.listeners.get(type) || [];
+    handlers.push(handler);
+    this.listeners.set(type, handlers);
+  }
+
+  getElementById(id) {
+    if (id === "keyboard") return this.keyboard;
+    if (id === "app") return this.app;
+    return this.app.children.find(child => child.id === id) || null;
+  }
+
+  querySelectorAll(selector) {
+    const children = this.app.children || [];
+    if (selector === "[data-row]") return children.filter(child => "row" in child.dataset);
+    if (selector === "[data-rack]") return children.filter(child => "rack" in child.dataset);
+    if (selector === "[data-suggestion]") return children.filter(child => "suggestion" in child.dataset);
+    return [];
+  }
+
+  querySelector(selector) {
+    const children = this.app.children || [];
+    if (selector === ".cell.selected") return children.find(child => child.className.split(" ").includes("cell") && child.className.split(" ").includes("selected")) || null;
+    if (selector === ".rack-slot.selected") return children.find(child => child.className.split(" ").includes("rack-slot") && child.className.split(" ").includes("selected")) || null;
+    return null;
+  }
+}
+
+class EventBus {
+  constructor() { this.listeners = []; }
+  addEventListener(_type, listener) { this.listeners.push(listener); }
+  dispatch(args) { for (const listener of this.listeners) listener({ detail: { args } }); }
+}
+
+function loadController() {
+  const document = new FakeDocument();
+  const events = new EventBus();
+  const messages = [];
+  const window = {
+    WordfeudBoard: WF,
+    localStorage: memoryStorage(),
+    sessionStorage: memoryStorage(),
+    parent: null,
+    clearTimeout: () => {},
+    setTimeout: () => 1,
+    cancelAnimationFrame: () => {},
+    requestAnimationFrame: () => 1,
+    visualViewport: null,
+  };
+  window.parent = window;
+  const streamlit = {
+    RENDER_EVENT: "streamlit:render",
+    events,
+    setComponentValue: value => messages.push(value),
+    setComponentReady: () => {},
+    setFrameHeight: () => {},
+  };
+  const context = vm.createContext({
+    window,
+    document,
+    Element: FakeElement,
+    Streamlit: streamlit,
+    console,
+    JSON,
+    Math,
+    Date,
+    CustomEvent: class CustomEvent {},
+  });
+  vm.runInContext(fs.readFileSync("frontend/app.js", "utf8"), context, { filename: "frontend/app.js" });
+  return { document, events, messages };
+}
+
+function editProps(source, response = null) {
+  return {
+    snapshot: source,
+    board_version: 0,
+    mode: "edit",
+    solve_result: null,
+    response,
+    storage_namespace: "test",
+  };
+}
+
+test("rack selection survives a rerun before the first tile is typed", () => {
+  const controller = loadController();
+  const source = snapshot(["A"]);
+  const empty = snapshot();
+  controller.events.dispatch(editProps(source));
+  controller.events.dispatch({
+    ...editProps(source),
+    mode: "preview",
+    solve_result: {
+      token: "solve-1",
+      state_hash: "hash",
+      moves: [{ word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] }],
+    },
+  });
+  controller.document.getElementById("place-button").click();
+  controller.events.dispatch(editProps(empty, { kind: "place_result", ok: true, snapshot: empty }));
+
+  controller.document.querySelectorAll("[data-rack]")[0].click();
+  assert.ok(controller.document.querySelector(".rack-slot.selected"));
+
+  // This is the stale/different snapshot that used to recreate the editor
+  // with the default board selection before the key event was handled.
+  controller.events.dispatch(editProps(source));
+  assert.ok(controller.document.querySelector(".rack-slot.selected"));
+  assert.equal(controller.document.querySelector(".cell.selected"), null);
+
+  const keyboard = controller.document.getElementById("keyboard");
+  keyboard.dispatchEvent({ type: "keydown", key: "B", preventDefault() {} });
+  const rack = controller.document.querySelectorAll("[data-rack]");
+  assert.equal(rack[0].className.includes("empty"), false);
+  assert.equal(rack[1].className.includes("selected"), true);
+  assert.equal(controller.document.querySelector(".cell.selected"), null);
+});

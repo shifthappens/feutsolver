@@ -42,7 +42,7 @@ jobs:
           python ops/check_lockfiles.py
           python -m pip check
           python -m pytest -q
-          node --test frontend/board.test.js
+          node --test frontend/*.test.js
           pip-audit -r requirements.txt --strict
           # Requirements hashes are public package metadata, not credentials.
           detect-secrets scan --all-files --force-use-all-plugins \

@@ -121,7 +121,7 @@ De lijst is vrij beschikbaar onder voorwaarden; neem de licentie en bronvermeldi
 
 ```bash
 python -m pytest -q
-node --test frontend/board.test.js
+node --test frontend/*.test.js
 python ops/check_lockfiles.py
 ```
 

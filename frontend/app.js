@@ -489,11 +489,19 @@
           localChangesPending = false;
         }
         let restoredActive = false;
+        let restoredDraft = false;
         const firstRender = !initialized;
-        if (firstRender) { restoredActive = restoreActive(); initialized = true; restoreDraft(); }
+        if (firstRender) { restoredActive = restoreActive(); initialized = true; }
         if (props.mode === "preview") clearDraft();
         const incomingSnapshotChanged = Boolean(editor) && !same(editor.snapshot, props.snapshot);
-        if (!editor || (!restoredActive && incomingSnapshotChanged && !localChangesPending)) {
+        // A Streamlit rerun can arrive between selecting a rack slot and the
+        // first typed tile. Reconcile a persisted local draft before falling
+        // back to createEditor(), which defaults to board (7,7) and discards
+        // the rack selection.
+        if (props.mode !== "preview" && (firstRender || (!restoredActive && incomingSnapshotChanged && !localChangesPending))) {
+          restoredDraft = restoreDraft();
+        }
+        if (!editor || (!restoredActive && !restoredDraft && incomingSnapshotChanged && !localChangesPending)) {
           if (incomingSnapshotChanged && !localChangesPending) clearDraft();
           editor = WF.createEditor(props.snapshot);
           localChangesPending = false;
