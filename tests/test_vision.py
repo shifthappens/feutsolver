@@ -148,7 +148,7 @@ def test_the_strip_holds_the_tiles_in_reading_order(tmp_path: Path) -> None:
         y = 6 + cell // 2
         source = board.getpixel((int((col + 0.5) * board.size[0] / BOARD_SIZE),
                                  int((row + 0.5) * board.size[1] / BOARD_SIZE)))
-    assert strip.getpixel((x, y)) == source
+        assert strip.getpixel((x, y)) == source
 
 
 def test_local_rack_geometry_finds_all_tiles_without_reading_the_letters() -> None:
@@ -233,15 +233,25 @@ def test_external_backend_requires_a_real_requester_identity(tmp_path: Path) -> 
         )
 
 
-def test_recovery_sheet_enlarges_and_numbers_a_dense_tile_sequence(tmp_path: Path) -> None:
+def test_recovery_sheet_enlarges_and_labels_each_tile(tmp_path: Path) -> None:
     tiles = [(7, 7), (7, 8), (8, 8)]
     path = _screenshot(tmp_path / "board.png", DARK_THEME, set(tiles))
     board, _ = _wordfeud_crop_images(path)
 
-    sheet = tile_contact_sheet(board, tiles)
+    sheet = tile_contact_sheet(board, tiles, indexes=[7, 19, 42], columns=2)
 
-    assert sheet.width >= 1_000
-    assert sheet.height > 140
+    assert sheet.size == (264, 336)
+    for position in range(len(tiles)):
+        column = position % 2
+        row = position // 2
+        left = 8 + column * 128
+        top = 8 + row * 164
+        label = sheet.crop((left, top, left + 120, top + 36))
+        assert any(
+            label.getpixel((x, y)) != (255, 255, 255)
+            for x in range(label.width)
+            for y in range(label.height)
+        )
 
 
 def test_deciding_crop_order_is_neither_forward_nor_reverse() -> None:

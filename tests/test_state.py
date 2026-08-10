@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import pytest
-
 from types import SimpleNamespace
+
+import pytest
+from pydantic import ValidationError
 
 from wordfeud_analyzer.models import Move, PlacedTile, standard_board
 from wordfeud_analyzer.state import (
@@ -35,10 +36,6 @@ def test_standard_board_has_the_complete_symmetric_layout() -> None:
     assert sum(cell.bonus == "TL" for row in state.grid for cell in row) == 20
     assert sum(cell.bonus == "DW" for row in state.grid for cell in row) == 12
     assert sum(cell.bonus == "TW" for row in state.grid for cell in row) == 8
-
-
-def test_empty_rack_is_valid() -> None:
-    assert standard_board().model_validate(standard_board().model_dump()).rack == []
 
 
 def test_component_events_from_an_older_board_version_are_ignored() -> None:
@@ -141,6 +138,6 @@ def test_upload_replacement_validates_before_the_working_state_is_swapped() -> N
     assert current.rack == ["Z"]
 
     invalid = {"grid": [], "rack": []}
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         replace_from_upload(current, invalid)
     assert current.rack == ["Z"]

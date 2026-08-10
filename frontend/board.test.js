@@ -27,7 +27,7 @@ test("board selection toggles direction, overwrites, deletes, and backspaces", (
   assert.deepEqual(editor.selection, { kind:"board", row:4, col:4, index:0 });
 });
 
-test("rack accepts blanks, compacts after deletion, and rejects gaps", () => {
+test("rack accepts blanks, appends out-of-range selections, and compacts after deletion", () => {
   let editor = WF.createEditor(snapshot());
   editor = WF.reduceEditor(editor, { type:"select_rack", index:5 });
   editor = WF.reduceEditor(editor, { type:"set_rack", tile:"?" });

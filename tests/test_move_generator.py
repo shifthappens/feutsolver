@@ -143,7 +143,7 @@ def test_remove_word_from_wordlist_removes_diacritic_spelling(tmp_path: Path) ->
     assert not load_wordlist(source).contains("FACADE")
 
 
-def test_remove_words_from_wordlist_updates_a_bulk_selection_atomically(tmp_path: Path) -> None:
+def test_remove_words_from_wordlist_normalises_and_deduplicates_a_bulk_selection(tmp_path: Path) -> None:
     source = tmp_path / "lijst.txt"
     _ = source.write_text("kat\nfaçade\nkamer\nGINS\n", encoding="utf-8")
 
@@ -233,3 +233,5 @@ def test_a_confirmed_word_makes_a_move_possible_that_was_rejected_before(tmp_pat
     after = load_wordlist(source)
     assert after.contains("ZQX")
     assert after.contains("GINS")
+    after_moves = generate_moves(state, after, limit=20)
+    assert any(move.word == "GINS" for move in after_moves)
