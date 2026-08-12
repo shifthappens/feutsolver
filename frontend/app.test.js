@@ -126,13 +126,13 @@ class EventBus {
   dispatch(args) { for (const listener of this.listeners) listener({ detail: { args } }); }
 }
 
-function loadController() {
+function loadController(localStorage = memoryStorage()) {
   const document = new FakeDocument();
   const events = new EventBus();
   const messages = [];
   const window = {
     WordfeudBoard: WF,
-    localStorage: memoryStorage(),
+    localStorage,
     sessionStorage: memoryStorage(),
     parent: null,
     clearTimeout: () => {},
@@ -161,7 +161,7 @@ function loadController() {
     CustomEvent: class CustomEvent {},
   });
   vm.runInContext(fs.readFileSync("frontend/app.js", "utf8"), context, { filename: "frontend/app.js" });
-  return { document, events, messages };
+  return { document, events, messages, localStorage };
 }
 
 function editProps(source, response = null) {
@@ -207,4 +207,53 @@ test("rack selection survives a rerun before the first tile is typed", () => {
   assert.equal(rack[0].className.includes("empty"), false);
   assert.equal(rack[1].className.includes("selected"), true);
   assert.equal(controller.document.querySelector(".cell.selected"), null);
+});
+
+test("editing an active saved game waits for an explicit save", () => {
+  const localStorage = memoryStorage();
+  const source = snapshot(["A"]);
+  const saved = WF.saveSnapshot(localStorage, "Partij", source, null, "test");
+  assert.equal(saved.ok, true);
+  assert.equal(WF.setActiveSaveId(localStorage, saved.record.id, "test").ok, true);
+
+  const controller = loadController(localStorage);
+  controller.events.dispatch(editProps(source));
+  controller.document.getElementById("keyboard").dispatchEvent({ type: "keydown", key: "B", preventDefault() {} });
+
+  const beforeExplicitSave = WF.snapshotFromRecord(WF.readSaves(localStorage, "test").records[0]);
+  assert.equal(beforeExplicitSave.grid[7][7].letter, null);
+  assert.deepEqual(beforeExplicitSave.rack, ["A"]);
+
+  controller.document.getElementById("save-button").click();
+  const afterExplicitSave = WF.snapshotFromRecord(WF.readSaves(localStorage, "test").records[0]);
+  assert.equal(afterExplicitSave.grid[7][7].letter, "B");
+  assert.deepEqual(afterExplicitSave.rack, ["A"]);
+});
+
+test("placing a suggestion does not update the active saved game automatically", () => {
+  const localStorage = memoryStorage();
+  const source = snapshot(["A"]);
+  const placed = snapshot();
+  placed.grid[7][7] = { letter: "A", bonus: "NORMAL", is_blank: false };
+  const saved = WF.saveSnapshot(localStorage, "Partij", source, null, "test");
+  assert.equal(saved.ok, true);
+  assert.equal(WF.setActiveSaveId(localStorage, saved.record.id, "test").ok, true);
+
+  const controller = loadController(localStorage);
+  controller.events.dispatch(editProps(source));
+  controller.events.dispatch({
+    ...editProps(source),
+    mode: "preview",
+    solve_result: {
+      token: "solve-1",
+      state_hash: "hash",
+      moves: [{ word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] }],
+    },
+  });
+  controller.document.getElementById("place-button").click();
+  controller.events.dispatch(editProps(placed, { kind: "place_result", ok: true, snapshot: placed }));
+
+  const afterPlacement = WF.snapshotFromRecord(WF.readSaves(localStorage, "test").records[0]);
+  assert.equal(afterPlacement.grid[7][7].letter, null);
+  assert.deepEqual(afterPlacement.rack, ["A"]);
 });

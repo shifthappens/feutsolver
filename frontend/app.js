@@ -14,8 +14,6 @@
     let lastMessage = 0;
     let boardVersion = 0;
     let lastSolveToken = null;
-    let autosaveTimer = null;
-    let autosaveDirty = false;
     let localChangesPending = false;
     let focusVisibilityFrame = null;
     let focusVisibilityTimers = [];
@@ -99,55 +97,12 @@
       return result;
     }
     function closeActiveSave() {
-      resetAutosave();
       notice = null;
       const link = setActive(null, "");
       if (link.ok) return true;
       activeSaveId = null; activeSaveName = ""; saveName = ""; saveNameDirty = false;
       notice = { message:`De actieve spelopslag kon niet worden gesloten: ${link.error}`, kind:"error" };
       return false;
-    }
-    function resetAutosave() {
-      if (autosaveTimer !== null) {
-        window.clearTimeout(autosaveTimer);
-        autosaveTimer = null;
-      }
-      autosaveDirty = false;
-    }
-    function showAutosaveSuccess(record) {
-      notice = { message:`Spel “${record.name}” is automatisch opgeslagen.`, kind:"success" };
-    }
-    function runAutosave() {
-      autosaveTimer = null;
-      if (!autosaveDirty || !editor || !WF.isSnapshot(editor.snapshot)) return;
-      const saved = WF.autosaveExistingSnapshot(storage(), editor.snapshot, activeSaveId, storageNamespace());
-      if (saved.skipped) {
-        autosaveDirty = false;
-        return;
-      }
-      if (saved.ok) {
-        autosaveDirty = false;
-        activeSaveName = saved.record.name;
-        saveName = saved.record.name;
-        saveNameDirty = false;
-        showAutosaveSuccess(saved.record);
-      } else if (saved.saved) {
-        autosaveDirty = false;
-        notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
-      } else {
-        notice = { message:`Automatisch opslaan mislukt: ${saved.error}`, kind:"error" };
-      }
-      render();
-    }
-    function scheduleAutosave() {
-      if (autosaveTimer !== null) window.clearTimeout(autosaveTimer);
-      autosaveTimer = null;
-      if (!autosaveDirty || !activeSaveId || !editor || !WF.isSnapshot(editor.snapshot)) return;
-      autosaveTimer = window.setTimeout(runAutosave, 3000);
-    }
-    function markAutosaveDirty() {
-      if (activeSaveId) autosaveDirty = true;
-      scheduleAutosave();
     }
     function restoreActive() {
       const stored = WF.readActiveSaveId(storage(), storageNamespace());
@@ -292,11 +247,6 @@
       editor = WF.reduceEditor(editor, action);
       persistDraft();
       render();
-      if (changesSnapshot) {
-        markAutosaveDirty();
-      } else if (autosaveDirty) {
-        scheduleAutosave();
-      }
       focusKeyboard();
     }
     function boardLabel(row, col, cell, overlay) {
@@ -376,11 +326,10 @@
       Streamlit.setFrameHeight(document.body.scrollHeight + 16);
     }
     function bindEvents() {
-      document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); persistDraft(); render(); scheduleAutosave(); focusKeyboard(); }));
-      document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); persistDraft(); render(); scheduleAutosave(); focusKeyboard(); }));
+      document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); persistDraft(); render(); focusKeyboard(); }));
+      document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); persistDraft(); render(); focusKeyboard(); }));
       document.querySelectorAll("[data-suggestion]").forEach(button => button.addEventListener("click", () => { selectedSuggestion = Number(button.dataset.suggestion); render(); }));
       document.getElementById("new-button")?.addEventListener("click", () => {
-        resetAutosave();
         clearDraft();
         localChangesPending = false;
         const link = setActive(null, "");
@@ -411,7 +360,6 @@
           result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId, storageNamespace(), result.duplicateId);
         }
         if (!result.ok) return showNotice(result.error, "error");
-        resetAutosave();
         const link = setActive(result.record.id, result.record.name);
         if (!link.ok) return showNotice(`Opgeslagen als “${result.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${link.error}`, "error");
         showNotice(`Opgeslagen als “${result.record.name}”.`, "success");
@@ -421,7 +369,6 @@
         const record = saves().find(item => item.id === id);
         const snapshot = record && WF.snapshotFromRecord(record);
         if (!snapshot) return showNotice("Dit opgeslagen spel is ongeldig of niet meer beschikbaar.", "error");
-        resetAutosave();
         clearDraft();
         localChangesPending = false;
         const link = setActive(record.id, record.name);
@@ -433,14 +380,12 @@
         const name = (nameInput?.value || "").trim();
         const result = WF.saveSnapshot(storage(), name, editor.snapshot, activeSaveId, storageNamespace());
         if (!result.ok) return showNotice(result.error, "error");
-        resetAutosave();
         const link = setActive(result.record.id, result.record.name);
         if (!link.ok) return showNotice(`Naam gewijzigd naar “${result.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${link.error}`, "error");
         showNotice(`Naam gewijzigd naar “${result.record.name}”.`, "success");
       });
       document.getElementById("delete-button")?.addEventListener("click", () => {
         if (!activeSaveId || !window.confirm(`Opgeslagen spel “${activeSaveName}” verwijderen?`)) return;
-        resetAutosave();
         const result = WF.deleteSave(storage(), activeSaveId, storageNamespace());
         if (!result.ok) return showNotice(result.error, "error");
         const link = setActive(null, "");
@@ -452,7 +397,6 @@
       });
       document.getElementById("clear-local-button")?.addEventListener("click", () => {
         if (!window.confirm("Alle lokaal opgeslagen spellen en voorkeuren op dit apparaat wissen?")) return;
-        resetAutosave();
         clearDraft();
         const cleared = WF.clearSaves(storage(), storageNamespace());
         if (!cleared.ok) return showNotice(cleared.error, "error");
@@ -505,7 +449,6 @@
           if (incomingSnapshotChanged && !localChangesPending) clearDraft();
           editor = WF.createEditor(props.snapshot);
           localChangesPending = false;
-          if (incomingSnapshotChanged && !restoredActive && !boardWasReplaced) markAutosaveDirty();
         }
         const solveToken = props.mode === "preview" ? (props.solve_result?.token || null) : null;
         if (props.mode === "preview") selectedSuggestion = WF.suggestionSelection(lastSolveToken, solveToken, selectedSuggestion, props.solve_result?.moves?.length || 0);
@@ -515,14 +458,8 @@
         if (response.kind === "place_result" && response.ok) {
           editor = WF.createEditor(response.snapshot); props.mode = "edit";
           localChangesPending = false;
-          resetAutosave();
           clearDraft();
-          if (activeSaveId) {
-            const saved = WF.autosaveSnapshot(storage(), activeSaveName, response.snapshot, activeSaveId, storageNamespace());
-            if (saved.ok) showAutosaveSuccess(saved.record);
-            else if (saved.saved) notice = { message:`Automatisch opgeslagen aan “${saved.record.name}”, maar de actieve spelopslag kon niet worden opgeslagen: ${saved.error}`, kind:"error" };
-            else notice = { message:`Plaatsing gelukt, maar automatisch opslaan mislukte: ${saved.error}`, kind:"error" };
-          } else notice = { message:"Zet geplaatst.", kind:"success" };
+          notice = { message:"Zet geplaatst. Sla het spel handmatig op om de opgeslagen stand bij te werken.", kind:"success" };
         } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
         else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error, kind:"error" }; }
       }

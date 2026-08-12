@@ -330,23 +330,6 @@
     return writeSaves(storage, records, namespace);
   }
 
-  function autosaveSnapshot(storage, name, snapshot, activeId, namespace) {
-    const saved = saveSnapshot(storage, name, snapshot, activeId, namespace);
-    if (!saved.ok) return { ...saved, saved:false };
-    const linked = setActiveSaveId(storage, saved.record.id, namespace);
-    if (!linked.ok) return { ok:false, saved:true, record:saved.record, error:linked.error };
-    return { ok:true, saved:true, record:saved.record };
-  }
-
-  function autosaveExistingSnapshot(storage, snapshot, activeId, namespace) {
-    if (!activeId) return { ok:true, saved:false, skipped:true };
-    const loaded = readSaves(storage, namespace);
-    if (!loaded.ok) return { ok:false, saved:false, error:loaded.error || "Opgeslagen spellen konden niet veilig worden gelezen." };
-    const active = loaded.records.find(record => record.id === activeId);
-    if (!active) return { ok:true, saved:false, skipped:true };
-    return autosaveSnapshot(storage, active.name, snapshot, activeId, namespace);
-  }
-
   function clearSaves(storage, namespace) {
     const source = storage || (typeof localStorage !== "undefined" ? localStorage : null);
     if (!source) return { ok: false, error: "localStorage is niet beschikbaar." };
@@ -364,7 +347,6 @@
     clone, effectiveBonus, isSnapshot, createEditor, setBoardCell, clearBoardCell,
     setRackTile, removeRackTile, selectBoard, selectRack, suggestionSelection, moveSelection, reduceEditor,
     gridPlacement, recordFromSnapshot, snapshotFromRecord, isValidRecord, readSaves,
-    writeSaves, readActiveSaveId, setActiveSaveId, saveSnapshot, deleteSave, autosaveSnapshot,
-    autosaveExistingSnapshot, clearSaves, scopedKey,
+    writeSaves, readActiveSaveId, setActiveSaveId, saveSnapshot, deleteSave, clearSaves, scopedKey,
   };
 });
