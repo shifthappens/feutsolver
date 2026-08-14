@@ -14,6 +14,7 @@
     let lastMessage = 0;
     let boardVersion = 0;
     let lastSolveToken = null;
+    let handledResponseSignature = null;
     let localChangesPending = false;
     let focusVisibilityFrame = null;
     let focusVisibilityTimers = [];
@@ -454,17 +455,23 @@
         if (props.mode === "preview") selectedSuggestion = WF.suggestionSelection(lastSolveToken, solveToken, selectedSuggestion, props.solve_result?.moves?.length || 0);
         lastSolveToken = solveToken;
         if (props.response) {
-        const response = props.response;
-        if (response.kind === "place_result" && response.ok) {
-          editor = WF.createEditor(response.snapshot); props.mode = "edit";
-          localChangesPending = false;
-          clearDraft();
-          notice = { message:"Zet geplaatst. Sla het spel handmatig op om de opgeslagen stand bij te werken.", kind:"success" };
-        } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
-        else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error, kind:"error" }; }
-      }
-      if (props.mode === "preview" && props.solve_result && selectedSuggestion >= props.solve_result.moves.length) selectedSuggestion = 0;
-      render();
+          const response = props.response;
+          const responseSignature = JSON.stringify(response);
+          if (responseSignature !== handledResponseSignature) {
+            handledResponseSignature = responseSignature;
+            if (response.kind === "place_result" && response.ok) {
+              editor = WF.createEditor(response.snapshot); props.mode = "edit";
+              localChangesPending = false;
+              clearDraft();
+              notice = { message:"Zet geplaatst. Sla het spel handmatig op om de opgeslagen stand bij te werken.", kind:"success" };
+            } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
+            else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error, kind:"error" }; }
+          }
+        } else {
+          handledResponseSignature = null;
+        }
+        if (props.mode === "preview" && props.solve_result && selectedSuggestion >= props.solve_result.moves.length) selectedSuggestion = 0;
+        render();
     });
     Streamlit.setComponentReady();
     Streamlit.setFrameHeight(500);

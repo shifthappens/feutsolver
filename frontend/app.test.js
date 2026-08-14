@@ -71,6 +71,7 @@ class FakeElement {
 
 class FakeApp extends FakeElement {
   set innerHTML(value) {
+    this.html = value;
     this.children = [];
     const elements = /<(button|input|select)\b([^>]*)>/g;
     for (const match of value.matchAll(elements)) {
@@ -256,4 +257,28 @@ test("placing a suggestion does not update the active saved game automatically",
   const afterPlacement = WF.snapshotFromRecord(WF.readSaves(localStorage, "test").records[0]);
   assert.equal(afterPlacement.grid[7][7].letter, null);
   assert.deepEqual(afterPlacement.rack, ["A"]);
+});
+
+test("explicit save replaces the placement status and survives a replayed response", () => {
+  const localStorage = memoryStorage();
+  const source = snapshot(["A"]);
+  const placed = snapshot();
+  placed.grid[7][7] = { letter: "A", bonus: "NORMAL", is_blank: false };
+  const saved = WF.saveSnapshot(localStorage, "Partij", source, null, "test");
+  assert.equal(saved.ok, true);
+  assert.equal(WF.setActiveSaveId(localStorage, saved.record.id, "test").ok, true);
+
+  const controller = loadController(localStorage);
+  controller.events.dispatch(editProps(source));
+  const placeResponse = { kind: "place_result", ok: true, snapshot: placed };
+  controller.events.dispatch(editProps(placed, placeResponse));
+  assert.match(controller.document.app.html, /Sla het spel handmatig op/);
+
+  controller.document.getElementById("save-button").click();
+  assert.match(controller.document.app.html, /Opgeslagen als “Partij”/);
+
+  // A parent rerun can replay the last response; it must not overwrite the
+  // newer confirmation shown after the explicit save.
+  controller.events.dispatch(editProps(placed, placeResponse));
+  assert.match(controller.document.app.html, /Opgeslagen als “Partij”/);
 });
