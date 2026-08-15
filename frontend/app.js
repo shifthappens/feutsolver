@@ -18,6 +18,7 @@
     let localChangesPending = false;
     let focusVisibilityFrame = null;
     let focusVisibilityTimers = [];
+    let purgeInFlight = false;
     const DRAFT_STORAGE_KEY = "wordfeud-board-draft-v1";
 
     function storage() { try { return window.localStorage; } catch (_error) { return null; } }
@@ -291,8 +292,9 @@
     }
     function renderSuggestions(result) {
       if (!result?.moves?.length) return `<p class="empty">Geen legale zet gevonden in de gekozen woordenlijst.</p>`;
+      const purgeEnabled = Boolean(props.can_purge_suggestions) && !props.wordlist_update_active && !purgeInFlight;
       return result.moves.map((move, index) => `<article class="suggestion ${index === selectedSuggestion ? "selected" : ""}">
-        <button data-suggestion="${index}" aria-pressed="${index === selectedSuggestion}"><strong>${index + 1}. ${escapeHtml(move.word)} · ${escapeHtml(move.score)} punten</strong><small>${escapeHtml(formatMove(move))}</small></button></article>`).join("");
+        <div class="suggestion-row"><button class="suggestion-select" data-suggestion="${index}" aria-pressed="${index === selectedSuggestion}"><strong>${index + 1}. ${escapeHtml(move.word)} · ${escapeHtml(move.score)} punten</strong><small>${escapeHtml(formatMove(move))}</small></button>${props.can_purge_suggestions ? `<button class="suggestion-purge" data-purge-suggestion="${index}" aria-label="Verwijder suggestie ${escapeHtml(move.word)} uit de woordenlijst" title="Verwijder ${escapeHtml(move.word)} uit de woordenlijst" ${purgeEnabled ? "" : "disabled"}>×</button>` : ""}</div></article>`).join("");
     }
     function renderSaves(editing) {
       const loaded = WF.readSaves(storage(), storageNamespace());
@@ -330,6 +332,21 @@
       document.querySelectorAll("[data-row]").forEach(button => button.addEventListener("click", () => { editor = WF.selectBoard(editor, Number(button.dataset.row), Number(button.dataset.col)); persistDraft(); render(); focusKeyboard(); }));
       document.querySelectorAll("[data-rack]").forEach(button => button.addEventListener("click", () => { editor = WF.selectRack(editor, Number(button.dataset.rack)); persistDraft(); render(); focusKeyboard(); }));
       document.querySelectorAll("[data-suggestion]").forEach(button => button.addEventListener("click", () => { selectedSuggestion = Number(button.dataset.suggestion); render(); }));
+      document.querySelectorAll("[data-purge-suggestion]").forEach(button => button.addEventListener("click", event => {
+        event.stopPropagation?.();
+        if (purgeInFlight || props.wordlist_update_active) return;
+        const index = Number(button.dataset.purgeSuggestion);
+        const move = props.solve_result?.moves?.[index];
+        if (!move) return;
+        purgeInFlight = true;
+        render();
+        emit("purge_suggestion", {
+          suggestionIndex: index,
+          word: move.word,
+          solveToken: props.solve_result.token,
+          stateHash: props.solve_result.state_hash,
+        });
+      }));
       document.getElementById("new-button")?.addEventListener("click", () => {
         clearDraft();
         localChangesPending = false;
@@ -425,6 +442,7 @@
       document.addEventListener("click", dismissKeyboardForAction);
       Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, event => {
         props = event.detail.args || {};
+        purgeInFlight = false;
         const incomingBoardVersion = Number(props.board_version);
         const boardWasReplaced = Number.isFinite(incomingBoardVersion) && incomingBoardVersion !== boardVersion;
         if (Number.isFinite(incomingBoardVersion)) boardVersion = incomingBoardVersion;
@@ -465,6 +483,7 @@
               clearDraft();
               notice = { message:"Zet geplaatst. Sla het spel handmatig op om de opgeslagen stand bij te werken.", kind:"success" };
             } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
+            else if (response.kind === "purge_error") { notice = { message:response.error, kind:"error" }; }
             else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error, kind:"error" }; }
           }
         } else {

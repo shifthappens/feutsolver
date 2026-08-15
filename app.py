@@ -21,7 +21,6 @@ from wordfeud_analyzer.move_generator import (
     board_words,
     generate_moves,
     load_wordlist,
-    parse_comma_separated_words,
     remove_words_from_wordlist,
     suggest_words,
 )
@@ -41,6 +40,7 @@ from wordfeud_analyzer.state import (
     StaleSolveRequest,
     apply_place_request,
     is_current_board_version,
+    is_current_solve_result,
     make_solve_result,
     replaceable_words,
     replace_from_upload,
@@ -54,7 +54,14 @@ configured_wordlist = Path(os.getenv("WORDFEUD_WORDLIST_PATH", "data/opentaal-wo
 DEFAULT_WORDLIST = configured_wordlist if configured_wordlist.exists() else Path("data/voorbeeld_woorden.txt")
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 MAX_COMPONENT_MESSAGE_BYTES = 256 * 1024
-ALLOWED_COMPONENT_EVENTS = {"new_board", "solve_request", "cancel", "load", "place_request"}
+ALLOWED_COMPONENT_EVENTS = {
+    "new_board",
+    "solve_request",
+    "cancel",
+    "load",
+    "place_request",
+    "purge_suggestion",
+}
 FRONTEND = Path(__file__).parent / "frontend"
 wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
 
@@ -276,6 +283,59 @@ def clear_word_suggestions() -> None:
     st.session_state.word_suggestions = []
 
 
+def purge_suggestion(
+    word: str,
+    state: BoardState,
+    solve_result: dict[str, Any],
+    *,
+    actor: str | None,
+) -> None:
+    """Exclude one visible suggestion before persisting that exclusion."""
+    if replacement_update_active():
+        response("purge_error", error="De woordenlijst wordt nog bijgewerkt; probeer het zo opnieuw.")
+        st.rerun()
+
+    try:
+        moves = solve_state(state, excluded_words=[word])
+    except Exception as error:
+        correlation_id = new_correlation_id()
+        log_failure(event="replacement_solve", correlation_id=correlation_id, actor=actor, action="solve", error=error)
+        response(
+            "purge_error",
+            error=public_error("SOLVER-ERROR", correlation_id, "De vervangende suggestie kon niet worden berekend."),
+        )
+        st.rerun()
+
+    if not moves:
+        if not queue_wordlist_update([word], actor=actor):
+            response(
+                "purge_error",
+                error=st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.",
+            )
+            st.rerun()
+        st.session_state.solve_result = None
+        response("solve_error", error="Geen vervangende legale zet gevonden in de gekozen woordenlijst.")
+        st.rerun()
+
+    next_solve_result = make_solve_result(state, moves, uuid4().hex)
+    still_suggested = replaceable_words(next_solve_result).intersection({word})
+    if still_suggested:
+        response(
+            "purge_error",
+            error="Deze suggestie staat nog in de nieuwe suggesties; de woordenlijst is niet gewijzigd.",
+        )
+        st.rerun()
+
+    if not queue_wordlist_update([word], actor=actor):
+        response(
+            "purge_error",
+            error=st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.",
+        )
+        st.rerun()
+    st.session_state.solve_result = next_solve_result
+    st.rerun()
+
+
 def handle_component_event(event: object) -> None:
     if not isinstance(event, dict):
         return
@@ -312,6 +372,43 @@ def handle_component_event(event: object) -> None:
     if not is_current_board_version(event_version, st.session_state.board_version):
         return
     state = current_state()
+
+    if kind == "purge_suggestion":
+        actor = current_actor()
+        solve_result = st.session_state.get("solve_result")
+        suggestion_index = payload.get("suggestionIndex")
+        requested_word = payload.get("word")
+        if (
+            not isinstance(solve_result, dict)
+            or not isinstance(suggestion_index, int)
+            or isinstance(suggestion_index, bool)
+            or not isinstance(requested_word, str)
+            or not is_current_solve_result(
+                payload.get("solveToken"),
+                payload.get("stateHash"),
+                solve_result.get("token"),
+                state,
+            )
+            or payload.get("stateHash") != solve_result.get("state_hash")
+        ):
+            response("purge_error", error="Deze suggestie is verouderd. Kies opnieuw voor ‘Geef oplossingen weer’.")
+            st.rerun()
+        stored_moves = solve_result.get("moves")
+        if not isinstance(stored_moves, list) or not 0 <= suggestion_index < len(stored_moves):
+            response("purge_error", error="Deze suggestie is verouderd. Kies opnieuw voor ‘Geef oplossingen weer’.")
+            st.rerun()
+        try:
+            selected = Move.model_validate(stored_moves[suggestion_index])
+        except Exception:
+            response("purge_error", error="Deze suggestie is ongeldig. Kies opnieuw voor ‘Geef oplossingen weer’.")
+            st.rerun()
+        if selected.word != requested_word.strip().upper():
+            response("purge_error", error="Deze suggestie is verouderd. Kies opnieuw voor ‘Geef oplossingen weer’.")
+            st.rerun()
+        if not may_mutate_production_wordlist(actor):
+            response("purge_error", error="Je mag de productiewoordenlijst niet wijzigen.")
+            st.rerun()
+        purge_suggestion(selected.word, state, solve_result, actor=actor)
 
     if kind == "new_board":
         set_state(standard_board())
@@ -522,85 +619,6 @@ def process_upload() -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def render_replacement_form() -> None:
-    actor = current_actor()
-    if not may_mutate_production_wordlist(actor):
-        return
-    feedback = st.session_state.get("replacement_update_feedback")
-    if feedback:
-        if st.session_state.get("replacement_update_feedback_error", False):
-            st.error(feedback)
-        else:
-            st.success(feedback)
-    solve_result = st.session_state.get("solve_result")
-    if not isinstance(solve_result, dict) or not solve_result.get("moves"):
-        return
-    update_active = replacement_update_active()
-    if update_active:
-        st.info(
-            "De nieuwe suggesties zijn al berekend. De woordenlijst wordt nog bijgewerkt; "
-            "dit invoerveld is daarom tijdelijk geblokkeerd."
-        )
-    with st.form("replace_suggestion", clear_on_submit=True):
-        word_to_replace = st.text_input(
-            "Een suggestie vervangen",
-            placeholder="Bijv. woord, ander woord, kruiswoord",
-            help="Vul één of meer voorgestelde woorden of kruiswoorden in, gescheiden door komma's.",
-            disabled=update_active,
-        )
-        submitted = st.form_submit_button("Vervang suggestie", disabled=update_active)
-    if not submitted:
-        return
-    if update_active:
-        st.info("Er wordt al een vervanging verwerkt; probeer het opnieuw zodra het veld weer beschikbaar is.")
-        return
-    state = current_state()
-    entered_words = parse_comma_separated_words(word_to_replace)
-    replaceable = replaceable_words(solve_result)
-    if not entered_words:
-        st.warning("Vul één of meer geldige woorden in, gescheiden door komma's.")
-        return
-    not_replaceable = [word for word in entered_words if word not in replaceable]
-    if not_replaceable:
-        st.warning(
-            "Deze woorden staan niet tussen de huidige suggesties of bijbehorende kruiswoorden: "
-            + ", ".join(not_replaceable)
-            + "."
-        )
-        return
-    try:
-        # Exclude the submitted words in memory first. This reuses the current
-        # GADDAG and makes the replacement visible before the persistent file
-        # update has finished.
-        moves = solve_state(state, excluded_words=entered_words)
-    except Exception as error:
-        correlation_id = new_correlation_id()
-        log_failure(event="replacement_solve", correlation_id=correlation_id, actor=actor, action="solve", error=error)
-        st.error(public_error("SOLVER-ERROR", correlation_id, "De vervangende suggestie kon niet worden berekend."))
-        return
-    if not moves:
-        if not queue_wordlist_update(entered_words, actor=actor):
-            st.error(st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.")
-            return
-        st.session_state.solve_result = None
-        response("solve_error", error="Geen vervangende legale zet gevonden in de gekozen woordenlijst.")
-        st.rerun()
-    next_solve_result = make_solve_result(state, moves, uuid4().hex)
-    still_suggested = replaceable_words(next_solve_result).intersection(entered_words)
-    if still_suggested:
-        st.error(
-            "Deze woorden staan nog in de nieuwe suggesties: "
-            + ", ".join(sorted(still_suggested))
-            + "."
-        )
-        return
-    if not queue_wordlist_update(entered_words, actor=actor):
-        st.error(st.session_state.replacement_update_feedback or "De woordenlijst kon niet worden bijgewerkt.")
-        return
-    st.session_state.solve_result = next_solve_result
-    st.rerun()
-
-
 @st.fragment(run_every=0.5)
 def render_wordlist_update_status() -> None:
     """Poll a queued wordlist write without rerunning the whole app."""
@@ -608,6 +626,15 @@ def render_wordlist_update_status() -> None:
         st.rerun()
     if replacement_update_active():
         st.info("Woordenlijst wordt op de achtergrond bijgewerkt…")
+
+
+def render_wordlist_update_feedback() -> None:
+    feedback = st.session_state.get("replacement_update_feedback")
+    if feedback:
+        if st.session_state.get("replacement_update_feedback_error", False):
+            st.error(feedback)
+        else:
+            st.success(feedback)
 
 
 def render_word_suggestions() -> None:
@@ -714,6 +741,8 @@ event = wordfeud_board(
     board_version=st.session_state.board_version,
     mode="preview" if st.session_state.solve_result else "edit",
     solve_result=st.session_state.solve_result,
+    can_purge_suggestions=may_mutate_production_wordlist(actor),
+    wordlist_update_active=replacement_update_active(),
     response=component_response,
     storage_namespace=actor or st.session_state.anonymous_storage_namespace,
     default=None,
@@ -723,4 +752,5 @@ handle_component_event(event)
 render_word_suggestions()
 if replacement_update_active():
     render_wordlist_update_status()
-render_replacement_form()
+else:
+    render_wordlist_update_feedback()

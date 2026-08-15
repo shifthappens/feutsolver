@@ -33,7 +33,10 @@ class FakeElement {
     this.style = {};
     this.listeners = new Map();
     for (const [key, value] of Object.entries(attributes)) {
-      if (key.startsWith("data-")) this.dataset[key.slice(5)] = value;
+      if (key.startsWith("data-")) {
+        const dataKey = key.slice(5).replace(/-([a-z])/g, (_match, character) => character.toUpperCase());
+        this.dataset[dataKey] = value;
+      }
     }
   }
 
@@ -110,6 +113,7 @@ class FakeDocument {
     if (selector === "[data-row]") return children.filter(child => "row" in child.dataset);
     if (selector === "[data-rack]") return children.filter(child => "rack" in child.dataset);
     if (selector === "[data-suggestion]") return children.filter(child => "suggestion" in child.dataset);
+    if (selector === "[data-purge-suggestion]") return children.filter(child => "purgeSuggestion" in child.dataset);
     return [];
   }
 
@@ -173,8 +177,44 @@ function editProps(source, response = null) {
     solve_result: null,
     response,
     storage_namespace: "test",
+    can_purge_suggestions: true,
+    wordlist_update_active: false,
   };
 }
+
+function previewProps(source, moves, response = null) {
+  return {
+    ...editProps(source, response),
+    mode: "preview",
+    solve_result: {
+      token: "solve-1",
+      state_hash: "hash-1",
+      moves,
+    },
+  };
+}
+
+test("purging a suggestion emits the selected word and current solve identity", () => {
+  const controller = loadController();
+  const source = snapshot(["A"]);
+  controller.events.dispatch(previewProps(source, [
+    { word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] },
+  ]));
+
+  controller.document.querySelectorAll("[data-purge-suggestion]")[0].click();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(controller.messages[0])), {
+    id: 1,
+    type: "purge_suggestion",
+    payload: {
+      suggestionIndex: 0,
+      word: "A",
+      solveToken: "solve-1",
+      stateHash: "hash-1",
+      boardVersion: 0,
+    },
+  });
+});
 
 test("rack selection survives a rerun before the first tile is typed", () => {
   const controller = loadController();

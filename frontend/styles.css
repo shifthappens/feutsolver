@@ -34,8 +34,12 @@
     .notice.success { color:#185c38; background:#edf8ef; }
     .suggestion { border:1px solid var(--line); border-radius:10px; margin:.5rem 0; padding:.65rem; background:#fff; }
     .suggestion.selected { border-color:#2b7c51; box-shadow:0 0 0 2px #d9efdf; }
-    .suggestion button { width:100%; text-align:left; border:0; padding:0; background:transparent; color:inherit; }
+    .suggestion-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.55rem; align-items:stretch; }
+    .suggestion-select { width:100%; min-width:0; text-align:left; border:0; padding:0; background:transparent; color:inherit; }
     .suggestion strong { font-size:1rem; } .suggestion small { display:block; margin-top:.3rem; color:var(--muted); line-height:1.35; }
+    .suggestion-purge { align-self:stretch; min-width:2.15rem; padding:0 .55rem; border:1px solid #ead28f; border-radius:8px; background:#fff8df; color:#88671f; font-size:1.45rem; font-weight:500; line-height:1; }
+    .suggestion-purge:hover, .suggestion-purge:focus-visible { border-color:#c6a24d; background:#ffefb6; color:#5c4619; }
+    .suggestion-purge:focus-visible { outline:3px solid #d9efdf; outline-offset:1px; }
     .save-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.5rem; margin:.45rem 0; }
     .save-row input, .save-row select { width:100%; min-width:0; border:1px solid #cbd4cd; border-radius:8px; padding:.5rem .6rem; background:#fff; }
     .save-actions { margin-top:.5rem; }
