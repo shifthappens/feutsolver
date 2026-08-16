@@ -296,7 +296,7 @@
       return result.moves.map((move, index) => `<article class="suggestion ${index === selectedSuggestion ? "selected" : ""}">
         <div class="suggestion-row"><button class="suggestion-select" data-suggestion="${index}" aria-pressed="${index === selectedSuggestion}"><strong>${index + 1}. ${escapeHtml(move.word)} · ${escapeHtml(move.score)} punten</strong><small>${escapeHtml(formatMove(move))}</small></button>${props.can_purge_suggestions ? `<button class="suggestion-purge" data-purge-suggestion="${index}" aria-label="Verwijder suggestie ${escapeHtml(move.word)} uit de woordenlijst" title="Verwijder ${escapeHtml(move.word)} uit de woordenlijst" ${purgeEnabled ? "" : "disabled"}>×</button>` : ""}</div></article>`).join("");
     }
-    function renderSaves(editing) {
+    function renderSaves(editing, notification = "") {
       const loaded = WF.readSaves(storage(), storageNamespace());
       const records = loaded.records;
       const active = records.find(record => record.id === activeSaveId);
@@ -305,6 +305,7 @@
       const options = records.map(record => `<option value="${escapeHtml(record.id)}" ${record.id === activeSaveId ? "selected" : ""}>${escapeHtml(record.name)}</option>`).join("");
       return `<section class="panel" aria-label="Opgeslagen spellen">
         <span class="save-label">Opgeslagen spellen${currentName ? ` · ${escapeHtml(currentName)}` : ""}</span>
+        ${notification}
         <div class="save-row"><input id="save-name" value="${escapeHtml(currentName)}" placeholder="Naam van dit spel" ${!editing ? "disabled" : ""}><button id="save-button" ${!editing ? "disabled" : ""}>${active ? "Opslaan" : "Opslaan als…"}</button></div>
         <div class="save-row"><select id="save-select" aria-label="Opgeslagen spel" ${!editing || !records.length ? "disabled" : ""}><option value="">Kies een opgeslagen spel…</option>${options}</select><button id="load-button" ${!editing || !records.length ? "disabled" : ""}>Laden</button></div>
         <div class="save-actions"><button id="rename-button" ${!editing || !active ? "disabled" : ""}>Naam wijzigen</button><button id="delete-button" class="danger" ${!editing || !active ? "disabled" : ""}>Verwijderen</button><button id="clear-local-button" class="danger" ${!editing ? "disabled" : ""}>Lokale gegevens wissen</button></div>
@@ -323,8 +324,8 @@
         ${renderBoard(editor.snapshot, preview)}
         <div class="hint">Klik een vakje; klik nogmaals om de richting te wisselen. Typ A–Z. Gebruik Wissen of Terug om te wissen. Pijltjes verplaatsen de selectie.</div>
         ${renderRack(editor.snapshot)}
-        ${notification}</section>
-        <section><section class="panel"><h3>Suggesties</h3>${props.mode === "preview" ? renderSuggestions(props.solve_result) : '<p class="empty">Bewerk het bord en kies Geef oplossingen weer voor maximaal twaalf suggesties.</p>'}</section>${renderSaves(editing)}</section>`;
+        </section>
+        <section class="side-panels"><section class="panel"><h3>Suggesties</h3>${props.mode === "preview" ? renderSuggestions(props.solve_result) : '<p class="empty">Bewerk het bord en kies Geef oplossingen weer voor maximaal twaalf suggesties.</p>'}</section>${renderSaves(editing, notification)}</section>`;
       bindEvents();
       Streamlit.setFrameHeight(document.body.scrollHeight + 16);
     }

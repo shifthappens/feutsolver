@@ -6,6 +6,7 @@
     button { cursor:pointer; }
     button:disabled { cursor:not-allowed; opacity:.48; }
     .shell { display:grid; grid-template-columns:minmax(0, 1.15fr) minmax(270px, .85fr); gap:1.25rem; align-items:start; }
+    .side-panels { display:grid; gap:1.25rem; align-content:start; }
     .panel { border:1px solid var(--line); border-radius:14px; padding:1rem; background:var(--paper); box-shadow:0 3px 14px rgba(28,55,39,.06); }
     .board { display:grid; grid-template-columns:repeat(15, minmax(0, 1fr)); gap:2px; width:min(100%, 500px); margin:auto; padding:4px; border-radius:10px; background:#3b3025; }
     .cell { min-width:0; aspect-ratio:1; padding:0; border:0; border-radius:2px; display:grid; place-items:center; background:#efe5c9; color:#614831; font-size:clamp(.47rem, 1.75vw, 1rem); font-weight:800; line-height:1; }

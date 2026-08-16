@@ -316,6 +316,8 @@ test("explicit save replaces the placement status and survives a replayed respon
 
   controller.document.getElementById("save-button").click();
   assert.match(controller.document.app.html, /Opgeslagen als “Partij”/);
+  assert.ok(controller.document.app.html.indexOf('aria-label="Opgeslagen spellen"') < controller.document.app.html.indexOf('class="notice'));
+  assert.match(controller.document.app.html, /<section class="side-panels">/);
 
   // A parent rerun can replay the last response; it must not overwrite the
   // newer confirmation shown after the explicit save.
