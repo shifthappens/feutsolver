@@ -13,21 +13,27 @@
     let initialized = false;
     let lastMessage = 0;
     let boardVersion = 0;
+    let serverSession = null;
+    let lastNamespace = null;
+    let resyncedSession = null;
+    let keepSuggestionSelection = false;
     let lastSolveToken = null;
     let handledResponseSignature = null;
     let localChangesPending = false;
     let focusVisibilityFrame = null;
     let focusVisibilityTimers = [];
     let purgeInFlight = false;
-    const DRAFT_STORAGE_KEY = "wordfeud-board-draft-v1";
+    const DRAFT_STORAGE_KEY = "wordfeud-board-draft-v2";
 
     function storage() { try { return window.localStorage; } catch (_error) { return null; } }
     function draftStorage() { try { return window.sessionStorage; } catch (_error) { return null; } }
     function storageNamespace() { return String(props.storage_namespace || "unauthenticated"); }
     function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
     function draftStorageKey() {
+      // The key stays free of the board version: a restarted server session
+      // counts from zero again, while this draft must survive that reset.
       const namespace = encodeURIComponent(storageNamespace()).slice(0, 128);
-      return `${DRAFT_STORAGE_KEY}:${namespace}:${boardVersion}`;
+      return `${DRAFT_STORAGE_KEY}:${namespace}`;
     }
     function validSelection(selection) {
       if (!selection || typeof selection !== "object") return null;
@@ -48,12 +54,16 @@
       try { source.removeItem(draftStorageKey()); } catch (_error) { /* sessionStorage is best effort */ }
     }
     function persistDraft() {
-      if (!editor || props.mode === "preview" || !WF.isSnapshot(editor.snapshot)) return;
+      // Also persisted while a suggestion is previewed: a reload or a lost
+      // server session must never cost the board that is visible right now.
+      if (!editor || !WF.isSnapshot(editor.snapshot)) return;
       const source = draftStorage();
       if (!source) return;
       try {
         source.setItem(draftStorageKey(), JSON.stringify({
-          schemaVersion: 1,
+          schemaVersion: 2,
+          serverSession,
+          boardVersion,
           snapshot: editor.snapshot,
           selection: editor.selection,
           direction: editor.direction,
@@ -61,10 +71,6 @@
       } catch (_error) { /* sessionStorage is best effort */ }
     }
     function restoreDraft() {
-      if (props.mode === "preview") {
-        clearDraft();
-        return false;
-      }
       const source = draftStorage();
       if (!source) return false;
       let draft;
@@ -76,8 +82,14 @@
         return false;
       }
       const selection = validSelection(draft?.selection);
-      if (draft?.schemaVersion !== 1 || !WF.isSnapshot(draft?.snapshot) || !selection) {
+      if (draft?.schemaVersion !== 2 || !WF.isSnapshot(draft?.snapshot) || !selection) {
         if (draft) clearDraft();
+        return false;
+      }
+      // Within one server session a differing board version means the server
+      // replaced the board itself, for example after a screenshot upload.
+      if (draft.serverSession === serverSession && draft.boardVersion !== boardVersion) {
+        clearDraft();
         return false;
       }
       editor = WF.createEditor(draft.snapshot);
@@ -135,6 +147,12 @@
       });
     }
     function showNotice(message, kind) { notice = message ? { message, kind: kind || "" } : null; render(); }
+    function boardDiffersFromServer() {
+      // A rejected request leaves the server board in place. Only forget the
+      // local board when it already equals that board, so an error can never
+      // clear a game the server no longer knows about.
+      return Boolean(editor) && WF.isSnapshot(editor.snapshot) && !same(editor.snapshot, props.snapshot);
+    }
     function selectedFocusTarget() {
       if (editor?.selection?.kind === "board") return document.querySelector(".cell.selected");
       if (editor?.selection?.kind === "rack") return document.querySelector(".rack-slot.selected");
@@ -364,7 +382,14 @@
         const move = props.solve_result?.moves?.[selectedSuggestion];
         if (move) {
           localChangesPending = false;
-          emit("place_request", { solveToken: props.solve_result.token, selectedMove: move, stateHash: props.solve_result.state_hash });
+          // The snapshot travels with the request so the server can validate
+          // this placement again when it no longer remembers the solve itself.
+          emit("place_request", {
+            solveToken: props.solve_result.token,
+            selectedMove: move,
+            stateHash: props.solve_result.state_hash,
+            snapshot: editor.snapshot,
+          });
         }
       });
       const nameInput = document.getElementById("save-name");
@@ -444,19 +469,36 @@
       Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, event => {
         props = event.detail.args || {};
         purgeInFlight = false;
+        const preserveSelection = keepSuggestionSelection;
+        keepSuggestionSelection = false;
+        const wasPreviewing = lastSolveToken !== null;
+        const incomingSession = props.server_session === undefined ? serverSession : String(props.server_session);
+        const incomingNamespace = storageNamespace();
+        // A different storage namespace means a different identity. That board
+        // is deliberately dropped by the server and must not come back here.
+        const identityChanged = initialized && lastNamespace !== null && incomingNamespace !== lastNamespace;
+        // Streamlit forgets a session whose websocket stayed disconnected past
+        // its TTL. The board then only exists here, so it is kept and pushed
+        // back instead of being replaced by that session's empty board.
+        const sessionWasReset = initialized && serverSession !== null && !identityChanged && incomingSession !== serverSession;
         const incomingBoardVersion = Number(props.board_version);
-        const boardWasReplaced = Number.isFinite(incomingBoardVersion) && incomingBoardVersion !== boardVersion;
+        const boardWasReplaced = identityChanged ||
+          (!sessionWasReset && Number.isFinite(incomingBoardVersion) && incomingBoardVersion !== boardVersion);
         if (Number.isFinite(incomingBoardVersion)) boardVersion = incomingBoardVersion;
+        serverSession = incomingSession;
+        lastNamespace = incomingNamespace;
         if (boardWasReplaced) {
           clearDraft();
           closeActiveSave();
           localChangesPending = false;
         }
+        if (sessionWasReset && editor && WF.isSnapshot(editor.snapshot) && !same(editor.snapshot, props.snapshot)) {
+          localChangesPending = true;
+        }
         let restoredActive = false;
         let restoredDraft = false;
         const firstRender = !initialized;
         if (firstRender) { restoredActive = restoreActive(); initialized = true; }
-        if (props.mode === "preview") clearDraft();
         const incomingSnapshotChanged = Boolean(editor) && !same(editor.snapshot, props.snapshot);
         // A Streamlit rerun can arrive between selecting a rack slot and the
         // first typed tile. Reconcile a persisted local draft before falling
@@ -470,8 +512,22 @@
           editor = WF.createEditor(props.snapshot);
           localChangesPending = false;
         }
+        if (editor && same(editor.snapshot, props.snapshot)) localChangesPending = false;
+        if ((sessionWasReset || (firstRender && restoredDraft && !restoredActive)) && resyncedSession !== incomingSession &&
+            editor && WF.isSnapshot(editor.snapshot) && !same(editor.snapshot, props.snapshot)) {
+          // Hand the surviving board back to the server. Suggestions are only
+          // requested again; the solver keeps deciding which moves exist.
+          resyncedSession = incomingSession;
+          keepSuggestionSelection = wasPreviewing;
+          emit("resync", { snapshot: editor.snapshot, serverSession: incomingSession, resolve: wasPreviewing });
+        }
         const solveToken = props.mode === "preview" ? (props.solve_result?.token || null) : null;
-        if (props.mode === "preview") selectedSuggestion = WF.suggestionSelection(lastSolveToken, solveToken, selectedSuggestion, props.solve_result?.moves?.length || 0);
+        if (props.mode === "preview") {
+          const suggestionCount = props.solve_result?.moves?.length || 0;
+          selectedSuggestion = preserveSelection && suggestionCount
+            ? Math.min(Math.max(selectedSuggestion, 0), suggestionCount - 1)
+            : WF.suggestionSelection(lastSolveToken, solveToken, selectedSuggestion, suggestionCount);
+        }
         lastSolveToken = solveToken;
         if (props.response) {
           const response = props.response;
@@ -483,14 +539,15 @@
               localChangesPending = false;
               clearDraft();
               notice = { message:"Zet geplaatst. Sla het spel handmatig op om de opgeslagen stand bij te werken.", kind:"success" };
-            } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
+            } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = boardDiffersFromServer(); notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
             else if (response.kind === "purge_error") { notice = { message:response.error, kind:"error" }; }
-            else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = false; notice = { message:response.error, kind:"error" }; }
+            else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = boardDiffersFromServer(); notice = { message:response.error, kind:"error" }; }
           }
         } else {
           handledResponseSignature = null;
         }
         if (props.mode === "preview" && props.solve_result && selectedSuggestion >= props.solve_result.moves.length) selectedSuggestion = 0;
+        persistDraft();
         render();
     });
     Streamlit.setComponentReady();

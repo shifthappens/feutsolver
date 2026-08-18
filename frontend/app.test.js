@@ -13,6 +13,14 @@ function snapshot(rack = []) {
   return { grid, rack };
 }
 
+function unavailableStorage() {
+  return {
+    getItem: () => { throw new Error("storage unavailable"); },
+    setItem: () => { throw new Error("storage unavailable"); },
+    removeItem: () => { throw new Error("storage unavailable"); },
+  };
+}
+
 function memoryStorage() {
   const values = new Map();
   return {
@@ -131,14 +139,14 @@ class EventBus {
   dispatch(args) { for (const listener of this.listeners) listener({ detail: { args } }); }
 }
 
-function loadController(localStorage = memoryStorage()) {
+function loadController(localStorage = memoryStorage(), sessionStorage = memoryStorage()) {
   const document = new FakeDocument();
   const events = new EventBus();
   const messages = [];
   const window = {
     WordfeudBoard: WF,
     localStorage,
-    sessionStorage: memoryStorage(),
+    sessionStorage,
     parent: null,
     clearTimeout: () => {},
     setTimeout: () => 1,
@@ -177,6 +185,7 @@ function editProps(source, response = null) {
     solve_result: null,
     response,
     storage_namespace: "test",
+    server_session: "session-1",
     can_purge_suggestions: true,
     wordlist_update_active: false,
   };
@@ -193,6 +202,142 @@ function previewProps(source, moves, response = null) {
     },
   };
 }
+
+test("a placement carries the board it was calculated for", () => {
+  const controller = loadController();
+  const source = snapshot(["A"]);
+  const move = { word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] };
+  controller.events.dispatch(previewProps(source, [move]));
+
+  controller.document.getElementById("place-button").click();
+
+  const message = JSON.parse(JSON.stringify(controller.messages.at(-1)));
+  assert.equal(message.type, "place_request");
+  assert.deepEqual(message.payload.snapshot, source);
+  assert.equal(message.payload.stateHash, "hash-1");
+  assert.equal(message.payload.solveToken, "solve-1");
+});
+
+test("a forgotten server session keeps the board and hands it back", () => {
+  const controller = loadController();
+  const source = snapshot(["A"]);
+  const move = { word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] };
+  controller.events.dispatch(previewProps(source, [move]));
+
+  // The session expired: Streamlit restarts with an empty board, no solve
+  // result and a board version that counts from zero again.
+  const empty = snapshot();
+  controller.events.dispatch({
+    ...editProps(empty, { kind: "place_result", ok: false, error: "Deze zet is verouderd" }),
+    server_session: "session-2",
+  });
+
+  assert.match(controller.document.app.html, /Deze zet is verouderd/);
+  const resync = JSON.parse(JSON.stringify(controller.messages.at(-1)));
+  assert.equal(resync.type, "resync");
+  assert.deepEqual(resync.payload.snapshot, source);
+  assert.equal(resync.payload.serverSession, "session-2");
+  assert.equal(resync.payload.resolve, true);
+
+  // The rack stays filled while the server catches up.
+  assert.match(controller.document.app.html, /aria-label="Rekpositie 1">A</);
+
+  // The restored session answers with the same board and fresh suggestions.
+  controller.events.dispatch({
+    ...previewProps(source, [move]),
+    server_session: "session-2",
+    solve_result: { token: "solve-2", state_hash: "hash-2", moves: [move] },
+  });
+  assert.equal(controller.messages.filter(message => message.type === "resync").length, 1);
+  assert.match(controller.document.app.html, /1\. A · 1 punten/);
+});
+
+test("the board survives a forgotten session without any browser storage", () => {
+  const controller = loadController(memoryStorage(), unavailableStorage());
+  const source = snapshot(["A"]);
+  const move = { word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] };
+  controller.events.dispatch(previewProps(source, [move]));
+
+  controller.events.dispatch({ ...editProps(snapshot()), server_session: "session-2" });
+
+  assert.match(controller.document.app.html, /aria-label="Rekpositie 1">A</);
+  const resync = JSON.parse(JSON.stringify(controller.messages.at(-1)));
+  assert.equal(resync.type, "resync");
+  assert.deepEqual(resync.payload.snapshot, source);
+});
+
+test("a session for another identity never gets the previous board back", () => {
+  const controller = loadController();
+  const source = snapshot(["A"]);
+  const move = { word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] };
+  controller.events.dispatch(previewProps(source, [move]));
+
+  // Reconnecting as somebody else starts a new session with its own storage
+  // namespace; the server drops the board there on purpose.
+  controller.events.dispatch({
+    ...editProps(snapshot()),
+    server_session: "session-2",
+    storage_namespace: "other-actor",
+  });
+
+  assert.doesNotMatch(controller.document.app.html, /aria-label="Rekpositie 1">A</);
+  assert.equal(controller.messages.some(message => message.type === "resync"), false);
+});
+
+test("a board version that restarts with a new session is not a replaced board", () => {
+  const localStorage = memoryStorage();
+  const source = snapshot(["A"]);
+  const saved = WF.saveSnapshot(localStorage, "Partij", source, null, "test");
+  assert.equal(WF.setActiveSaveId(localStorage, saved.record.id, "test").ok, true);
+
+  const controller = loadController(localStorage);
+  controller.events.dispatch(editProps(source));
+  // A screenshot upload replaces the board and closes the active save.
+  const uploaded = snapshot(["B"]);
+  controller.events.dispatch({ ...editProps(uploaded), board_version: 1 });
+  assert.equal(WF.readActiveSaveId(localStorage, "test").id, null);
+  assert.equal(WF.setActiveSaveId(localStorage, saved.record.id, "test").ok, true);
+
+  // The session expires; its successor counts board versions from zero again.
+  controller.events.dispatch({ ...editProps(snapshot()), board_version: 0, server_session: "session-2" });
+
+  assert.match(controller.document.app.html, /aria-label="Rekpositie 1">B</);
+  assert.equal(WF.readActiveSaveId(localStorage, "test").id, saved.record.id);
+  assert.equal(controller.messages.at(-1).type, "resync");
+});
+
+test("a reloaded page restores the previewed board from its own draft", () => {
+  const sessionStorage = memoryStorage();
+  const source = snapshot(["A"]);
+  const move = { word: "A", score: 1, row: 7, col: 7, direction: "H", tiles: [] };
+  const first = loadController(memoryStorage(), sessionStorage);
+  first.events.dispatch(previewProps(source, [move]));
+
+  // The page reloads: the component restarts against a session that has
+  // forgotten both the board and the suggestions.
+  const reloaded = loadController(memoryStorage(), sessionStorage);
+  reloaded.events.dispatch({ ...editProps(snapshot()), server_session: "session-2" });
+
+  assert.match(reloaded.document.app.html, /aria-label="Rekpositie 1">A</);
+  const resync = JSON.parse(JSON.stringify(reloaded.messages.at(-1)));
+  assert.equal(resync.type, "resync");
+  assert.deepEqual(resync.payload.snapshot, source);
+  assert.equal(resync.payload.resolve, false);
+});
+
+test("a board the server replaced itself discards the stored draft", () => {
+  const sessionStorage = memoryStorage();
+  const source = snapshot(["A"]);
+  const first = loadController(memoryStorage(), sessionStorage);
+  first.events.dispatch(editProps(source));
+
+  const uploaded = snapshot(["B"]);
+  const reloaded = loadController(memoryStorage(), sessionStorage);
+  reloaded.events.dispatch({ ...editProps(uploaded), board_version: 1 });
+
+  assert.match(reloaded.document.app.html, /aria-label="Rekpositie 1">B</);
+  assert.equal(reloaded.messages.length, 0);
+});
 
 test("purging a suggestion emits the selected word and current solve identity", () => {
   const controller = loadController();

@@ -92,6 +92,29 @@ def test_server_owns_screenshot_solving_and_wordlist_operations() -> None:
     assert {"generate_moves", "load_wordlist"} <= _defined_functions(move_tree)
 
 
+def test_recovered_board_and_placement_stay_server_validated() -> None:
+    """The browser may restore a board, never its own suggestions or moves."""
+    app_tree = _python_tree(ROOT / "app.py")
+    calls = _calls(app_tree)
+
+    # A restored browser board is validated before it becomes working state.
+    assert any(
+        _call_path(call.func) == "validate_snapshot"
+        and call.args
+        and isinstance(call.args[0], ast.Call)
+        and _call_path(call.args[0].func) == "payload.get"
+        for call in calls
+    )
+    # A placement that outlived its solve result is solved again here.
+    assert any(
+        _call_path(call.func) == "replay_place_request"
+        and len(call.args) == 2
+        and _call_path(call.args[1]) == "solve_state"
+        for call in calls
+    )
+    assert "solve_into_session" in _defined_functions(app_tree)
+
+
 def test_ocr_words_require_explicit_dictionary_confirmation() -> None:
     app_tree = _python_tree(ROOT / "app.py")
     calls = _calls(app_tree)
