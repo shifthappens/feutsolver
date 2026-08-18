@@ -130,8 +130,6 @@ def initialise_session() -> None:
         st.session_state.pop("external_ocr_consent_checkbox", None)
         st.session_state.anonymous_storage_namespace = uuid4().hex
         st.session_state.board_version = st.session_state.get("board_version", 0) + 1
-        # A new identity must never inherit the previous board, so the browser
-        # is told to drop its own copy instead of restoring it here.
         st.session_state.server_session_id = uuid4().hex
     st.session_state.authenticated_actor = actor
     st.session_state._actor_initialized = True
@@ -147,9 +145,8 @@ def initialise_session() -> None:
     st.session_state.setdefault("component_response", None)
     st.session_state.setdefault("last_component_event_signature", None)
     st.session_state.setdefault("board_version", 0)
-    # Identifies this server-side session to the browser. Streamlit discards
-    # session state once a websocket stays disconnected past its TTL, and the
-    # browser recognizes the resulting fresh session by this changed value.
+    # Streamlit discards session state after a disconnect; a changed value
+    # tells the browser its board only exists there.
     st.session_state.setdefault("server_session_id", uuid4().hex)
     st.session_state.setdefault("replacement_update_future", None)
     st.session_state.setdefault("replacement_update_words", [])
@@ -208,7 +205,7 @@ def solve_state(state: BoardState, excluded_words: Iterable[str] = ()) -> list[M
 
 
 def solve_into_session(state: BoardState) -> None:
-    """Recompute the suggestion list for a board without leaving the rerun."""
+    """Replace the suggestion list with the moves this solver finds."""
     if not state.rack:
         st.session_state.solve_result = None
         return
@@ -227,61 +224,8 @@ def solve_into_session(state: BoardState) -> None:
     st.session_state.solve_result = make_solve_result(state, moves, uuid4().hex)
 
 
-def restore_browser_board(payload: dict[str, object]) -> None:
-    """Adopt the board the browser still shows after a server session reset.
-
-    Streamlit drops all session state once a websocket stays disconnected past
-    its TTL, for example while a phone is locked. The browser then holds the
-    only copy of the board, so that copy is validated and taken over instead of
-    replacing the visible game with an empty standard board. Suggestions are
-    recomputed here rather than restored from the browser: the solver stays the
-    only source of legal moves, cross words and points.
-    """
-    if str(payload.get("serverSession", "")) != str(st.session_state.server_session_id):
-        return
-    try:
-        restored = validate_snapshot(payload.get("snapshot"))
-    except Exception:
-        response("solve_error", error="Het herstelde bord was ongeldig; de huidige stand is behouden.")
-        st.rerun()
-    wants_suggestions = bool(payload.get("resolve", False))
-    if restored.model_dump(mode="json") == st.session_state.working_state and not wants_suggestions:
-        return
-    set_state(restored)
-    st.session_state.confidence = None
-    if wants_suggestions:
-        solve_into_session(restored)
-    st.rerun()
-
-
-def replay_placement(payload: dict[str, object], correlation_id: str) -> BoardState | None:
-    """Revalidate a placement whose solve result was lost with the session.
-
-    The browser sends the board it based the request on. That board is only
-    accepted together with its own hash, and the move must be one this solver
-    still offers for exactly that board, so the server keeps deciding what is
-    legal. Returns ``None`` when the request cannot be revalidated this way.
-    """
-    actor = current_actor()
-    try:
-        replayed = replay_place_request(payload, solve_state)
-    except Exception as error:
-        log_failure(event="place_request", correlation_id=correlation_id, actor=actor, action="replay", error=error)
-        return None
-    if replayed is None:
-        return None
-    log_security_event(
-        event="place_request",
-        correlation_id=correlation_id,
-        actor=actor,
-        action="replay",
-        result="ok",
-    )
-    return replayed
-
-
 def commit_placement(committed: BoardState) -> None:
-    """Store a validated placement and hand the new board back to the browser."""
+    """Store a validated placement and return the new board to the browser."""
     set_state(committed)
     st.session_state.solve_result = None
     st.session_state.confidence = None
@@ -459,11 +403,24 @@ def handle_component_event(event: object) -> None:
     if event_signature == st.session_state.last_component_event_signature:
         return
     st.session_state.last_component_event_signature = event_signature
+    # Handled before the board version check: a session that lost its state
+    # counts board versions from zero again, and this event restores both.
     if kind == "resync":
-        # A recovered browser board carries its own snapshot and predates the
-        # board version this fresh session started counting from.
-        restore_browser_board(payload)
-        return
+        if str(payload.get("serverSession", "")) != str(st.session_state.server_session_id):
+            return
+        try:
+            restored = validate_snapshot(payload.get("snapshot"))
+        except Exception:
+            response("solve_error", error="Het herstelde bord was ongeldig; de huidige stand is behouden.")
+            st.rerun()
+        wants_suggestions = bool(payload.get("resolve", False))
+        if restored.model_dump(mode="json") == st.session_state.working_state and not wants_suggestions:
+            return
+        set_state(restored)
+        st.session_state.confidence = None
+        if wants_suggestions:
+            solve_into_session(restored)
+        st.rerun()
     event_version = payload.get("boardVersion")
     if not is_current_board_version(event_version, st.session_state.board_version):
         return
@@ -558,13 +515,18 @@ def handle_component_event(event: object) -> None:
             committed = apply_place_request(state, solve_result, payload)
         except StaleSolveRequest as error:
             correlation_id = new_correlation_id()
-            # The solve result lives in Streamlit session state and disappears
-            # with the session. Revalidate the request against the board the
-            # browser still shows before calling a visible suggestion stale.
-            replayed = replay_placement(payload, correlation_id)
+            actor = current_actor()
+            # The solve result disappears with the session; the board the
+            # browser sent along still proves what was calculated for it.
+            try:
+                replayed = replay_place_request(payload, solve_state)
+            except Exception as replay_error:
+                log_failure(event="place_request", correlation_id=correlation_id, actor=actor, action="replay", error=replay_error)
+                replayed = None
             if replayed is not None:
+                log_security_event(event="place_request", correlation_id=correlation_id, actor=actor, action="replay", result="ok")
                 commit_placement(replayed)
-            log_failure(event="place_request", correlation_id=correlation_id, actor=current_actor(), action="stale", error=error)
+            log_failure(event="place_request", correlation_id=correlation_id, actor=actor, action="stale", error=error)
             st.session_state.solve_result = None
             response(
                 "place_result", ok=False,

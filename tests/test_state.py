@@ -17,7 +17,6 @@ from wordfeud_analyzer.state import (
     replaceable_words,
     replace_from_upload,
     replay_place_request,
-    requested_snapshot,
     is_current_solve_result,
     snapshot_hash,
 )
@@ -134,17 +133,6 @@ def _place_request_payload() -> tuple[BoardState, Move, dict[str, object]]:
     return state, move, payload
 
 
-def test_requested_snapshot_only_accepts_a_board_that_matches_its_own_hash() -> None:
-    state, _move, payload = _place_request_payload()
-    accepted = requested_snapshot(payload)
-    assert accepted is not None
-    assert snapshot_hash(accepted) == snapshot_hash(state)
-
-    assert requested_snapshot({**payload, "stateHash": "wrong"}) is None
-    assert requested_snapshot({**payload, "snapshot": {"grid": "invalid"}}) is None
-    assert requested_snapshot({key: value for key, value in payload.items() if key != "snapshot"}) is None
-
-
 def test_place_request_survives_a_solve_result_that_the_session_lost() -> None:
     """A forgotten server session must not cost a suggestion that is still shown."""
     state, move, payload = _place_request_payload()
@@ -158,7 +146,7 @@ def test_place_request_survives_a_solve_result_that_the_session_lost() -> None:
     assert committed is not None
     assert committed.grid[7][7].letter == "A"
     assert committed.rack == []
-    # The solver must run on the board the browser sent, not on server state.
+    # The solver runs on the board the browser sent, not on server state.
     assert [snapshot_hash(snapshot) for snapshot in solved] == [snapshot_hash(state)]
 
 
@@ -169,6 +157,10 @@ def test_replayed_place_request_only_accepts_a_move_this_solver_still_offers() -
     assert replay_place_request(payload, lambda _snapshot: []) is None
     assert replay_place_request(payload, lambda _snapshot: [other]) is None
     assert replay_place_request({**payload, "stateHash": "wrong"}, lambda _snapshot: [move]) is None
+    assert replay_place_request({**payload, "snapshot": {"grid": "invalid"}}, lambda _snapshot: [move]) is None
+    assert replay_place_request(
+        {key: value for key, value in payload.items() if key != "snapshot"}, lambda _snapshot: [move]
+    ) is None
     assert replay_place_request(
         {**payload, "selectedMove": {"word": "Z"}}, lambda _snapshot: [move]
     ) is None

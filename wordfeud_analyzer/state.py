@@ -173,25 +173,6 @@ def selected_move(solve_result: dict[str, Any], value: object) -> Move | None:
     return None
 
 
-def requested_snapshot(payload: dict[str, object]) -> BoardState | None:
-    """Return the board the browser showed, but only when it matches its hash.
-
-    The browser sends the snapshot it based its request on. Binding it to the
-    hash that travelled with the same request keeps a placement tied to exactly
-    one board, also when the server no longer remembers that board itself.
-    """
-    raw = payload.get("snapshot")
-    if raw is None:
-        return None
-    try:
-        snapshot = validate_snapshot(raw)
-    except Exception:
-        return None
-    if snapshot_hash(snapshot) != str(payload.get("stateHash", "")):
-        return None
-    return snapshot
-
-
 def apply_place_request(
     state: BoardState,
     solve_result: object,
@@ -217,21 +198,18 @@ def replay_place_request(
     payload: dict[str, object],
     solve: Callable[[BoardState], Iterable[Move]],
 ) -> BoardState | None:
-    """Place a move whose solve result was lost with the browser session.
+    """Validate a placement again for the board the browser sent along.
 
-    A Streamlit session disappears while the browser keeps showing a complete
-    board with its suggestions. Rejecting that placement throws away work the
-    user can no longer reconstruct, so the request is validated again from
-    scratch instead: the snapshot must match its own hash, the solver runs
-    again for exactly that board, and only a move this server would offer for
-    it is applied. The server therefore stays authoritative over legality,
-    cross words and points; only the memory of the earlier solve is replaced.
-
-    Returns ``None`` when the request cannot be revalidated this way, so the
-    caller keeps reporting the original staleness instead.
+    Used when a lost session took the solve result with it. The snapshot must
+    match its own hash and the solver must still offer exactly that move for
+    exactly that board, so the server keeps deciding what is legal. Returns
+    ``None`` when the request cannot be revalidated this way.
     """
-    snapshot = requested_snapshot(payload)
-    if snapshot is None:
+    try:
+        snapshot = validate_snapshot(payload.get("snapshot"))
+    except Exception:
+        return None
+    if snapshot_hash(snapshot) != str(payload.get("stateHash", "")):
         return None
     rebuilt = make_solve_result(snapshot, solve(snapshot), str(payload.get("solveToken", "")))
     move = selected_move(rebuilt, payload.get("selectedMove"))

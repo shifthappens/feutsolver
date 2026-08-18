@@ -30,8 +30,6 @@
     function storageNamespace() { return String(props.storage_namespace || "unauthenticated"); }
     function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
     function draftStorageKey() {
-      // The key stays free of the board version: a restarted server session
-      // counts from zero again, while this draft must survive that reset.
       const namespace = encodeURIComponent(storageNamespace()).slice(0, 128);
       return `${DRAFT_STORAGE_KEY}:${namespace}`;
     }
@@ -54,8 +52,6 @@
       try { source.removeItem(draftStorageKey()); } catch (_error) { /* sessionStorage is best effort */ }
     }
     function persistDraft() {
-      // Also persisted while a suggestion is previewed: a reload or a lost
-      // server session must never cost the board that is visible right now.
       if (!editor || !WF.isSnapshot(editor.snapshot)) return;
       const source = draftStorage();
       if (!source) return;
@@ -86,8 +82,8 @@
         if (draft) clearDraft();
         return false;
       }
-      // Within one server session a differing board version means the server
-      // replaced the board itself, for example after a screenshot upload.
+      // Within one session a differing board version means the server itself
+      // replaced the board; a new session simply counts from zero again.
       if (draft.serverSession === serverSession && draft.boardVersion !== boardVersion) {
         clearDraft();
         return false;
@@ -147,12 +143,6 @@
       });
     }
     function showNotice(message, kind) { notice = message ? { message, kind: kind || "" } : null; render(); }
-    function boardDiffersFromServer() {
-      // A rejected request leaves the server board in place. Only forget the
-      // local board when it already equals that board, so an error can never
-      // clear a game the server no longer knows about.
-      return Boolean(editor) && WF.isSnapshot(editor.snapshot) && !same(editor.snapshot, props.snapshot);
-    }
     function selectedFocusTarget() {
       if (editor?.selection?.kind === "board") return document.querySelector(".cell.selected");
       if (editor?.selection?.kind === "rack") return document.querySelector(".rack-slot.selected");
@@ -382,8 +372,6 @@
         const move = props.solve_result?.moves?.[selectedSuggestion];
         if (move) {
           localChangesPending = false;
-          // The snapshot travels with the request so the server can validate
-          // this placement again when it no longer remembers the solve itself.
           emit("place_request", {
             solveToken: props.solve_result.token,
             selectedMove: move,
@@ -474,12 +462,10 @@
         const wasPreviewing = lastSolveToken !== null;
         const incomingSession = props.server_session === undefined ? serverSession : String(props.server_session);
         const incomingNamespace = storageNamespace();
-        // A different storage namespace means a different identity. That board
-        // is deliberately dropped by the server and must not come back here.
+        // Another namespace is another identity: that board stays dropped.
         const identityChanged = initialized && lastNamespace !== null && incomingNamespace !== lastNamespace;
-        // Streamlit forgets a session whose websocket stayed disconnected past
-        // its TTL. The board then only exists here, so it is kept and pushed
-        // back instead of being replaced by that session's empty board.
+        // A changed session id means the server lost its state, so the board
+        // below is kept and handed back instead of adopting the empty one.
         const sessionWasReset = initialized && serverSession !== null && !identityChanged && incomingSession !== serverSession;
         const incomingBoardVersion = Number(props.board_version);
         const boardWasReplaced = identityChanged ||
@@ -515,8 +501,6 @@
         if (editor && same(editor.snapshot, props.snapshot)) localChangesPending = false;
         if ((sessionWasReset || (firstRender && restoredDraft && !restoredActive)) && resyncedSession !== incomingSession &&
             editor && WF.isSnapshot(editor.snapshot) && !same(editor.snapshot, props.snapshot)) {
-          // Hand the surviving board back to the server. Suggestions are only
-          // requested again; the solver keeps deciding which moves exist.
           resyncedSession = incomingSession;
           keepSuggestionSelection = wasPreviewing;
           emit("resync", { snapshot: editor.snapshot, serverSession: incomingSession, resolve: wasPreviewing });
@@ -539,9 +523,9 @@
               localChangesPending = false;
               clearDraft();
               notice = { message:"Zet geplaatst. Sla het spel handmatig op om de opgeslagen stand bij te werken.", kind:"success" };
-            } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = boardDiffersFromServer(); notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
+            } else if (response.kind === "place_result") { props.mode = "edit"; localChangesPending = !same(editor.snapshot, props.snapshot); notice = { message:response.error || "De zet is verouderd en kon niet worden geplaatst.", kind:"error" }; }
             else if (response.kind === "purge_error") { notice = { message:response.error, kind:"error" }; }
-            else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = boardDiffersFromServer(); notice = { message:response.error, kind:"error" }; }
+            else if (response.kind === "solve_error") { props.mode = "edit"; localChangesPending = !same(editor.snapshot, props.snapshot); notice = { message:response.error, kind:"error" }; }
           }
         } else {
           handledResponseSignature = null;
