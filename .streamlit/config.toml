@@ -5,8 +5,10 @@ port = 8501
 # The server rejects oversized files before they consume app memory.
 maxUploadSize = 2
 maxMessageSize = 5
-# Keep a mobile browser session available while its app is briefly backgrounded.
-disconnectedSessionTTL = 60
+# Streamlit drops the board and the suggestions of every session whose
+# websocket stays disconnected longer than this; a locked phone must not cost
+# a running game. After a longer break the browser restores its own board.
+disconnectedSessionTTL = 7200
 # Rerun the app as soon as Python or component files change on disk.
 runOnSave = true
 # The environment does not bundle watchdog on macOS; polling is the reliable

@@ -44,6 +44,7 @@ from wordfeud_analyzer.state import (
     make_solve_result,
     replaceable_words,
     replace_from_upload,
+    replay_place_request,
     validate_snapshot,
 )
 from wordfeud_analyzer.vision import VisionExtractionError, extract_board
@@ -61,6 +62,7 @@ ALLOWED_COMPONENT_EVENTS = {
     "load",
     "place_request",
     "purge_suggestion",
+    "resync",
 }
 FRONTEND = Path(__file__).parent / "frontend"
 wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
@@ -128,6 +130,7 @@ def initialise_session() -> None:
         st.session_state.pop("external_ocr_consent_checkbox", None)
         st.session_state.anonymous_storage_namespace = uuid4().hex
         st.session_state.board_version = st.session_state.get("board_version", 0) + 1
+        st.session_state.server_session_id = uuid4().hex
     st.session_state.authenticated_actor = actor
     st.session_state._actor_initialized = True
     if "working_state" not in st.session_state:
@@ -142,6 +145,9 @@ def initialise_session() -> None:
     st.session_state.setdefault("component_response", None)
     st.session_state.setdefault("last_component_event_signature", None)
     st.session_state.setdefault("board_version", 0)
+    # Streamlit discards session state after a disconnect; a changed value
+    # tells the browser its board only exists there.
+    st.session_state.setdefault("server_session_id", uuid4().hex)
     st.session_state.setdefault("replacement_update_future", None)
     st.session_state.setdefault("replacement_update_words", [])
     st.session_state.setdefault("replacement_update_feedback", None)
@@ -196,6 +202,35 @@ def log_failure(*, event: str, correlation_id: str, actor: str | None, action: s
 def solve_state(state: BoardState, excluded_words: Iterable[str] = ()) -> list[Move]:
     with resource_slot("solver", timeout_seconds=0.5):
         return generate_moves(state, configured_lexicon(), limit=MAX_SUGGESTIONS, excluded_words=excluded_words)
+
+
+def solve_into_session(state: BoardState) -> None:
+    """Replace the suggestion list with the moves this solver finds."""
+    if not state.rack:
+        st.session_state.solve_result = None
+        return
+    try:
+        moves = solve_state(state)
+    except Exception as error:
+        correlation_id = new_correlation_id()
+        log_failure(event="solve", correlation_id=correlation_id, actor=current_actor(), action="solve", error=error)
+        st.session_state.solve_result = None
+        response("solve_error", error=public_error(safe_error_code(error, "SOLVER-ERROR"), correlation_id))
+        return
+    if not moves:
+        st.session_state.solve_result = None
+        response("solve_error", error="Geen legale zet gevonden in de gekozen woordenlijst.")
+        return
+    st.session_state.solve_result = make_solve_result(state, moves, uuid4().hex)
+
+
+def commit_placement(committed: BoardState) -> None:
+    """Store a validated placement and return the new board to the browser."""
+    set_state(committed)
+    st.session_state.solve_result = None
+    st.session_state.confidence = None
+    response("place_result", ok=True, snapshot=committed.model_dump(mode="json"))
+    st.rerun()
 
 
 def replacement_update_active() -> bool:
@@ -368,6 +403,24 @@ def handle_component_event(event: object) -> None:
     if event_signature == st.session_state.last_component_event_signature:
         return
     st.session_state.last_component_event_signature = event_signature
+    # Handled before the board version check: a session that lost its state
+    # counts board versions from zero again, and this event restores both.
+    if kind == "resync":
+        if str(payload.get("serverSession", "")) != str(st.session_state.server_session_id):
+            return
+        try:
+            restored = validate_snapshot(payload.get("snapshot"))
+        except Exception:
+            response("solve_error", error="Het herstelde bord was ongeldig; de huidige stand is behouden.")
+            st.rerun()
+        wants_suggestions = bool(payload.get("resolve", False))
+        if restored.model_dump(mode="json") == st.session_state.working_state and not wants_suggestions:
+            return
+        set_state(restored)
+        st.session_state.confidence = None
+        if wants_suggestions:
+            solve_into_session(restored)
+        st.rerun()
     event_version = payload.get("boardVersion")
     if not is_current_board_version(event_version, st.session_state.board_version):
         return
@@ -432,26 +485,11 @@ def handle_component_event(event: object) -> None:
         state = incoming
         set_state(state)
         st.session_state.confidence = None
-        try:
-            if not state.rack:
-                response("solve_error", error="Vul minstens één letter of blanco in het rek in voordat je oplossingen laat weergeven.")
-                st.session_state.solve_result = None
-                st.rerun()
-            moves = solve_state(state)
-        except Exception as error:
-            correlation_id = new_correlation_id()
-            log_failure(event="solve", correlation_id=correlation_id, actor=current_actor(), action="solve", error=error)
+        if not state.rack:
+            response("solve_error", error="Vul minstens één letter of blanco in het rek in voordat je oplossingen laat weergeven.")
             st.session_state.solve_result = None
-            response(
-                "solve_error",
-                error=public_error(safe_error_code(error, "SOLVER-ERROR"), correlation_id),
-            )
             st.rerun()
-        if not moves:
-            st.session_state.solve_result = None
-            response("solve_error", error="Geen legale zet gevonden in de gekozen woordenlijst.")
-            st.rerun()
-        st.session_state.solve_result = make_solve_result(state, moves, uuid4().hex)
+        solve_into_session(state)
         st.rerun()
 
     if kind == "cancel":
@@ -477,7 +515,18 @@ def handle_component_event(event: object) -> None:
             committed = apply_place_request(state, solve_result, payload)
         except StaleSolveRequest as error:
             correlation_id = new_correlation_id()
-            log_failure(event="place_request", correlation_id=correlation_id, actor=current_actor(), action="stale", error=error)
+            actor = current_actor()
+            # The solve result disappears with the session; the board the
+            # browser sent along still proves what was calculated for it.
+            try:
+                replayed = replay_place_request(payload, solve_state)
+            except Exception as replay_error:
+                log_failure(event="place_request", correlation_id=correlation_id, actor=actor, action="replay", error=replay_error)
+                replayed = None
+            if replayed is not None:
+                log_security_event(event="place_request", correlation_id=correlation_id, actor=actor, action="replay", result="ok")
+                commit_placement(replayed)
+            log_failure(event="place_request", correlation_id=correlation_id, actor=actor, action="stale", error=error)
             st.session_state.solve_result = None
             response(
                 "place_result", ok=False,
@@ -503,11 +552,7 @@ def handle_component_event(event: object) -> None:
                 error=public_error("PLACE-INVALID", correlation_id, "De zet kon niet worden geplaatst."),
             )
             st.rerun()
-        set_state(committed)
-        st.session_state.solve_result = None
-        st.session_state.confidence = None
-        response("place_result", ok=True, snapshot=committed.model_dump(mode="json"))
-        st.rerun()
+        commit_placement(committed)
 
 
 def process_upload() -> None:
@@ -741,6 +786,7 @@ event = wordfeud_board(
     board_version=st.session_state.board_version,
     mode="preview" if st.session_state.solve_result else "edit",
     solve_result=st.session_state.solve_result,
+    server_session=st.session_state.server_session_id,
     can_purge_suggestions=may_mutate_production_wordlist(actor),
     wordlist_update_active=replacement_update_active(),
     response=component_response,

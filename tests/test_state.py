@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from wordfeud_analyzer.models import Move, PlacedTile, standard_board
+from wordfeud_analyzer.models import BoardState, Move, PlacedTile, standard_board
 from wordfeud_analyzer.state import (
     InvalidSolveRequest,
     StaleSolveRequest,
@@ -16,6 +16,7 @@ from wordfeud_analyzer.state import (
     make_solve_result,
     replaceable_words,
     replace_from_upload,
+    replay_place_request,
     is_current_solve_result,
     snapshot_hash,
 )
@@ -110,6 +111,73 @@ def test_solve_and_place_request_is_bound_to_the_exact_snapshot_and_move() -> No
         apply_place_request(state, result, {**payload, "stateHash": "wrong"})
     with pytest.raises(InvalidSolveRequest):
         apply_place_request(state, result, {**payload, "selectedMove": {"word": "Z"}})
+
+
+def _place_request_payload() -> tuple[BoardState, Move, dict[str, object]]:
+    state = standard_board()
+    state.rack = ["A"]
+    move = Move(
+        word="A",
+        row=7,
+        col=7,
+        direction="H",
+        score=1,
+        tiles=[PlacedTile(row=7, col=7, letter="A")],
+    )
+    payload: dict[str, object] = {
+        "solveToken": "solve-1",
+        "stateHash": snapshot_hash(state),
+        "selectedMove": move.model_dump(mode="json"),
+        "snapshot": state.model_dump(mode="json"),
+    }
+    return state, move, payload
+
+
+def test_place_request_survives_a_solve_result_that_the_session_lost() -> None:
+    """A forgotten server session must not cost a suggestion that is still shown."""
+    state, move, payload = _place_request_payload()
+    solved: list[BoardState] = []
+
+    def solve(snapshot: BoardState) -> list[Move]:
+        solved.append(snapshot)
+        return [move]
+
+    committed = replay_place_request(payload, solve)
+    assert committed is not None
+    assert committed.grid[7][7].letter == "A"
+    assert committed.rack == []
+    # The solver runs on the board the browser sent, not on server state.
+    assert [snapshot_hash(snapshot) for snapshot in solved] == [snapshot_hash(state)]
+
+
+def test_replayed_place_request_only_accepts_a_move_this_solver_still_offers() -> None:
+    _state, move, payload = _place_request_payload()
+    other = move.model_copy(update={"score": 99})
+
+    assert replay_place_request(payload, lambda _snapshot: []) is None
+    assert replay_place_request(payload, lambda _snapshot: [other]) is None
+    assert replay_place_request({**payload, "stateHash": "wrong"}, lambda _snapshot: [move]) is None
+    assert replay_place_request({**payload, "snapshot": {"grid": "invalid"}}, lambda _snapshot: [move]) is None
+    assert replay_place_request(
+        {key: value for key, value in payload.items() if key != "snapshot"}, lambda _snapshot: [move]
+    ) is None
+    assert replay_place_request(
+        {**payload, "selectedMove": {"word": "Z"}}, lambda _snapshot: [move]
+    ) is None
+
+
+def test_replayed_place_request_cannot_place_the_same_move_twice() -> None:
+    _state, move, payload = _place_request_payload()
+    committed = replay_place_request(payload, lambda _snapshot: [move])
+    assert committed is not None
+
+    replayed_payload = {
+        **payload,
+        "stateHash": snapshot_hash(committed),
+        "snapshot": committed.model_dump(mode="json"),
+    }
+    with pytest.raises(ValueError, match="occupied"):
+        replay_place_request(replayed_payload, lambda _snapshot: [move])
 
 
 def test_replaceable_words_include_suggestion_cross_words() -> None:

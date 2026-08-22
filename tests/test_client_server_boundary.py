@@ -92,6 +92,18 @@ def test_server_owns_screenshot_solving_and_wordlist_operations() -> None:
     assert {"generate_moves", "load_wordlist"} <= _defined_functions(move_tree)
 
 
+def test_a_recovered_placement_is_solved_again_by_the_server() -> None:
+    """The browser may restore a board, never its own suggestions or moves."""
+    calls = _calls(_python_tree(ROOT / "app.py"))
+
+    assert any(
+        _call_path(call.func) == "replay_place_request"
+        and len(call.args) == 2
+        and _call_path(call.args[1]) == "solve_state"
+        for call in calls
+    )
+
+
 def test_ocr_words_require_explicit_dictionary_confirmation() -> None:
     app_tree = _python_tree(ROOT / "app.py")
     calls = _calls(app_tree)

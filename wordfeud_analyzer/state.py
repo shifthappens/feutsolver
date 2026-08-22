@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .models import BOARD_SIZE, BoardState, Move
 
@@ -192,6 +192,30 @@ def apply_place_request(
     if move is None:
         raise InvalidSolveRequest("De geselecteerde suggestie was ongeldig.")
     return apply_move(state, move)
+
+
+def replay_place_request(
+    payload: dict[str, object],
+    solve: Callable[[BoardState], Iterable[Move]],
+) -> BoardState | None:
+    """Validate a placement again for the board the browser sent along.
+
+    Used when a lost session took the solve result with it. The snapshot must
+    match its own hash and the solver must still offer exactly that move for
+    exactly that board, so the server keeps deciding what is legal. Returns
+    ``None`` when the request cannot be revalidated this way.
+    """
+    try:
+        snapshot = validate_snapshot(payload.get("snapshot"))
+    except Exception:
+        return None
+    if snapshot_hash(snapshot) != str(payload.get("stateHash", "")):
+        return None
+    rebuilt = make_solve_result(snapshot, solve(snapshot), str(payload.get("solveToken", "")))
+    move = selected_move(rebuilt, payload.get("selectedMove"))
+    if move is None:
+        return None
+    return apply_move(snapshot, move)
 
 
 def replace_from_upload(_current: BoardState, extracted: object) -> BoardState:
