@@ -253,7 +253,7 @@ jobs:
              find \"\$active/wordfeud_analyzer\" -type d -exec chmod g+rx,g+s {} +
              find \"\$active/wordfeud_analyzer\" -type f -exec chmod g+r {} +
              chmod g+rx,g+s '${DEPLOY_PATH}' '${DEPLOY_PATH}/releases' \"\$active\" \"\$active/.streamlit\" \"\$active/data\"
-             chmod g+r \"\$active/app.py\" \"\$active/requirements.txt\" \"\$active/.streamlit/config.toml\" \"\$active/data/voorbeeld_woorden.txt\" \"\$active/data/opentaal-wordlist.txt.gaddag-cache-v3.json\" '${DEPLOY_PATH}/data/opentaal-wordlist.txt' \"\$active/sbom.json\" \"\$active/release-manifest.json\"
+             chmod g+r \"\$active/app.py\" \"\$active/requirements.txt\" \"\$active/.streamlit/config.toml\" \"\$active/data/voorbeeld_woorden.txt\" \"\$active/data/opentaal-wordlist.txt.gaddag-cache-v3.json\" \"\$active/sbom.json\" \"\$active/release-manifest.json\"
              chmod g+rx '${DEPLOY_PATH}/.wordlist-sync'
              chmod g+r '${DEPLOY_PATH}/.wordlist-sync/previous-repository.txt' '${DEPLOY_PATH}/.wordlist-sync/previous-merged.txt'
              lock_path='${DEPLOY_PATH}/.wordlist.lock'
@@ -270,6 +270,11 @@ jobs:
              test \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c5)\" = r
              case \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c7)\" in x|s) ;; *) exit 1 ;; esac
              service_user='${SERVICE_USER}'
+             if [ \"\$(id -un)\" = \"\$service_user\" ]; then
+               test -r '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
+             else
+               sudo -n -u \"\$service_user\" -- test -r '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
+             fi
              if [ \"\$(id -un)\" = \"\$service_user\" ]; then
                test -r \"\$lock_path\" && test -w \"\$lock_path\"
                exec 9>>\"\$lock_path\"

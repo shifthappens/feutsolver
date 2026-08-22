@@ -115,6 +115,7 @@ def test_words_seen_on_a_board_are_suggestions_until_explicitly_confirmed(tmp_pa
     assert "gins" not in source.read_text(encoding="utf-8").splitlines()
 
     assert add_words_to_wordlist(["GINS"], source, actor="feutsolver") == ["GINS"]
+    assert source.stat().st_mode & 0o777 == 0o664
     assert suggest_words(["GINS"], source) == []
 
     relearned = load_wordlist(source)
@@ -139,6 +140,7 @@ def test_remove_word_from_wordlist_removes_diacritic_spelling(tmp_path: Path) ->
 
     assert remove_word_from_wordlist("FACADE", source, actor="feutsolver")
     assert source.read_text(encoding="utf-8") == "kat\nkamer\n"
+    assert source.stat().st_mode & 0o777 == 0o664
     assert not remove_word_from_wordlist("FACADE", source, actor="feutsolver")
     assert not load_wordlist(source).contains("FACADE")
 

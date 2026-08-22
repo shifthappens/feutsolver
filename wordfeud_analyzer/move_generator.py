@@ -40,7 +40,8 @@ CACHE_SCHEMA_VERSION = 1
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 MAX_CACHE_NODES = 10_000_000
 MAX_CACHE_WORDS = 2_000_000
-WORDLIST_LOCK_MODE = 0o664
+WORDLIST_SHARED_MODE = 0o664
+WORDLIST_LOCK_MODE = WORDLIST_SHARED_MODE
 RUNTIME_CACHE_WRITE = os.getenv(
     "FEUTSOLVER_RUNTIME_CACHE_WRITE",
     "0" if os.getenv("APP_ENV", "production").strip().lower() == "production" else "1",
@@ -590,6 +591,7 @@ def _atomic_text_replace(path: Path, content: str) -> None:
             temporary.write(content)
             temporary.flush()
             os.fsync(temporary.fileno())
+        os.chmod(temporary_path, WORDLIST_SHARED_MODE)
         temporary_path.replace(path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
@@ -693,6 +695,7 @@ def remove_words_from_wordlist(
                     temporary.flush()
                     os.fsync(temporary.fileno())
             if removed and temporary_path is not None:
+                os.chmod(temporary_path, WORDLIST_SHARED_MODE)
                 temporary_path.replace(source)
                 directory_fd = os.open(source.parent, os.O_RDONLY)
                 try:
