@@ -166,6 +166,17 @@ def test_local_rack_geometry_finds_all_tiles_without_reading_the_letters() -> No
     assert boxes == [(15 + index * 80, 95, 15 + index * 80 + 77, 171) for index in range(7)]
 
 
+def test_local_rack_geometry_does_not_split_a_single_tile_on_a_glyph_scanline() -> None:
+    rack = Image.new("RGB", (588, 315), DARK_THEME["empty"])
+    draw = ImageDraw.Draw(rack)
+    draw.rectangle((15, 95, 92, 250), fill=DARK_THEME["tile"])
+    # This mirrors the supplied screenshot: the last candidate scanline crosses
+    # the lower stroke of the only rack glyph and creates two light runs.
+    draw.rectangle((50, 219, 55, 219), fill=DARK_THEME["empty"])
+
+    assert _rack_boxes(rack, DARK_THEME["empty"]) == [(15, 95, 93, 251)]
+
+
 def _glyph_from_profile(letter: str) -> Image.Image:
     """Build a real, versioned Wordfeud glyph fixture without a host font."""
     mask = _decoded_wordfeud_profiles()[letter][0]

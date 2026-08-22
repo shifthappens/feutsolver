@@ -124,6 +124,16 @@ EXPECTED: dict[str, dict[str, object]] = {
             ".....T.NUL.I...", "....HE..WIEK...", "....ARME.......", "HOPSA..........", "....G..........",
         ),
     },
+    "IMG_6091.png": {
+        "rack": "C",
+        "layout": "B",
+        "rows": (
+            "....G..........", "...MA...K......", ".NOODWEER.ZEND.", "...R...AU.ER.U.",
+            ".H..BEDUIDT.FIT", ".IJZEN..TOE.AF.", ".P..N....EL.N..", ".S.SEC.YAMS....",
+            ".T..N...Q...J..", "....D...U..PETS", "...MENG.AXEL..A", "......ES...O..R",
+            "..N...V...WOL.O", "..E..GE..HAI..N", ".VERBENE..D....",
+        ),
+    },
 }
 
 

@@ -1415,13 +1415,17 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
         row = [_is_tile_colour(_rgb_pixel(rack, x, y), empty_colour) for x in range(width)]
         runs = _tile_runs(row, minimum_width, maximum_width)
         # Letter strokes and point values can split a tile into several bright
-        # runs. A rack contains at most seven tiles, so such a scanline is noise,
-        # not a better geometry candidate. Prefer a lower scanline where the tile
-        # bodies form seven contiguous runs instead.
+        # runs. A rack contains at most seven tiles, so reject scanlines with
+        # more candidates than that and rank the remaining lines by tile-body
+        # coverage below.
         if len(runs) > 7:
             continue
-        if (len(runs), sum(end - start for start, end in runs)) > (
-            len(best), sum(end - start for start, end in best)
+        # A glyph can split one tile on an otherwise valid scanline.  Prefer the
+        # scanline that covers the most tile body first; choosing by run count
+        # turns that split into a false extra rack tile (especially when the rack
+        # contains only one or two tiles).
+        if (sum(end - start for start, end in runs), len(runs)) > (
+            sum(end - start for start, end in best), len(best)
         ):
             best = runs
     if not best:
