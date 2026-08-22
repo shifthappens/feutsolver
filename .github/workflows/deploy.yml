@@ -270,11 +270,11 @@ jobs:
              test \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c5)\" = r
              case \"\$(stat -c '%A' '${DEPLOY_PATH}' | cut -c7)\" in x|s) ;; *) exit 1 ;; esac
              service_user='${SERVICE_USER}'
-             if [ \"\$(id -un)\" = \"\$service_user\" ]; then
-               test -r '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
-             else
-               sudo -n -u \"\$service_user\" -- test -r '${DEPLOY_PATH}/data/opentaal-wordlist.txt'
-             fi
+             service_group='feutsolver-app'
+             wordlist='${DEPLOY_PATH}/data/opentaal-wordlist.txt'
+             test \"\$(stat -c '%G' \"\$wordlist\")\" = \"\$service_group\"
+             test \"\$(stat -c '%A' \"\$wordlist\" | cut -c5)\" = r
+             id -Gn \"\$service_user\" | tr ' ' '\n' | grep -Fxq \"\$service_group\"
              if [ \"\$(id -un)\" = \"\$service_user\" ]; then
                test -r \"\$lock_path\" && test -w \"\$lock_path\"
                exec 9>>\"\$lock_path\"
