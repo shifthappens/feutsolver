@@ -15,6 +15,7 @@ from wordfeud_analyzer.state import (
     is_current_board_version,
     make_solve_result,
     replaceable_words,
+    replaceable_words_for_move,
     replace_from_upload,
     replay_place_request,
     is_current_solve_result,
@@ -194,6 +195,11 @@ def test_replaceable_words_include_suggestion_cross_words() -> None:
     result = make_solve_result(state, [move], "solve-1")
 
     assert replaceable_words(result) == {"FLUX", "FTE"}
+    assert replaceable_words_for_move(move) == {"FLUX", "FTE"}
+
+
+def test_replaceable_words_for_move_rejects_invalid_payloads() -> None:
+    assert replaceable_words_for_move({"word": "FLUX"}) == set()
 
 
 def test_upload_replacement_validates_before_the_working_state_is_swapped() -> None:

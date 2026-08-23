@@ -361,6 +361,28 @@ test("purging a suggestion emits the selected word and current solve identity", 
   });
 });
 
+test("purging a cross word emits that cross word and current solve identity", () => {
+  const controller = loadController();
+  const source = snapshot(["A"]);
+  controller.events.dispatch(previewProps(source, [
+    { word: "FLUX", score: 20, row: 7, col: 7, direction: "H", tiles: [], cross_words: ["FTE"] },
+  ]));
+
+  controller.document.querySelectorAll("[data-purge-suggestion]")[1].click();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(controller.messages[0])), {
+    id: 1,
+    type: "purge_suggestion",
+    payload: {
+      suggestionIndex: 0,
+      word: "FTE",
+      solveToken: "solve-1",
+      stateHash: "hash-1",
+      boardVersion: 0,
+    },
+  });
+});
+
 test("rack selection survives a rerun before the first tile is typed", () => {
   const controller = loadController();
   const source = snapshot(["A"]);

@@ -148,13 +148,17 @@ def replaceable_words(solve_result: object) -> set[str]:
     if not isinstance(moves, list):
         return result
     for stored in moves:
-        try:
-            move = Move.model_validate(stored)
-        except Exception:
-            continue
-        result.add(move.word)
-        result.update(move.cross_words)
+        result.update(replaceable_words_for_move(stored))
     return result
+
+
+def replaceable_words_for_move(move: object) -> set[str]:
+    """Return the dictionary words represented by one offered move."""
+    try:
+        validated = Move.model_validate(move)
+    except Exception:
+        return set()
+    return {validated.word, *validated.cross_words}
 
 
 def selected_move(solve_result: dict[str, Any], value: object) -> Move | None:

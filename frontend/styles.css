@@ -41,6 +41,11 @@
     .suggestion-purge { align-self:stretch; min-width:2.15rem; padding:0 .55rem; border:1px solid #ead28f; border-radius:8px; background:#fff8df; color:#88671f; font-size:1.45rem; font-weight:500; line-height:1; }
     .suggestion-purge:hover, .suggestion-purge:focus-visible { border-color:#c6a24d; background:#ffefb6; color:#5c4619; }
     .suggestion-purge:focus-visible { outline:3px solid #d9efdf; outline-offset:1px; }
+    .cross-words { display:flex; gap:.4rem; flex-wrap:wrap; align-items:center; margin-top:.5rem; color:var(--muted); font-size:.84rem; }
+    .cross-words-label { margin-right:.1rem; }
+    .cross-word { display:inline-flex; align-items:center; gap:.15rem; padding:.12rem .2rem .12rem .45rem; border:1px solid #d8ded8; border-radius:999px; background:#f7faf6; color:var(--ink); }
+    .cross-word-purge { min-width:1.35rem; padding:.05rem .25rem; border:0; background:transparent; color:#88671f; font-size:1.05rem; }
+    .cross-word-purge:hover, .cross-word-purge:focus-visible { color:#5c4619; background:#ffefb6; }
     .save-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.5rem; margin:.45rem 0; }
     .save-row input, .save-row select { width:100%; min-width:0; border:1px solid #cbd4cd; border-radius:8px; padding:.5rem .6rem; background:#fff; }
     .save-actions { margin-top:.5rem; }

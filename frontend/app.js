@@ -294,15 +294,19 @@
     }
     function formatMove(move) {
       const direction = move.direction === "H" ? "horizontaal" : "verticaal";
-      const crosses = move.cross_words?.length ? ` · kruiswoorden: ${move.cross_words.join(", ")}` : "";
       const bingo = move.bingo ? " · bingo +40" : "";
-      return `${direction}, start rij ${move.row + 1}, kolom ${move.col + 1}${crosses}${bingo}`;
+      return `${direction}, start rij ${move.row + 1}, kolom ${move.col + 1}${bingo}`;
+    }
+    function renderCrossWords(move, index, purgeEnabled) {
+      const crossWords = [...new Set(move.cross_words || [])].filter(word => word && word !== move.word);
+      if (!crossWords.length) return "";
+      return `<div class="cross-words"><span class="cross-words-label">Nieuwe kruiswoorden:</span>${crossWords.map(word => `<span class="cross-word"><span>${escapeHtml(word)}</span>${props.can_purge_suggestions ? `<button class="suggestion-purge cross-word-purge" data-purge-suggestion="${index}" data-purge-word="${escapeHtml(word)}" aria-label="Verwijder kruiswoord ${escapeHtml(word)} uit de woordenlijst" title="Verwijder ${escapeHtml(word)} uit de woordenlijst" ${purgeEnabled ? "" : "disabled"}>×</button>` : ""}</span>`).join("")}</div>`;
     }
     function renderSuggestions(result) {
       if (!result?.moves?.length) return `<p class="empty">Geen legale zet gevonden in de gekozen woordenlijst.</p>`;
       const purgeEnabled = Boolean(props.can_purge_suggestions) && !props.wordlist_update_active && !purgeInFlight;
       return result.moves.map((move, index) => `<article class="suggestion ${index === selectedSuggestion ? "selected" : ""}">
-        <div class="suggestion-row"><button class="suggestion-select" data-suggestion="${index}" aria-pressed="${index === selectedSuggestion}"><strong>${index + 1}. ${escapeHtml(move.word)} · ${escapeHtml(move.score)} punten</strong><small>${escapeHtml(formatMove(move))}</small></button>${props.can_purge_suggestions ? `<button class="suggestion-purge" data-purge-suggestion="${index}" aria-label="Verwijder suggestie ${escapeHtml(move.word)} uit de woordenlijst" title="Verwijder ${escapeHtml(move.word)} uit de woordenlijst" ${purgeEnabled ? "" : "disabled"}>×</button>` : ""}</div></article>`).join("");
+        <div class="suggestion-row"><button class="suggestion-select" data-suggestion="${index}" aria-pressed="${index === selectedSuggestion}"><strong>${index + 1}. ${escapeHtml(move.word)} · ${escapeHtml(move.score)} punten</strong><small>${escapeHtml(formatMove(move))}</small></button>${props.can_purge_suggestions ? `<button class="suggestion-purge" data-purge-suggestion="${index}" data-purge-word="${escapeHtml(move.word)}" aria-label="Verwijder suggestie ${escapeHtml(move.word)} uit de woordenlijst" title="Verwijder ${escapeHtml(move.word)} uit de woordenlijst" ${purgeEnabled ? "" : "disabled"}>×</button>` : ""}</div>${renderCrossWords(move, index, purgeEnabled)}</article>`).join("");
     }
     function renderSaves(editing, notification = "") {
       const loaded = WF.readSaves(storage(), storageNamespace());
@@ -347,11 +351,12 @@
         const index = Number(button.dataset.purgeSuggestion);
         const move = props.solve_result?.moves?.[index];
         if (!move) return;
+        const word = button.dataset.purgeWord || move.word;
         purgeInFlight = true;
         render();
         emit("purge_suggestion", {
           suggestionIndex: index,
-          word: move.word,
+          word,
           solveToken: props.solve_result.token,
           stateHash: props.solve_result.state_hash,
         });

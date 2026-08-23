@@ -25,6 +25,7 @@ from wordfeud_analyzer.move_generator import (
     suggest_words,
 )
 from wordfeud_analyzer.security import (
+    APP_ENV,
     ResourceLimitError,
     authenticated_actor,
     file_version,
@@ -455,13 +456,14 @@ def handle_component_event(event: object) -> None:
         except Exception:
             response("purge_error", error="Deze suggestie is ongeldig. Kies opnieuw voor ‘Geef oplossingen weer’.")
             st.rerun()
-        if selected.word != requested_word.strip().upper():
+        requested = requested_word.strip().upper()
+        if requested not in {selected.word, *selected.cross_words}:
             response("purge_error", error="Deze suggestie is verouderd. Kies opnieuw voor ‘Geef oplossingen weer’.")
             st.rerun()
         if not may_mutate_production_wordlist(actor):
             response("purge_error", error="Je mag de productiewoordenlijst niet wijzigen.")
             st.rerun()
-        purge_suggestion(selected.word, state, solve_result, actor=actor)
+        purge_suggestion(requested, state, solve_result, actor=actor)
 
     if kind == "new_board":
         set_state(standard_board())
@@ -733,9 +735,13 @@ if poll_wordlist_update():
 # The solve request then waits only for work that is still in progress.
 _ = get_lexicon(str(DEFAULT_WORDLIST), lexicon_signature())
 actor = current_actor()
+can_mutate_wordlist = may_mutate_production_wordlist(actor)
 st.title("Wordfeud-oplosser")
 if actor:
     st.caption(f"Ingelogd als {actor}.")
+elif APP_ENV != "production":
+    mutation_status = "ingeschakeld" if can_mutate_wordlist else "uitgeschakeld"
+    st.caption(f"Lokale modus: authenticatie is niet nodig; woordenlijstwijzigingen zijn {mutation_status}.")
 else:
     st.warning("Foutcode AUTH-001: betrouwbare identiteit ontbreekt; alleen lezen en oplossen is beschikbaar.")
 st.link_button("Uitloggen", "/feutsolver-logout")
