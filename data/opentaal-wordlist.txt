@@ -63987,6 +63987,13 @@ downstemming
 downstemmingen
 downsyndroom
 downtown
+dox
+doxen
+doxend
+doxende
+doxt
+doxte
+doxten
 doxologie
 doxycycline
 dozen
@@ -83936,6 +83943,7 @@ gedoctoreerde
 gedoctoreerden
 gedocumenteerd
 gedocumenteerde
+gedoxt
 gedode
 gedoden
 gedodijnd
