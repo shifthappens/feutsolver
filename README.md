@@ -60,7 +60,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-De standaard is lokale OCR (`WORDFEUD_OCR_BACKEND=local`), waardoor een API-sleutel niet nodig is. De lokale route is ontworpen voor Wordfeud-screenshots en blijft ruim onder twee seconden op een normale laptop. Zet voor een optionele cloudfallback `WORDFEUD_OCR_BACKEND=auto`; `openrouter` forceert de oude AI-route.
+De standaard is lokale OCR (`WORDFEUD_OCR_BACKEND=local`), waardoor een API-sleutel niet nodig is. Met maximaal één lokale tile-worker per proces duurde de gemeten route voor twee echte screenshots met 76 en 100 bordtegels circa 1,23 en 1,30 seconden mediaan, van beeldvalidatie en OCR tot oplossingen en JSON-serialisatie. Dit is gemeten op een ontwikkelmachine, niet op de productie-VPS; zie [`docs/performance.md`](docs/performance.md) voor de meetmethode, VPS-specificaties en grenzen. Zet voor een optionele cloudfallback `WORDFEUD_OCR_BACKEND=auto`; `openrouter` forceert de oude AI-route.
 
 Een blijvende, lokale optie is `.streamlit/secrets.toml` (dit bestand staat in `.gitignore`):
 

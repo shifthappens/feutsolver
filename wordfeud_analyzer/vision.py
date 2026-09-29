@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import colorsys
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -63,6 +64,32 @@ _EXTERNAL_OCR_LIMITER = SlidingWindowRateLimiter(
     window_seconds=EXTERNAL_REQUEST_WINDOW_SECONDS,
 )
 _IMAGE_DECODER_WARNING_LOCK = RLock()
+
+
+def _local_tile_ocr_worker_count() -> int:
+    """Use parallel Tesseract only across CPUs available to this process."""
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    available = process_cpu_count() if callable(process_cpu_count) else None
+    if not available:
+        available = os.cpu_count() or 1
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if callable(get_affinity):
+        try:
+            available = min(available, len(get_affinity(0)))
+        except OSError:
+            pass
+    configured_limit_raw = os.getenv("FEUTSOLVER_MAX_LOCAL_TILE_OCR_WORKERS", "4")
+    try:
+        configured_limit = int(configured_limit_raw)
+    except (TypeError, ValueError):
+        configured_limit = 4
+    return max(1, min(4, available, configured_limit))
+
+
+_LOCAL_TILE_OCR_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_local_tile_ocr_worker_count(),
+    thread_name_prefix="feutsolver-tile-ocr",
+)
 
 EXTRACTION_PROMPT = """You read letters from Wordfeud tile crops. Do not solve the game.
 
@@ -402,10 +429,13 @@ def _locate_board_top(image: Image.Image) -> int:
     return best_top if best_score / width >= 6 else fallback
 
 
-def _wordfeud_crop_images(image_path: str | Path) -> tuple[Image.Image, Image.Image]:
+def _wordfeud_crop_images(image_path: str | Path | Image.Image) -> tuple[Image.Image, Image.Image]:
     """Split a portrait screenshot into its square board and its rack band."""
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
+    if isinstance(image_path, Image.Image):
+        image = image_path if image_path.mode == "RGB" else image_path.convert("RGB")
+    else:
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
     width, height = image.size
     if height <= width or width < 200:
         return image, image.copy()
@@ -462,17 +492,20 @@ def _is_tile_colour(colour: Rgb, empty_colour: Rgb) -> bool:
     return min(colour) >= TILE_MINIMUM_CHANNEL and _colour_distance(colour, empty_colour) > EMPTY_COLOUR_TOLERANCE
 
 
-def detect_visible_tiles(image_path: str | Path) -> set[tuple[int, int]]:
-    """Find the coordinates of the tiles already on the board."""
-    board, _ = _wordfeud_crop_images(image_path)
-    colours = _cell_colours(board)
-    empty_colour = _empty_cell_colour(colours)
+def _visible_tiles_from_colours(colours: list[list[Rgb]], empty_colour: Rgb) -> set[tuple[int, int]]:
     return {
         (row, col)
         for row in range(BOARD_SIZE)
         for col in range(BOARD_SIZE)
         if _is_tile_colour(colours[row][col], empty_colour)
     }
+
+
+def detect_visible_tiles(image_path: str | Path | Image.Image) -> set[tuple[int, int]]:
+    """Find the coordinates of the tiles already on the board."""
+    board, _ = _wordfeud_crop_images(image_path)
+    colours = _cell_colours(board)
+    return _visible_tiles_from_colours(colours, _empty_cell_colour(colours))
 
 
 # Hue is what survives a theme change: the light theme brightens and saturates every
@@ -491,11 +524,7 @@ def _hue_distance(first: float, second: float) -> float:
     return min(difference, 360 - difference)
 
 
-def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
-    """Read the visible bonus squares by hue, without assuming a board layout."""
-    board, _ = _wordfeud_crop_images(image_path)
-    colours = _cell_colours(board)
-    empty_colour = _empty_cell_colour(colours)
+def _visible_bonuses_from_colours(colours: list[list[Rgb]], empty_colour: Rgb) -> list[list[str]]:
     bonuses: list[list[str]] = []
     for row in range(BOARD_SIZE):
         result_row: list[str] = []
@@ -514,6 +543,13 @@ def detect_visible_bonuses(image_path: str | Path) -> list[list[str]]:
             result_row.append(name if distance <= 25 else "NORMAL")
         bonuses.append(result_row)
     return bonuses
+
+
+def detect_visible_bonuses(image_path: str | Path | Image.Image) -> list[list[str]]:
+    """Read the visible bonus squares by hue, without assuming a board layout."""
+    board, _ = _wordfeud_crop_images(image_path)
+    colours = _cell_colours(board)
+    return _visible_bonuses_from_colours(colours, _empty_cell_colour(colours))
 
 
 # While a move is being composed, Wordfeud paints a saturated yellow score bubble on
@@ -558,15 +594,22 @@ def _matching_fraction(
     return matches / total if total else 0.0
 
 
-def detect_pending_move(image_path: str | Path) -> bool:
+def detect_pending_move(
+    image_path: str | Path | Image.Image,
+    *,
+    board_image: Image.Image | None = None,
+) -> bool:
     """Is a move being composed on this board, rather than played?
 
     Either signal is enough: the blue action button below the rack, or the score
     bubble on the board for a placement Wordfeud can already price. Neither depends on
     where the tiles lie or on what the bubble says.
     """
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
+    if isinstance(image_path, Image.Image):
+        image = image_path if image_path.mode == "RGB" else image_path.convert("RGB")
+    else:
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
     width, height = image.size
     step = max(1, width // 300)
 
@@ -577,7 +620,7 @@ def detect_pending_move(image_path: str | Path) -> bool:
     if button > 0.005:
         return True
 
-    board, _ = _wordfeud_crop_images(image_path)
+    board = board_image if board_image is not None else _wordfeud_crop_images(image)[0]
     bubble = _matching_fraction(
         board, PENDING_HUE_RANGE, PENDING_MINIMUM_SATURATION, PENDING_MINIMUM_VALUE, step
     )
@@ -1193,8 +1236,8 @@ def _point_components(
     ]
 
 
-def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, int | None]:
-    """Extract the large letter and the printed point value, if present."""
+def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, Image.Image | None]:
+    """Extract the large glyph and the tiny point glyph, without running OCR."""
     margin = max(2, round(min(tile.size) * 0.1))
     inner = tile.crop((margin, margin, tile.width - margin, tile.height - margin))
     components = _dark_components(inner)
@@ -1214,15 +1257,8 @@ def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, int | None]:
     point_margin = max(2, round(min(tile.size) * 0.04))
     point_inner = tile.crop((point_margin, point_margin, tile.width - point_margin, tile.height - point_margin))
     point_components = _point_components(point_inner, sorted(_dark_components(point_inner), key=len, reverse=True))
-    point_value = None
-    if point_components:
-        try:
-            point_value = _template_point_value(_combined_component_image(point_components))
-        except (LocalOCRUnavailable, LocalOCRFailure):
-            # The superscript is secondary evidence.  A failed tiny-digit read must
-            # never turn a clear large-glyph profile into a failed whole-board OCR.
-            point_value = None
-    return glyph, point_value
+    point_glyph = _combined_component_image(point_components) if point_components else None
+    return glyph, point_glyph
 
 
 def _packed_profile(glyph: Image.Image) -> bytes:
@@ -1385,11 +1421,14 @@ def _tile_cells(board: Image.Image, tiles: list[tuple[int, int]]) -> list[Image.
     ]
 
 
-def _tile_runs(row: list[bool], minimum_width: int, maximum_width: int) -> list[tuple[int, int]]:
+def _tile_runs(
+    row: list[bool] | bytearray, minimum_width: int, maximum_width: int,
+) -> list[tuple[int, int]]:
     """Find pale tile runs in one rack scanline and merge JPEG gaps."""
     runs: list[tuple[int, int]] = []
     start: int | None = None
-    for x, is_tile in enumerate(row + [False]):
+    for x in range(len(row) + 1):
+        is_tile = row[x] if x < len(row) else False
         if is_tile and start is None:
             start = x
         elif not is_tile and start is not None:
@@ -1410,9 +1449,27 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     width, height = rack.size
     minimum_width = max(30, round(width * 0.055))
     maximum_width = round(width * 0.2)
+    # Cache each colour decision once. The old two-pass scan repeatedly decoded
+    # and classified the same rack pixels for every candidate tile column.
+    pixels = rack.load()
+    tile_mask = [bytearray(width) for _ in range(height)]
+    empty_distance_squared = EMPTY_COLOUR_TOLERANCE ** 2
+    for y, row in enumerate(tile_mask):
+        for x in range(width):
+            pixel = pixels[x, y]
+            if not isinstance(pixel, tuple) or len(pixel) < 3:
+                raise TypeError("expected an RGB image")
+            colour = pixel[0], pixel[1], pixel[2]
+            if min(colour) < TILE_MINIMUM_CHANNEL:
+                continue
+            distance_squared = sum(
+                (colour[channel] - empty_colour[channel]) ** 2 for channel in range(3)
+            )
+            row[x] = distance_squared > empty_distance_squared
+
     best: list[tuple[int, int]] = []
     for y in range(round(height * 0.25), round(height * 0.7)):
-        row = [_is_tile_colour(_rgb_pixel(rack, x, y), empty_colour) for x in range(width)]
+        row = tile_mask[y]
         runs = _tile_runs(row, minimum_width, maximum_width)
         # Letter strokes and point values can split a tile into several bright
         # runs. A rack contains at most seven tiles, so reject scanlines with
@@ -1434,10 +1491,7 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     for left, right in best:
         rows: list[int] = []
         for y in range(height):
-            coverage = sum(
-                _is_tile_colour(_rgb_pixel(rack, x, y), empty_colour)
-                for x in range(left, right)
-            ) / max(1, right - left)
+            coverage = sum(tile_mask[y][left:right]) / max(1, right - left)
             if coverage >= 0.5:
                 rows.append(y)
         if not rows:
@@ -1492,26 +1546,34 @@ def _local_glyph_readings(
     cells: list[Image.Image], *, rack: bool, budget: OCRBudget | None = None,
 ) -> list[LocalGlyphReading]:
     """Read cells using checked-in Wordfeud profiles and measured confidence."""
-    readings: list[LocalGlyphReading] = []
-    for cell in cells:
+    def read_tile_glyph(cell: Image.Image) -> LocalGlyphReading:
         if budget is not None:
             budget.check()
-        glyph, point_value = _tile_glyph(cell)
+        glyph, point_glyph = _tile_glyph(cell)
         if glyph is None:
             if rack:
-                readings.append(LocalGlyphReading("?", _blank_tile_confidence(cell)))
-                continue
+                return LocalGlyphReading("?", _blank_tile_confidence(cell))
             raise LocalOCRFailure("Lokale OCR vond geen grote letter in een bordtegel.")
         candidates = _profile_letter_candidates(glyph)
+
+        def read_point_value() -> int | None:
+            if point_glyph is None:
+                return None
+            try:
+                return _template_point_value(point_glyph)
+            except (LocalOCRUnavailable, LocalOCRFailure):
+                # The tiny superscript is secondary evidence; a failed read must
+                # never turn an otherwise clear large-glyph match into a failure.
+                return None
+
         if not _profile_is_decisive(candidates):
-            if point_value == 10:
+            if read_point_value() == 10:
                 try:
                     if _tesseract_letter(glyph).upper() == "Q":
                         # Retain this fallback for older profile-bank variants where
                         # Q is unavailable; its unique value still needs a separate
                         # large-glyph read and remains visibly low-confidence.
-                        readings.append(LocalGlyphReading("Q", 60.0))
-                        continue
+                        return LocalGlyphReading("Q", 60.0)
                 except (LocalOCRUnavailable, LocalOCRFailure):
                     pass
             raise LocalOCRFailure(
@@ -1519,29 +1581,40 @@ def _local_glyph_readings(
                 "Gebruik een scherpere schermafbeelding of de expliciete AI-fallback."
             )
         score, letter = candidates[0]
+        # A very strong large-glyph profile is accepted even if the point OCR
+        # disagrees, so reading that secondary signal cannot change this result.
+        # Retain the existing point check for every weaker decisive profile.
+        point_value = read_point_value() if score > LOCAL_PROFILE_STRONG_DISTANCE else None
         letter = _reconcile_local_letter(letter, score, point_value)
         # Missing tiny-point OCR is not evidence of a blank: the points are optional
         # metadata and can disappear after resizing/compression. A local blank
         # classifier must provide explicit evidence before a board letter is lowered.
         reading = letter.upper()
-        readings.append(LocalGlyphReading(reading, _profile_confidence(candidates)))
-    return readings
+        return LocalGlyphReading(reading, _profile_confidence(candidates))
+
+    # Preserve input order while keeping Tesseract processes and image crops
+    # bounded. Strong profile matches now avoid an OCR subprocess whose result
+    # the reconciliation rules would ignore anyway.
+    return list(_LOCAL_TILE_OCR_EXECUTOR.map(read_tile_glyph, cells))
 
 
 def _extract_board_local(image_path: str | Path, *, budget: OCRBudget | None = None) -> BoardExtraction:
     """Extract a screenshot without a network call or a language model."""
     if budget is not None:
         budget.check()
-    if detect_pending_move(image_path):
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    board_image, rack_image = _wordfeud_crop_images(image)
+    if detect_pending_move(image, board_image=board_image):
         raise PendingMoveError
-    board_image, rack_image = _wordfeud_crop_images(image_path)
-    tiles = sorted(detect_visible_tiles(image_path))
+    cell_colours = _cell_colours(board_image)
+    empty_colour = _empty_cell_colour(cell_colours)
+    tiles = sorted(_visible_tiles_from_colours(cell_colours, empty_colour))
     loose = _disconnected_tiles(set(tiles)) | _implausible_tiles(set(tiles))
     if loose:
         raise LooseTilesError(len(loose))
-    bonuses = detect_visible_bonuses(image_path)
+    bonuses = _visible_bonuses_from_colours(cell_colours, empty_colour)
     board_readings = _local_glyph_readings(_tile_cells(board_image, tiles), rack=False, budget=budget)
-    empty_colour = _empty_cell_colour(_cell_colours(board_image))
     rack_cells = [rack_image.crop(box) for box in _rack_boxes(rack_image, empty_colour)]
     rack_readings = _local_glyph_readings(rack_cells, rack=True, budget=budget)
     readings = board_readings + rack_readings

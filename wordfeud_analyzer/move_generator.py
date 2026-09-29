@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 import fcntl
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -541,6 +542,16 @@ def load_wordlist(path: str | Path) -> Gaddag:
     return instance
 
 
+@lru_cache(maxsize=1)
+def _known_wordlist_entries(path: str, version: str) -> frozenset[str]:
+    """Cache normalized membership by content digest, including external updates."""
+    try:
+        entries = Path(path).read_text(encoding="utf-8").split()
+    except FileNotFoundError:
+        return frozenset()
+    return frozenset(normalise_word(line) for line in entries)
+
+
 def suggest_words(words: Iterable[str], path: str | Path) -> list[str]:
     """Return normalised words not yet present in the configured word list.
 
@@ -548,10 +559,16 @@ def suggest_words(words: Iterable[str], path: str | Path) -> list[str]:
     write side effect: OCR output must never change the dictionary implicitly.
     """
     target = Path(path)
-    try:
-        known = {normalise_word(line) for line in target.read_text(encoding="utf-8").split()}
-    except FileNotFoundError:
-        known = set()
+    version = file_version(target)
+    if version is None:
+        try:
+            entries = target.read_text(encoding="utf-8").split()
+        except FileNotFoundError:
+            known = frozenset()
+        else:
+            known = frozenset(normalise_word(line) for line in entries)
+    else:
+        known = _known_wordlist_entries(str(target.resolve()), version)
     return sorted({normalise_word(word) for word in words} - known - {""})
 
 
