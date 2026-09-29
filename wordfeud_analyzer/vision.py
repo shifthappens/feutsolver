@@ -14,8 +14,9 @@ confusion.
 from __future__ import annotations
 
 import base64
+import csv
 import colorsys
-from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO, StringIO
 import json
 import os
 import re
@@ -26,11 +27,11 @@ import warnings
 from collections import Counter
 from copy import deepcopy
 from functools import lru_cache
-from io import BytesIO
 from pathlib import Path
 from threading import RLock
 from typing import NamedTuple, TypeAlias, cast
 
+import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from PIL.Image import DecompressionBombError, UnidentifiedImageError
@@ -39,6 +40,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .models import BoardState
 from .move_generator import LETTER_VALUES
 from .security import OCRBudget, ResourceLimitError, SlidingWindowRateLimiter, resource_slot
+
+try:
+    # Import once during process startup. The app already preloads its lexicon in
+    # the background, and keeping Python package import time out of the first OCR
+    # request makes cold and warm request behaviour consistent. The native binary
+    # is still checked at call time so the existing graceful error remains.
+    import pytesseract as _pytesseract
+except ImportError:
+    _pytesseract = None
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -59,37 +69,15 @@ EXTERNAL_INPUT_COST_PER_MILLION_TOKENS = 1.0
 EXTERNAL_OUTPUT_COST_PER_MILLION_TOKENS = 4.0
 MAX_OCR_SECONDS = 30
 MAX_OCR_ATTEMPTS = 4
+# One batched Tesseract process is faster and more memory-efficient than nested
+# OpenMP work on the production VPS's single shared vCPU. Operators can still
+# opt into another explicit limit before the process starts.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 _EXTERNAL_OCR_LIMITER = SlidingWindowRateLimiter(
     limit=MAX_EXTERNAL_REQUESTS_PER_WINDOW,
     window_seconds=EXTERNAL_REQUEST_WINDOW_SECONDS,
 )
 _IMAGE_DECODER_WARNING_LOCK = RLock()
-
-
-def _local_tile_ocr_worker_count() -> int:
-    """Use parallel Tesseract only across CPUs available to this process."""
-    process_cpu_count = getattr(os, "process_cpu_count", None)
-    available = process_cpu_count() if callable(process_cpu_count) else None
-    if not available:
-        available = os.cpu_count() or 1
-    get_affinity = getattr(os, "sched_getaffinity", None)
-    if callable(get_affinity):
-        try:
-            available = min(available, len(get_affinity(0)))
-        except OSError:
-            pass
-    configured_limit_raw = os.getenv("FEUTSOLVER_MAX_LOCAL_TILE_OCR_WORKERS", "4")
-    try:
-        configured_limit = int(configured_limit_raw)
-    except (TypeError, ValueError):
-        configured_limit = 4
-    return max(1, min(4, available, configured_limit))
-
-
-_LOCAL_TILE_OCR_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_local_tile_ocr_worker_count(),
-    thread_name_prefix="feutsolver-tile-ocr",
-)
 
 EXTRACTION_PROMPT = """You read letters from Wordfeud tile crops. Do not solve the game.
 
@@ -298,6 +286,55 @@ def validate_and_normalize_image(
     """
     source = Path(source_path)
     destination = Path(destination_path)
+    normalized = _validated_rgb_image(
+        source,
+        max_bytes=max_bytes,
+        max_width=max_width,
+        max_height=max_height,
+        max_pixels=max_pixels,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=destination.parent, prefix=destination.name + ".", suffix=".png", delete=False,
+        ) as target:
+            temporary = Path(target.name)
+            normalized.save(target, format="PNG", optimize=True)
+            target.flush()
+            os.fsync(target.fileno())
+        normalized.close()
+        if temporary.stat().st_size > MAX_NORMALIZED_IMAGE_BYTES:
+            raise ImageValidationError("IMG-NORMALIZED-SIZE", "normalized image exceeds the internal limit")
+        temporary.replace(destination)
+        temporary = None
+        return destination
+    except ImageValidationError:
+        raise
+    except OSError as exc:
+        raise ImageValidationError("IMG-NORMALIZE", "image normalization failed") from exc
+    finally:
+        normalized.close()
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _validated_rgb_image(
+    source_path: str | Path,
+    *,
+    max_bytes: int = MAX_UPLOAD_BYTES,
+    max_width: int = MAX_IMAGE_WIDTH,
+    max_height: int = MAX_IMAGE_HEIGHT,
+    max_pixels: int = MAX_IMAGE_PIXELS,
+) -> Image.Image:
+    """Verify an uploaded image and return its fully decoded RGB pixels.
+
+    Local OCR can consume this image directly. Avoiding an otherwise redundant
+    lossless PNG encode, fsync and decode removes disk and compression work from
+    the request path without changing a single input pixel. Remote OCR continues
+    to use :func:`validate_and_normalize_image` and its bounded PNG artifact.
+    """
+    source = Path(source_path)
     try:
         if source.stat().st_size > max_bytes:
             raise ImageValidationError("IMG-SIZE", "upload exceeds the byte limit")
@@ -330,57 +367,33 @@ def validate_and_normalize_image(
                 raise ImageValidationError("IMG-WARNING", "decoder emitted a warning")
 
     verify_open()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with _IMAGE_DECODER_WARNING_LOCK, warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            try:
-                # A second independent open is intentional: verify() invalidates
-                # the decoder state and must never be followed by processing.
-                if source.stat().st_size > max_bytes:
-                    raise ImageValidationError("IMG-SIZE", "upload exceeds the byte limit")
-                with Image.open(source) as opened:
-                    actual_format = (opened.format or "").upper()
-                    if actual_format not in SUPPORTED_IMAGE_FORMATS:
-                        raise ImageValidationError("IMG-FORMAT", "unsupported decoded image format")
-                    if (
-                        opened.width <= 0 or opened.height <= 0
-                        or opened.width > max_width or opened.height > max_height
-                        or opened.width * opened.height > max_pixels
-                    ):
-                        raise ImageValidationError("IMG-DIMENSIONS", "decoded image dimensions exceed the limit")
-                    opened.load()
-                    normalized = opened.convert("RGB")
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", dir=destination.parent, prefix=destination.name + ".", suffix=".png", delete=False,
-                ) as target:
-                    temporary = Path(target.name)
-                    normalized.save(target, format="PNG", optimize=True)
-                    target.flush()
-                    os.fsync(target.fileno())
-                normalized.close()
-            except ImageValidationError:
-                raise
-            except (DecompressionBombError, UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
-                raise ImageValidationError("IMG-CORRUPT", "image decoding failed") from exc
-            if caught:
-                raise ImageValidationError("IMG-WARNING", "decoder emitted a warning")
-        if temporary is None:
-            raise ImageValidationError("IMG-NORMALIZE", "image normalization failed")
-        normalized_size = temporary.stat().st_size
-        if normalized_size > MAX_NORMALIZED_IMAGE_BYTES:
-            raise ImageValidationError("IMG-NORMALIZED-SIZE", "normalized image exceeds the internal limit")
-        temporary.replace(destination)
-        temporary = None
-        return destination
-    except ImageValidationError:
-        raise
-    except OSError as exc:
-        raise ImageValidationError("IMG-NORMALIZE", "image normalization failed") from exc
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    with _IMAGE_DECODER_WARNING_LOCK, warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            # A second independent open is intentional: verify() invalidates
+            # the decoder state and must never be followed by processing.
+            if source.stat().st_size > max_bytes:
+                raise ImageValidationError("IMG-SIZE", "upload exceeds the byte limit")
+            with Image.open(source) as opened:
+                actual_format = (opened.format or "").upper()
+                if actual_format not in SUPPORTED_IMAGE_FORMATS:
+                    raise ImageValidationError("IMG-FORMAT", "unsupported decoded image format")
+                if (
+                    opened.width <= 0 or opened.height <= 0
+                    or opened.width > max_width or opened.height > max_height
+                    or opened.width * opened.height > max_pixels
+                ):
+                    raise ImageValidationError("IMG-DIMENSIONS", "decoded image dimensions exceed the limit")
+                opened.load()
+                normalized = opened.convert("RGB")
+        except ImageValidationError:
+            raise
+        except (DecompressionBombError, UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
+            raise ImageValidationError("IMG-CORRUPT", "image decoding failed") from exc
+        if caught:
+            normalized.close()
+            raise ImageValidationError("IMG-WARNING", "decoder emitted a warning")
+    return normalized
 
 
 def _rgb_pixel(image: Image.Image, x: int, y: int) -> Rgb:
@@ -388,10 +401,6 @@ def _rgb_pixel(image: Image.Image, x: int, y: int) -> Rgb:
     if not isinstance(pixel, tuple) or len(pixel) < 3:
         raise TypeError("expected an RGB image")
     return (int(pixel[0]), int(pixel[1]), int(pixel[2]))
-
-
-def _brightness(pixel: Rgb) -> float:
-    return sum(pixel) / 3
 
 
 def _locate_board_top(image: Image.Image) -> int:
@@ -410,18 +419,19 @@ def _locate_board_top(image: Image.Image) -> int:
 
     boundary_x = [min(width - 1, round(index * width / BOARD_SIZE)) for index in range(BOARD_SIZE + 1)]
     centre_x = [int((index + 0.5) * width / BOARD_SIZE) for index in range(BOARD_SIZE)]
-    row_scores: list[float] = []
-    for y in range(height):
-        boundary = sum(_brightness(_rgb_pixel(image, x, y)) for x in boundary_x) / len(boundary_x)
-        centre = sum(_brightness(_rgb_pixel(image, x, y)) for x in centre_x) / len(centre_x)
-        row_scores.append(abs(centre - boundary))
-
-    window_score = sum(row_scores[:width])
-    best_score, best_top = window_score, 0
-    for top in range(1, height - width + 1):
-        window_score += row_scores[top + width - 1] - row_scores[top - 1]
-        if window_score > best_score:
-            best_score, best_top = window_score, top
+    # Pillow has already decoded the screenshot. Work on its contiguous pixel
+    # buffer instead of crossing the Python/Pillow boundary for every sample.
+    # This is the exact same mean-brightness score as the scalar loop above.
+    pixels = np.asarray(image)
+    # Only 31 vertical samples are needed. Converting the full permitted 20 MP
+    # image to float64 would briefly consume about 480 MB on the 1 GB VPS.
+    boundary = pixels[:, boundary_x, :3].astype(np.float64).mean(axis=(1, 2))
+    centre = pixels[:, centre_x, :3].astype(np.float64).mean(axis=(1, 2))
+    row_scores = np.abs(centre - boundary)
+    cumulative = np.concatenate((np.zeros(1, dtype=np.float64), np.cumsum(row_scores)))
+    window_scores = cumulative[width:] - cumulative[:-width]
+    best_top = int(np.argmax(window_scores))
+    best_score = float(window_scores[best_top])
 
     # Sparse synthetic images and unusual non-Wordfeud uploads do not contain enough
     # repeated grid evidence; retain the safe fallback for them. Real screenshots
@@ -579,19 +589,35 @@ def _matching_fraction(
     image: Image.Image, hue_range: tuple[float, float], minimum_saturation: float, minimum_value: float, step: int
 ) -> float:
     """Which part of the sampled pixels sits in this hue range and is that vivid."""
-    width, height = image.size
-    pixels = image.load()
-    if pixels is None:
-        raise TypeError("could not read the image")
-    matches, total = 0, 0
-    for y in range(0, height, step):
-        for x in range(0, width, step):
-            total += 1
-            red, green, blue = cast(Rgb, pixels[x, y])[:3]
-            hue, saturation, value = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
-            if hue_range[0] <= hue * 360 <= hue_range[1] and saturation > minimum_saturation and value > minimum_value:
-                matches += 1
-    return matches / total if total else 0.0
+    # Convert only the sampled pixels. Float64 preserves the scalar Python
+    # calculation exactly without allocating a floating-point copy of the full
+    # accepted image; at most roughly 300 columns are sampled in this path.
+    sampled = np.asarray(image)[::step, ::step, :3].astype(np.float64) / 255.0
+    if sampled.size == 0:
+        return 0.0
+    red, green, blue = np.moveaxis(sampled, -1, 0)
+    maximum = sampled.max(axis=2)
+    minimum = sampled.min(axis=2)
+    chroma = maximum - minimum
+    saturation = np.divide(chroma, maximum, out=np.zeros_like(chroma), where=maximum != 0)
+
+    hue = np.zeros_like(maximum)
+    colourful = chroma != 0
+    red_hue = np.divide(green - blue, chroma, out=np.zeros_like(chroma), where=colourful) % 6
+    green_hue = np.divide(blue - red, chroma, out=np.zeros_like(chroma), where=colourful) + 2
+    blue_hue = np.divide(red - green, chroma, out=np.zeros_like(chroma), where=colourful) + 4
+    hue = np.where((maximum == red) & colourful, red_hue, hue)
+    hue = np.where((maximum != red) & (maximum == green) & colourful, green_hue, hue)
+    hue = np.where((maximum != red) & (maximum != green) & colourful, blue_hue, hue)
+    hue *= 60
+
+    matches = (
+        (hue >= hue_range[0])
+        & (hue <= hue_range[1])
+        & (saturation > minimum_saturation)
+        & (maximum > minimum_value)
+    )
+    return float(np.count_nonzero(matches) / matches.size)
 
 
 def detect_pending_move(
@@ -1162,13 +1188,12 @@ def _dark_components(crop: Image.Image) -> list[list[tuple[int, int]]]:
     """Return connected dark pixel components in a small tile crop."""
     gray = ImageOps.grayscale(crop)
     width, height = gray.size
-    pixels = gray.load()
-    dark = {
-        (x, y)
-        for y in range(height)
-        for x in range(width)
-        if pixels[x, y] < LOCAL_GLYPH_THRESHOLD
-    }
+    # Thresholding the complete crop is substantially cheaper in Pillow/NumPy
+    # than thousands of Python pixel lookups. Keep the existing 8-connected
+    # flood fill so component membership and every downstream OCR decision stay
+    # unchanged.
+    dark_pixels = np.argwhere(np.asarray(gray) < LOCAL_GLYPH_THRESHOLD)
+    dark = {(int(x), int(y)) for y, x in dark_pixels}
     components: list[list[tuple[int, int]]] = []
     while dark:
         seed = dark.pop()
@@ -1264,11 +1289,8 @@ def _tile_glyph(tile: Image.Image) -> tuple[Image.Image | None, Image.Image | No
 def _packed_profile(glyph: Image.Image) -> bytes:
     """Return a compact, deterministic binary fingerprint for a tight glyph crop."""
     resized = glyph.resize(LOCAL_PROFILE_SIZE, Image.Resampling.LANCZOS)
-    pixels = [pixel >= 128 for pixel in resized.tobytes()]
-    return bytes(
-        sum(bit << (7 - offset) for offset, bit in enumerate(pixels[index:index + 8]))
-        for index in range(0, len(pixels), 8)
-    )
+    pixels = np.asarray(resized) >= 128
+    return np.packbits(pixels, bitorder="big").tobytes()
 
 
 @lru_cache(maxsize=1)
@@ -1293,8 +1315,21 @@ def _profile_distance(left: bytes, right: bytes) -> float:
 def _profile_letter_candidates(glyph: Image.Image) -> list[tuple[float, str]]:
     """Rank versioned Wordfeud-client profiles, independent of machine fonts."""
     actual = _packed_profile(glyph)
+    actual_array = np.frombuffer(actual, dtype=np.uint8)
+    bit_counts = np.array([value.bit_count() for value in range(256)], dtype=np.uint8)
     return sorted(
-        (min(_profile_distance(actual, profile) for profile in profiles), letter)
+        (
+            float(
+                bit_counts[
+                    np.bitwise_xor(
+                        np.frombuffer(b"".join(profiles), dtype=np.uint8).reshape(len(profiles), len(actual)),
+                        actual_array,
+                    )
+                ].sum(axis=1).min()
+                / (8 * len(actual))
+            ),
+            letter,
+        )
         for letter, profiles in _decoded_wordfeud_profiles().items()
     )
 
@@ -1354,15 +1389,17 @@ def _tesseract_letter(glyph: Image.Image) -> str:
             "Lokale OCR is niet beschikbaar. Installeer Tesseract (macOS: `brew install tesseract`) "
             "of kies WORDFEUD_OCR_BACKEND=auto met een OpenRouter-sleutel."
         )
+    if _pytesseract is None:
+        raise LocalOCRUnavailable(
+            "Lokale OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
+        )
     try:
-        import pytesseract
-
         rendered = ImageOps.invert(glyph)
         scale = max(3, 120 // max(1, rendered.height))
         rendered = rendered.resize((rendered.width * scale, rendered.height * scale), Image.Resampling.LANCZOS)
         canvas = Image.new("L", (180, 220), 255)
         canvas.paste(rendered, ((canvas.width - rendered.width) // 2, canvas.height - rendered.height - 16))
-        value = pytesseract.image_to_string(
+        value = _pytesseract.image_to_string(
             canvas,
             config="--oem 1 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
             timeout=0.35,
@@ -1377,6 +1414,21 @@ def _tesseract_letter(glyph: Image.Image) -> str:
     return letters[0].upper()
 
 
+def _point_value_canvas(glyph: Image.Image) -> Image.Image:
+    """Render a point glyph exactly as the single-value Tesseract path does."""
+    rendered = ImageOps.invert(glyph)
+    scale = max(4, 120 // max(1, rendered.height))
+    rendered = rendered.resize((rendered.width * scale, rendered.height * scale), Image.Resampling.LANCZOS)
+    canvas = Image.new("L", (180, 100), 255)
+    canvas.paste(rendered, ((canvas.width - rendered.width) // 2, (canvas.height - rendered.height) // 2))
+    return canvas
+
+
+def _parse_point_value(value: str) -> int | None:
+    digits = "".join(re.findall(r"[0-9]", value))
+    return int(digits) if digits in {"1", "2", "3", "4", "5", "8", "10"} else None
+
+
 def _tesseract_point_value(glyph: Image.Image) -> int:
     """Read a one- or two-digit point value when no local font is available."""
     if shutil.which("tesseract") is None:
@@ -1384,15 +1436,13 @@ def _tesseract_point_value(glyph: Image.Image) -> int:
             "Lokale punten-OCR is niet beschikbaar. Installeer Tesseract of kies "
             "WORDFEUD_OCR_BACKEND=auto met een OpenRouter-sleutel."
         )
+    if _pytesseract is None:
+        raise LocalOCRUnavailable(
+            "Lokale punten-OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
+        )
     try:
-        import pytesseract
-
-        rendered = ImageOps.invert(glyph)
-        scale = max(4, 120 // max(1, rendered.height))
-        rendered = rendered.resize((rendered.width * scale, rendered.height * scale), Image.Resampling.LANCZOS)
-        canvas = Image.new("L", (180, 100), 255)
-        canvas.paste(rendered, ((canvas.width - rendered.width) // 2, (canvas.height - rendered.height) // 2))
-        value = pytesseract.image_to_string(
+        canvas = _point_value_canvas(glyph)
+        value = _pytesseract.image_to_string(
             canvas,
             config="--oem 1 --psm 7 -c tessedit_char_whitelist=0123458",
             timeout=0.35,
@@ -1401,10 +1451,72 @@ def _tesseract_point_value(glyph: Image.Image) -> int:
         raise LocalOCRUnavailable(
             "Lokale punten-OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
         ) from exc
-    digits = "".join(re.findall(r"[0-9]", value))
-    if digits not in {"1", "2", "3", "4", "5", "8", "10"}:
+    point_value = _parse_point_value(value)
+    if point_value is None:
         raise LocalOCRFailure("Lokale OCR vond geen geldige Wordfeud-puntwaarde in een tegel.")
-    return int(digits)
+    return point_value
+
+
+def _tesseract_point_values(glyphs: list[Image.Image]) -> list[int | None]:
+    """Read independent point glyphs in one Tesseract process.
+
+    Every canvas is a separate TIFF page and uses the exact rendering, engine,
+    segmentation mode and whitelist of :func:`_tesseract_point_value`. TSV page
+    numbers preserve input identity even when a page yields no text. An invalid
+    page remains ``None``, matching the existing caught ``LocalOCRFailure``.
+    """
+    if not glyphs:
+        return []
+    if shutil.which("tesseract") is None:
+        raise LocalOCRUnavailable(
+            "Lokale punten-OCR is niet beschikbaar. Installeer Tesseract of kies "
+            "WORDFEUD_OCR_BACKEND=auto met een OpenRouter-sleutel."
+        )
+    if _pytesseract is None:
+        raise LocalOCRUnavailable(
+            "Lokale punten-OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
+        )
+    canvases = [_point_value_canvas(glyph) for glyph in glyphs]
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="feutsolver-points-", suffix=".tiff", delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        canvases[0].save(
+            temporary_path,
+            format="TIFF",
+            save_all=True,
+            append_images=canvases[1:],
+            compression="tiff_deflate",
+        )
+        try:
+            output = _pytesseract.run_and_get_output(
+                str(temporary_path),
+                extension="tsv",
+                config=(
+                    "-c tessedit_create_tsv=1 --oem 1 --psm 7 "
+                    "-c tessedit_char_whitelist=0123458"
+                ),
+                timeout=max(0.35, min(20.0, 0.35 * len(glyphs))),
+            )
+        except (ImportError, RuntimeError, OSError) as exc:
+            raise LocalOCRUnavailable(
+                "Lokale punten-OCR is niet beschikbaar. Installeer de Python-package pytesseract en Tesseract."
+            ) from exc
+        page_text = {page: [] for page in range(1, len(glyphs) + 1)}
+        try:
+            for row in csv.DictReader(StringIO(output), delimiter="\t"):
+                text = (row.get("text") or "").strip()
+                page = int(row.get("page_num") or 0)
+                if text and page in page_text:
+                    page_text[page].append(text)
+        except (TypeError, ValueError, csv.Error) as exc:
+            raise LocalOCRFailure("Lokale punten-OCR gaf geen bruikbare pagina-indeling terug.") from exc
+        return [_parse_point_value("".join(page_text[page])) for page in range(1, len(glyphs) + 1)]
+    finally:
+        for canvas in canvases:
+            canvas.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _tile_cells(board: Image.Image, tiles: list[tuple[int, int]]) -> list[Image.Image]:
@@ -1451,21 +1563,25 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     maximum_width = round(width * 0.2)
     # Cache each colour decision once. The old two-pass scan repeatedly decoded
     # and classified the same rack pixels for every candidate tile column.
-    pixels = rack.load()
-    tile_mask = [bytearray(width) for _ in range(height)]
-    empty_distance_squared = EMPTY_COLOUR_TOLERANCE ** 2
-    for y, row in enumerate(tile_mask):
-        for x in range(width):
-            pixel = pixels[x, y]
-            if not isinstance(pixel, tuple) or len(pixel) < 3:
-                raise TypeError("expected an RGB image")
-            colour = pixel[0], pixel[1], pixel[2]
-            if min(colour) < TILE_MINIMUM_CHANNEL:
-                continue
-            distance_squared = sum(
-                (colour[channel] - empty_colour[channel]) ** 2 for channel in range(3)
-            )
-            row[x] = distance_squared > empty_distance_squared
+    pixels = np.asarray(rack)
+    if pixels.ndim != 3 or pixels.shape[2] < 3:
+        raise TypeError("expected an RGB image")
+    # Validation permits 20 MP images. Building RGB int16, difference, square,
+    # and sum arrays for that entire crop at once can exceed the 1 GB VPS budget,
+    # especially with two admitted requests. Bound temporary work to one million
+    # pixels while retaining the same integer distance calculation.
+    tile_mask = np.empty((height, width), dtype=np.bool_)
+    chunk_rows = max(1, min(height, 1_000_000 // max(1, width)))
+    empty = np.asarray(empty_colour, dtype=np.int16)
+    for top in range(0, height, chunk_rows):
+        bottom = min(height, top + chunk_rows)
+        colours = pixels[top:bottom, :, :3].astype(np.int16)
+        minimum_channel = colours.min(axis=2)
+        colours -= empty
+        distance_squared = np.square(colours, dtype=np.int32).sum(axis=2, dtype=np.int32)
+        tile_mask[top:bottom] = (minimum_channel >= TILE_MINIMUM_CHANNEL) & (
+            distance_squared > EMPTY_COLOUR_TOLERANCE ** 2
+        )
 
     best: list[tuple[int, int]] = []
     for y in range(round(height * 0.25), round(height * 0.7)):
@@ -1491,7 +1607,7 @@ def _rack_boxes(rack: Image.Image, empty_colour: Rgb) -> list[tuple[int, int, in
     for left, right in best:
         rows: list[int] = []
         for y in range(height):
-            coverage = sum(tile_mask[y][left:right]) / max(1, right - left)
+            coverage = np.count_nonzero(tile_mask[y, left:right]) / max(1, right - left)
             if coverage >= 0.5:
                 rows.append(y)
         if not rows:
@@ -1546,34 +1662,57 @@ def _local_glyph_readings(
     cells: list[Image.Image], *, rack: bool, budget: OCRBudget | None = None,
 ) -> list[LocalGlyphReading]:
     """Read cells using checked-in Wordfeud profiles and measured confidence."""
-    def read_tile_glyph(cell: Image.Image) -> LocalGlyphReading:
+    prepared: list[tuple[Image.Image | None, list[tuple[float, str]], Image.Image | None]] = []
+    point_indexes: list[int] = []
+    point_glyphs: list[Image.Image] = []
+    for cell in cells:
         if budget is not None:
             budget.check()
         glyph, point_glyph = _tile_glyph(cell)
         if glyph is None:
             if rack:
-                return LocalGlyphReading("?", _blank_tile_confidence(cell))
+                prepared.append((None, [], None))
+                continue
             raise LocalOCRFailure("Lokale OCR vond geen grote letter in een bordtegel.")
         candidates = _profile_letter_candidates(glyph)
+        prepared.append((glyph, candidates, point_glyph))
+        if point_glyph is not None and (
+            not _profile_is_decisive(candidates) or candidates[0][0] > LOCAL_PROFILE_STRONG_DISTANCE
+        ):
+            point_indexes.append(len(prepared) - 1)
+            point_glyphs.append(point_glyph)
 
-        def read_point_value() -> int | None:
-            if point_glyph is None:
-                return None
-            try:
-                return _template_point_value(point_glyph)
-            except (LocalOCRUnavailable, LocalOCRFailure):
-                # The tiny superscript is secondary evidence; a failed read must
-                # never turn an otherwise clear large-glyph match into a failure.
-                return None
+    point_values: dict[int, int | None] = {}
+    if point_glyphs:
+        try:
+            batched_values = _tesseract_point_values(point_glyphs)
+        except (LocalOCRUnavailable, LocalOCRFailure):
+            # A malformed multipage result or batch timeout must not discard
+            # conflict evidence from every otherwise readable tile. Preserve
+            # the previous per-glyph failure semantics on this exceptional path.
+            batched_values = []
+            for glyph in point_glyphs:
+                try:
+                    batched_values.append(_tesseract_point_value(glyph))
+                except (LocalOCRUnavailable, LocalOCRFailure):
+                    batched_values.append(None)
+        point_values.update(zip(point_indexes, batched_values, strict=True))
 
+    readings: list[LocalGlyphReading] = []
+    for index, (glyph, candidates, _) in enumerate(prepared):
+        if glyph is None:
+            readings.append(LocalGlyphReading("?", _blank_tile_confidence(cells[index])))
+            continue
+        point_value = point_values.get(index)
         if not _profile_is_decisive(candidates):
-            if read_point_value() == 10:
+            if point_value == 10:
                 try:
                     if _tesseract_letter(glyph).upper() == "Q":
                         # Retain this fallback for older profile-bank variants where
                         # Q is unavailable; its unique value still needs a separate
                         # large-glyph read and remains visibly low-confidence.
-                        return LocalGlyphReading("Q", 60.0)
+                        readings.append(LocalGlyphReading("Q", 60.0))
+                        continue
                 except (LocalOCRUnavailable, LocalOCRFailure):
                     pass
             raise LocalOCRFailure(
@@ -1584,26 +1723,27 @@ def _local_glyph_readings(
         # A very strong large-glyph profile is accepted even if the point OCR
         # disagrees, so reading that secondary signal cannot change this result.
         # Retain the existing point check for every weaker decisive profile.
-        point_value = read_point_value() if score > LOCAL_PROFILE_STRONG_DISTANCE else None
+        point_value = point_value if score > LOCAL_PROFILE_STRONG_DISTANCE else None
         letter = _reconcile_local_letter(letter, score, point_value)
         # Missing tiny-point OCR is not evidence of a blank: the points are optional
         # metadata and can disappear after resizing/compression. A local blank
         # classifier must provide explicit evidence before a board letter is lowered.
         reading = letter.upper()
-        return LocalGlyphReading(reading, _profile_confidence(candidates))
-
-    # Preserve input order while keeping Tesseract processes and image crops
-    # bounded. Strong profile matches now avoid an OCR subprocess whose result
-    # the reconciliation rules would ignore anyway.
-    return list(_LOCAL_TILE_OCR_EXECUTOR.map(read_tile_glyph, cells))
+        readings.append(LocalGlyphReading(reading, _profile_confidence(candidates)))
+    return readings
 
 
-def _extract_board_local(image_path: str | Path, *, budget: OCRBudget | None = None) -> BoardExtraction:
+def _extract_board_local(
+    image_path: str | Path | Image.Image, *, budget: OCRBudget | None = None,
+) -> BoardExtraction:
     """Extract a screenshot without a network call or a language model."""
     if budget is not None:
         budget.check()
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
+    if isinstance(image_path, Image.Image):
+        image = image_path if image_path.mode == "RGB" else image_path.convert("RGB")
+    else:
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
     board_image, rack_image = _wordfeud_crop_images(image)
     if detect_pending_move(image, board_image=board_image):
         raise PendingMoveError
@@ -1832,8 +1972,8 @@ def extract_board(
     with tempfile.TemporaryDirectory(prefix="feutsolver-image-") as directory:
         normalized_path = Path(directory) / "normalized.png"
         with resource_slot("ocr", timeout_seconds=0.5):
-            validate_and_normalize_image(image_path, normalized_path)
             if selected == "openrouter":
+                validate_and_normalize_image(image_path, normalized_path)
                 return _extract_board_openrouter(
                     normalized_path,
                     api_key=api_key,
@@ -1843,20 +1983,28 @@ def extract_board(
                     budget=budget,
                     requester=requester,
                 )
+            image = _validated_rgb_image(image_path)
             try:
-                return _extract_board_local(normalized_path, budget=budget)
-            except (PendingMoveError, LooseTilesError):
-                raise
-            except (LocalOCRUnavailable, LocalOCRFailure) as local_error:
-                resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
-                if selected == "auto" and resolved_key and allow_external:
-                    return _extract_board_openrouter(
-                        normalized_path,
-                        api_key=resolved_key,
-                        model=model,
-                        retries=retries,
-                        timeout_seconds=timeout_seconds,
-                        budget=budget,
-                        requester=requester,
-                    )
-                raise local_error
+                try:
+                    return _extract_board_local(image, budget=budget)
+                except (PendingMoveError, LooseTilesError):
+                    raise
+                except (LocalOCRUnavailable, LocalOCRFailure) as local_error:
+                    resolved_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+                    if selected == "auto" and resolved_key and allow_external:
+                        # External OCR requires the existing bounded normalized
+                        # PNG. Only pay that encode/fsync cost when fallback is
+                        # actually needed.
+                        validate_and_normalize_image(image_path, normalized_path)
+                        return _extract_board_openrouter(
+                            normalized_path,
+                            api_key=resolved_key,
+                            model=model,
+                            retries=retries,
+                            timeout_seconds=timeout_seconds,
+                            budget=budget,
+                            requester=requester,
+                        )
+                    raise local_error
+            finally:
+                image.close()

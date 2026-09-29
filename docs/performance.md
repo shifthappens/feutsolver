@@ -2,75 +2,110 @@
 
 ## Production target
 
-Use this resource profile when changing the screenshot-to-solutions path:
+The screenshot path is tuned for the production host, not for the number of
+logical CPUs reported by a development machine:
 
-- **CPU:** 1 shared vCPU. The OS may report more CPUs than the VPS CPU quota allows.
-- **Memory:** 1 GB RAM.
-- **Disk:** 25 GB SSD.
+- **CPU:** 1 shared vCPU
+- **Memory:** 1 GB RAM
+- **Disk:** 25 GB SSD
 
-The app is CPU-bound while it finds the board and reads tile glyphs. More local
-tile workers do not make one screenshot faster on this host; they compete for the
-same CPU and use more memory. The production example therefore caps the
-process-wide local tile OCR pool at one worker and limits Tesseract's OpenMP
-threads to one. The separate request semaphore still allows two OCR requests at
-once, so those requests can compete for the same vCPU. Keep that limit intact to
-preserve existing multi-session capacity. The explicit tile-worker setting also
-handles VPS CPU quotas that Python cannot see through CPU affinity.
+Local OCR is CPU-bound. Running tile readers in parallel therefore adds process
+and memory pressure without shortening one request on this host. Point values are
+now submitted as separate pages to one Tesseract process. `OMP_THREAD_LIMIT=1`
+is set by the application when the operator has not supplied a value, and remains
+explicit in `ops/feutsolver.env.example`.
 
-`ops/feutsolver.env.example` is the reference configuration. The live service must
-load its environment file for these limits to apply.
+The request semaphore still permits two simultaneous OCR requests. That preserves
+the existing multi-session behaviour, even though two active requests necessarily
+share the one vCPU. The solver and external-OCR limits are unchanged.
 
-## Current single-worker measurements
+Streamlit source polling and hot reload are disabled in the checked-in production
+configuration. Releases are activated atomically and restarted through
+`feutsolver.path`, so polling the immutable checkout only steals CPU from requests.
+For local development, hot reload can be enabled explicitly:
 
-On 2026-09-28, the previous local OCR path was replayed and compared with the
-optimized path on the same development host. Both runs used a process-wide local
-tile OCR pool capped at one worker and `OMP_THREAD_LIMIT=1`. Requests were
-processed sequentially; simultaneous-request throughput was not measured. The
-timed interval included image validation and local OCR,
-word suggestions, generating up to twelve legal moves, and serializing the result
-as JSON. The lexicon was already loaded, as it normally is after the app's startup
-preload. These timings exclude Streamlit transport and browser rendering.
+```bash
+streamlit run app.py --server.runOnSave=true --server.fileWatcherType=poll
+```
 
-| Screenshot | Board tiles | Previous path | Optimized path | Confidence | Result |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `IMG_5913.PNG` | 76 | 6.57 s and 7.86 s (two runs) | 1.23 s median (three runs) | 95.4% | Serialized output identical |
-| `IMG_6091.png` | 100 | — | 1.30 s median (three runs) | 95.3% | Identical across runs |
+## Reproducible measurement
 
-For `IMG_5913.PNG`, local point-value OCR fell from 81 Tesseract calls to 6.
-The previous and optimized complete outputs matched, including the recognized
-board and rack, confidence, dictionary suggestions, ordered moves, and serialized
-payload. The 114 Python tests, including the real-screenshot OCR regressions, pass.
+`ops/benchmark_screenshot_pipeline.py` measures trusted image validation, local
+OCR, word suggestions, generation of at most twelve solutions, and JSON
+serialization. The lexicon and exact suggestion-membership set are loaded before
+the timer, matching the application's background startup preload. Browser upload,
+network transfer, Streamlit transport, and client rendering are intentionally
+outside the interval because they depend on the client and connection.
 
-The benchmark host is not the production VPS. It had more than one CPU available,
-although this measurement forced local OCR to one worker. Treat the times as an
-algorithm comparison, not a promise for the shared VPS. Re-measure on the VPS
-after deployment before publishing a production latency target.
+Run the benchmark sequentially with the production CPU limit:
 
-## Changes that help on one CPU
+```bash
+OMP_THREAD_LIMIT=1 FEUTSOLVER_RUNTIME_CACHE_WRITE=0 \
+  .venv/bin/python ops/benchmark_screenshot_pipeline.py \
+  tests/screenshots/IMG_5913.PNG tests/screenshots/IMG_6091.png \
+  --warmups 1 --repetitions 5
+```
 
-- Rack detection now caches a compact one-byte-per-pixel tile mask. The original
-  scan repeatedly classified the same pixels when it looked for tile rows and
-  then measured each tile's height. A local timing on `IMG_5913.PNG` reduced this
-  step from 0.786 s to 0.172 s, with the same detected rack.
-- Large glyphs with a strong Wordfeud template match skip tiny point-value OCR.
-  The existing reconciliation rules ignore a point conflict for those strong
-  matches, so launching Tesseract could not alter their result. Point OCR still
-  runs for weaker matches and for the existing Q fallback.
-- The local tile-worker cap and `OMP_THREAD_LIMIT=1` avoid parallel CPU work that
-  a one-vCPU quota cannot run at the same time.
-- Known-word suggestions are already cached against the wordlist content digest;
-  this avoids renormalizing the full list after every screenshot.
+On 2026-09-29, the pre-change path at Git revision
+`75185c155ab003638daa1b5aa84b0d3fc7f80ae9` and the optimized path were measured
+on the same arm64 development host. The table contains five-run warm medians after
+one warmup; requests were processed sequentially. The included
+[`performance-baseline-2026-09-29.json`](performance-baseline-2026-09-29.json)
+records the baseline command, environment, phase medians, individual totals, and
+payload hashes. `FEUTSOLVER_BENCHMARK_ROOT` lets the benchmark target an exported
+checkout of that revision without modifying the active tree.
 
-## Further work to consider
+| Screenshot | Board tiles | Before | After | Speed-up | Confidence |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `IMG_5913.PNG` | 76 | 1.303 s | 0.477 s | **2.73×** | 95.4% |
+| `IMG_6091.png` | 100 | 1.362 s | 0.384 s | **3.55×** | 95.3% |
 
-The remaining Tesseract calls are limited to weaker glyph matches. A persistent
-Tesseract API or batched point-value reader could reduce process startup further,
-but it must return the same value for every crop, including uncertain and failed
-reads, before replacing the current checks. Reworking connected-component scans
-in `_dark_components` may also help CPU use, but needs the full screenshot
-regression set because it directly affects letter shapes and confidence.
+A fresh-process first request for `IMG_5913.PNG` fell from 2.507 s to 0.582 s
+(**4.31×**). The optimized process startup imports the Python Tesseract adapter,
+and the existing background preload completes the same word-membership cache,
+before request timing; no screenshot result is precomputed.
 
-The SSD is not the current request-time bottleneck. The deploy workflow prebuilds
-the lexicon cache and runtime cache writes are disabled in production. Preserve
-those behaviours to avoid rebuilding or writing the wordlist cache during a user
-request.
+OCR remains the dominant phase. In the final run it took 0.453 s and 0.367 s;
+suggestions took about 0.002 s, solution generation 0.021 s and 0.014 s, and
+serialization less than 0.001 s. Across all nine checked-in screenshots the final
+median was 0.202–0.578 s.
+
+These are algorithm comparisons, not a production latency promise. The shared VPS
+can have different CPU contention, and client/network time is not included. Repeat
+the command on the VPS after deployment before publishing a live latency target.
+
+## What changed
+
+- Local OCR consumes the already verified RGB image directly. The bounded,
+  lossless PNG is still created for explicit external OCR or an actual external
+  fallback, but no longer encoded, flushed, and decoded for the normal local path.
+- Board localization, colour matching, rack classification, glyph thresholding,
+  and profile comparison use bounded NumPy operations with the same thresholds and
+  decision rules. The board locator converts only 31 sampled columns to float64,
+  avoiding a full-image 480 MB allocation at the maximum accepted resolution.
+- Weak point glyphs keep their old canvases, Tesseract engine, page segmentation,
+  character whitelist, parsing, and reconciliation. They are independent pages in
+  one TIFF, so one process start replaces six to eight process starts on the heavy
+  screenshots. If the batch itself fails or times out, the exceptional path falls
+  back to the previous independent per-glyph reader so successful point evidence
+  is never discarded with a failed page.
+- Strong glyph profiles still skip point OCR only where the reconciliation rule
+  could not change the result. The solver, move ordering, confidence calculation,
+  validation limits, pending-move checks, and external OCR path are unchanged.
+- The existing background lexicon preload now also warms the exact normalized
+  membership set used by word suggestions. This moves roughly 0.49 s of one-time
+  work out of the first screenshot request without adding a worker or changing the
+  set's contents.
+
+## Accuracy and regression guardrails
+
+All nine real-screenshot golden OCR regressions still match their exact expected
+board, rack, bonuses, and confidence. For every screenshot that invokes point OCR,
+the batched reader is also compared page-for-page with the previous individual
+reader; all results are identical, including unreadable values represented by
+`None`. Each benchmark repetition produced the same serialized payload hash.
+
+Keep the full screenshot suite and the batch-versus-individual comparison when
+changing crop geometry, glyph thresholds, Tesseract options, or profile matching.
+The SSD is not a request-time bottleneck: deployment prebuilds the lexicon cache,
+and production runtime cache writes remain disabled.

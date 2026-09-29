@@ -474,6 +474,7 @@ numpy==2.5.1 \
     --hash=sha256:f7d60026c0bdb1380e83bfa7a0419c4577ee4b9a08880afcb6dadeb74c649fa2 \
     --hash=sha256:f7feb014281029e628ba2d5a007407443b06e418b6fe451d1e2adcbc8eba0107
     # via
+    #   -r requirements-prod.in
     #   pandas
     #   pydeck
     #   streamlit

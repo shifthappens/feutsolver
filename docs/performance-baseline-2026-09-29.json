@@ -1,0 +1,64 @@
+{
+  "benchmark_script_source": "optimized checkout; measurement logic is independent of implementation under test",
+  "command": "FEUTSOLVER_MAX_LOCAL_TILE_OCR_WORKERS=1 OMP_THREAD_LIMIT=1 FEUTSOLVER_RUNTIME_CACHE_WRITE=0 FEUTSOLVER_BENCHMARK_ROOT=<exported-baseline> .venv/bin/python ops/benchmark_screenshot_pipeline.py tests/screenshots/IMG_5913.PNG tests/screenshots/IMG_6091.png --warmups 1 --repetitions 5",
+  "cold_first_request": {
+    "command_suffix": "tests/screenshots/IMG_5913.PNG --warmups 0 --repetitions 1",
+    "ocr_seconds": 2.0081656251568347,
+    "payload_sha256": "e4bf3dcf7711096532ad122c816930abb9d3e32c4584c0990e29ae8a3a64f6b0",
+    "serialize_seconds": 0.00039291707798838615,
+    "solve_seconds": 0.02170187490992248,
+    "suggest_seconds": 0.4767561659682542,
+    "total_seconds": 2.507016583113
+  },
+  "environment": {
+    "FEUTSOLVER_MAX_LOCAL_TILE_OCR_WORKERS": "1",
+    "FEUTSOLVER_RUNTIME_CACHE_WRITE": "0",
+    "OMP_THREAD_LIMIT": "1",
+    "machine": "arm64",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "python": "3.13.15"
+  },
+  "git_revision": "75185c155ab003638daa1b5aa84b0d3fc7f80ae9",
+  "repetitions": 5,
+  "screenshots": {
+    "IMG_5913.PNG": {
+      "board_tiles": 76,
+      "confidence": 95.4,
+      "median": {
+        "ocr_seconds": 1.2793855001218617,
+        "serialize_seconds": 0.00035541714169085026,
+        "solve_seconds": 0.021349832881242037,
+        "suggest_seconds": 0.0024140409659594297,
+        "total_seconds": 1.303317999932915
+      },
+      "payload_sha256": "e4bf3dcf7711096532ad122c816930abb9d3e32c4584c0990e29ae8a3a64f6b0",
+      "run_total_seconds": [
+        1.327165083028376,
+        1.317946417024359,
+        1.303317999932915,
+        1.2948963339440525,
+        1.3027713340707123
+      ]
+    },
+    "IMG_6091.png": {
+      "board_tiles": 100,
+      "confidence": 95.3,
+      "median": {
+        "ocr_seconds": 1.3450155828613788,
+        "serialize_seconds": 0.00028849998489022255,
+        "solve_seconds": 0.014080374967306852,
+        "suggest_seconds": 0.002230958081781864,
+        "total_seconds": 1.3616274998057634
+      },
+      "payload_sha256": "24becd2c1b40b39363fe97e662a2ee748231cfaf9f45cad16244521c30722a54",
+      "run_total_seconds": [
+        1.3597185830585659,
+        1.3557021669112146,
+        1.3616274998057634,
+        1.380287874955684,
+        1.3718570419587195
+      ]
+    }
+  },
+  "warmups": 1
+}

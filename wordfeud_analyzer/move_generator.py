@@ -482,6 +482,10 @@ def load_wordlist(path: str | Path) -> Gaddag:
     if cached is not None:
         version, cached_signature, cached_source_hash, count, graph = cached
         if version == GADDAG_CACHE_VERSION and cached_signature == signature and cached_source_hash == source_hash:
+            # Streamlit already preloads the lexicon in a background worker.
+            # Warm the exact membership set in that same startup task so the
+            # first screenshot does not pay for normalising the full word list.
+            _known_wordlist_entries(str(source.resolve()), source_hash)
             return Gaddag.from_cached_graph(count, graph)
         cache_reason = "invalid_or_stale"
 
@@ -539,6 +543,7 @@ def load_wordlist(path: str | Path) -> Gaddag:
         error_category=cache_reason,
         word_count=instance.count,
     )
+    _known_wordlist_entries(str(source.resolve()), source_hash)
     return instance
 
 

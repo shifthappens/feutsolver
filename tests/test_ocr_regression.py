@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from wordfeud_analyzer.vision import BOARD_SIZE, MINIMUM_CONFIDENCE, extract_board
+import wordfeud_analyzer.vision as vision
+from wordfeud_analyzer.vision import BOARD_SIZE, extract_board
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,7 @@ BONUS_LAYOUTS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {
 # A dot is an empty board square. Every non-dot is a confirmed board letter.
 EXPECTED: dict[str, dict[str, object]] = {
     "IMG_5912.PNG": {
+        "confidence": 96.2,
         "rack": "WPHSOEO",
         "layout": "A",
         "rows": (
@@ -58,6 +60,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5913.PNG": {
+        "confidence": 95.4,
         "rack": "OQOESJN",
         "layout": "B",
         "rows": (
@@ -68,6 +71,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5915.PNG": {
+        "confidence": 95.3,
         "rack": "DBXEDRT",
         "layout": "B",
         "rows": (
@@ -78,6 +82,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5916.PNG": {
+        "confidence": 95.4,
         "rack": "NJNJDME",
         "layout": "B",
         "rows": (
@@ -87,6 +92,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5917.PNG": {
+        "confidence": 96.0,
         "rack": "WEOAIVK",
         "layout": "A",
         "rows": (
@@ -96,6 +102,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5921 2.PNG": {
+        "confidence": 95.3,
         "rack": "XFE?UPN",
         "layout": "B",
         "rows": (
@@ -106,6 +113,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5932.PNG": {
+        "confidence": 95.4,
         "rack": "OQMPERE",
         "layout": "B",
         "rows": (
@@ -116,6 +124,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5942.PNG": {
+        "confidence": 96.0,
         "rack": "OAVSWSC",
         "layout": "A",
         "rows": (
@@ -125,6 +134,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_6091.png": {
+        "confidence": 95.3,
         "rack": "C",
         "layout": "B",
         "rows": (
@@ -170,19 +180,79 @@ def test_confirmed_screenshot_matches_production_ocr(filename: str) -> None:
     rows = expected["rows"]
     rack = expected["rack"]
     layout = expected["layout"]
+    confidence = expected["confidence"]
     assert isinstance(rows, tuple)
     assert isinstance(rack, str)
     assert isinstance(layout, str)
+    assert isinstance(confidence, float)
 
     # This is the same extraction entrypoint selected by app.process_upload when
     # WORDFEUD_OCR_BACKEND is local. No OCR or geometry step is mocked here.
     extraction = extract_board(SCREENSHOTS / filename, backend="local")
     bonuses = _expected_bonus_matrix(layout, rows)
 
-    assert extraction.confidence >= MINIMUM_CONFIDENCE, filename
+    assert extraction.confidence == confidence, filename
     assert extraction.state.rack == list(rack), filename
     assert extraction.state.effective_bonuses == bonuses, filename
     assert [
         [cell.model_dump() for cell in row]
         for row in extraction.state.grid
     ] == _expected_grid(rows, bonuses), filename
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ("IMG_5913.PNG", "IMG_5915.PNG", "IMG_5916.PNG", "IMG_5921 2.PNG", "IMG_5932.PNG", "IMG_6091.png"),
+)
+def test_batched_point_ocr_matches_the_previous_single_page_reader(
+    filename: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batching removes process starts, not OCR evidence or reconciliation."""
+    batched_reader = vision._tesseract_point_values
+    compared_batches = 0
+
+    def checked_reader(glyphs: list[vision.Image.Image]) -> list[int | None]:
+        nonlocal compared_batches
+        try:
+            batched = batched_reader(glyphs)
+        except (vision.LocalOCRUnavailable, vision.LocalOCRFailure) as error:
+            pytest.skip(f"batch point OCR is unavailable: {error}")
+        compared_batches += 1
+        individual: list[int | None] = []
+        for glyph in glyphs:
+            try:
+                individual.append(vision._tesseract_point_value(glyph))
+            except (vision.LocalOCRUnavailable, vision.LocalOCRFailure):
+                individual.append(None)
+        assert batched == individual
+        return batched
+
+    monkeypatch.setattr(vision, "_tesseract_point_values", checked_reader)
+    extract_board(SCREENSHOTS / filename, backend="local")
+    assert compared_batches >= 1
+
+
+def test_failed_point_batch_preserves_individual_point_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch timeout falls back to the old independent failure boundary."""
+    screenshot = SCREENSHOTS / "IMG_6091.png"
+    expected = extract_board(screenshot, backend="local")
+    individual_reader = vision._tesseract_point_value
+    individual_reads = 0
+
+    def failed_batch(_glyphs: list[vision.Image.Image]) -> list[int | None]:
+        raise vision.LocalOCRFailure("forced batch failure")
+
+    def checked_individual(glyph: vision.Image.Image) -> int:
+        nonlocal individual_reads
+        individual_reads += 1
+        return individual_reader(glyph)
+
+    monkeypatch.setattr(vision, "_tesseract_point_values", failed_batch)
+    monkeypatch.setattr(vision, "_tesseract_point_value", checked_individual)
+    actual = extract_board(screenshot, backend="local")
+
+    assert individual_reads > 0
+    assert actual.state.model_dump() == expected.state.model_dump()
+    assert actual.confidence == expected.confidence
