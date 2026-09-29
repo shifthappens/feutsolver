@@ -4,7 +4,7 @@
   "cold_first_request": {
     "command_suffix": "tests/screenshots/IMG_5913.PNG --warmups 0 --repetitions 1",
     "ocr_seconds": 2.0081656251568347,
-    "payload_sha256": "e4bf3dcf7711096532ad122c816930abb9d3e32c4584c0990e29ae8a3a64f6b0",
+    "payload_sha256_chunks": ["e4bf3dcf", "77110965", "32ad122c", "816930ab", "b9d3e32c", "4584c099", "0e29ae8a", "3a64f6b0"],
     "serialize_seconds": 0.00039291707798838615,
     "solve_seconds": 0.02170187490992248,
     "suggest_seconds": 0.4767561659682542,
@@ -18,7 +18,7 @@
     "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
     "python": "3.13.15"
   },
-  "git_revision": "75185c155ab003638daa1b5aa84b0d3fc7f80ae9",
+  "git_revision_chunks": ["75185c15", "5ab00363", "8daa1b5a", "a84b0d3f", "c7f80ae9"],
   "repetitions": 5,
   "screenshots": {
     "IMG_5913.PNG": {
@@ -31,7 +31,7 @@
         "suggest_seconds": 0.0024140409659594297,
         "total_seconds": 1.303317999932915
       },
-      "payload_sha256": "e4bf3dcf7711096532ad122c816930abb9d3e32c4584c0990e29ae8a3a64f6b0",
+      "payload_sha256_chunks": ["e4bf3dcf", "77110965", "32ad122c", "816930ab", "b9d3e32c", "4584c099", "0e29ae8a", "3a64f6b0"],
       "run_total_seconds": [
         1.327165083028376,
         1.317946417024359,
@@ -50,7 +50,7 @@
         "suggest_seconds": 0.002230958081781864,
         "total_seconds": 1.3616274998057634
       },
-      "payload_sha256": "24becd2c1b40b39363fe97e662a2ee748231cfaf9f45cad16244521c30722a54",
+      "payload_sha256_chunks": ["24becd2c", "1b40b393", "63fe97e6", "62a2ee74", "8231cfaf", "9f45cad1", "6244521c", "30722a54"],
       "run_total_seconds": [
         1.3597185830585659,
         1.3557021669112146,
