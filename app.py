@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
@@ -68,6 +70,119 @@ ALLOWED_COMPONENT_EVENTS = {
 FRONTEND = Path(__file__).parent / "frontend"
 wordfeud_board = components.declare_component("wordfeud_board", path=str(FRONTEND))
 
+SCREENSHOT_PASTE_HTML = """
+<div class="paste-actions">
+  <button id="paste-button" type="button">Plak screenshot</button>
+  <div id="paste-target" class="paste-target" contenteditable="true" inputmode="none"
+       role="textbox" aria-label="Plak hier een schermafbeelding" aria-multiline="false">
+    Of tik hier en houd vast om Plak te kiezen
+  </div>
+</div>
+<div id="paste-status" class="paste-status" role="status" aria-live="polite"></div>
+"""
+
+SCREENSHOT_PASTE_CSS = """
+.paste-actions { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.5rem; }
+button, .paste-target { min-height:2.8rem; border:1px solid var(--st-border-color, #b8c9be); border-radius:.6rem; padding:.5rem .75rem; background:var(--st-secondary-background-color, #fff); color:var(--st-text-color, #243127); font:inherit; }
+button { cursor:pointer; }
+.paste-target { min-width:0; display:grid; place-items:center; border-style:dashed; color:var(--st-secondary-text-color, #657168); font-size:.9rem; text-align:center; user-select:text; -webkit-user-select:text; }
+.paste-target:focus-visible, button:focus-visible { outline:3px solid var(--st-primary-color, #195b42); outline-offset:1px; }
+.paste-status { min-height:0; margin-top:.3rem; color:var(--st-secondary-text-color, #657168); font-size:.88rem; }
+@media (max-width: 480px) { .paste-actions { grid-template-columns:1fr; } }
+"""
+
+SCREENSHOT_PASTE_JS = """
+export default function(component) {
+  const { parentElement, setTriggerValue } = component;
+  const button = parentElement.querySelector("#paste-button");
+  const pasteTarget = parentElement.querySelector("#paste-target");
+  const status = parentElement.querySelector("#paste-status");
+  const maxBytes = 2 * 1024 * 1024;
+  const handledEvents = new WeakSet();
+  if (!button || !pasteTarget || !status) return;
+
+  function setStatus(message) { status.textContent = message; }
+  function imageType(type) {
+    const normalized = String(type || "").toLowerCase();
+    if (normalized === "image/x-png") return "image/png";
+    return ["image/png", "image/jpeg", "image/webp"].includes(normalized) ? normalized : "";
+  }
+  function clipboardFile(clipboardData) {
+    if (!clipboardData) return null;
+    for (const item of Array.from(clipboardData.items || [])) {
+      if (item.kind !== "file" || !imageType(item.type)) continue;
+      const file = item.getAsFile();
+      if (file) return file;
+    }
+    return Array.from(clipboardData.files || []).find(file => imageType(file.type)) || null;
+  }
+  async function sendImage(blob) {
+    const mime = imageType(blob?.type);
+    if (!mime) return setStatus("Gebruik een PNG-, JPG- of WebP-schermafbeelding.");
+    if (blob.size > maxBytes) return setStatus("Deze schermafbeelding is groter dan 2 MB.");
+    try {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      let binary = "";
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      }
+      setStatus("Schermafbeelding wordt verwerkt…");
+      setTriggerValue("pasted", { mime, data: window.btoa(binary) });
+    } catch (_error) {
+      setStatus("De schermafbeelding kon niet van het klembord worden gelezen.");
+    }
+  }
+  function handlePaste(event) {
+    if (handledEvents.has(event)) return;
+    const target = event.target instanceof Element ? event.target : null;
+    const isPasteTarget = target?.closest("#paste-target");
+    const file = clipboardFile(event.clipboardData);
+    if (!file) {
+      if (isPasteTarget) {
+        event.preventDefault();
+        setStatus("Kopieer eerst een schermafbeelding en plak die hier.");
+      }
+      return;
+    }
+    handledEvents.add(event);
+    event.preventDefault();
+    event.stopPropagation();
+    void sendImage(file);
+  }
+  async function readClipboard() {
+    if (!navigator.clipboard?.read) {
+      return setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
+    }
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const type = item.types.find(value => imageType(value));
+        if (type) return sendImage(await item.getType(type));
+      }
+      setStatus("Er staat geen ondersteunde afbeelding op het klembord.");
+    } catch (_error) {
+      setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
+    }
+  }
+  button.addEventListener("click", readClipboard);
+  const ownerDocument = parentElement.ownerDocument || document;
+  ownerDocument.addEventListener("paste", handlePaste, true);
+  parentElement.addEventListener("paste", handlePaste, true);
+  return () => {
+    button.removeEventListener("click", readClipboard);
+    ownerDocument.removeEventListener("paste", handlePaste, true);
+    parentElement.removeEventListener("paste", handlePaste, true);
+  };
+}
+"""
+
+screenshot_paste = st.components.v2.component(
+    "screenshot_paste",
+    html=SCREENSHOT_PASTE_HTML,
+    css=SCREENSHOT_PASTE_CSS,
+    js=SCREENSHOT_PASTE_JS,
+)
+
 
 def secret_or_env(name: str, default: str = "") -> str:
     environment_value = os.getenv(name)
@@ -127,6 +242,7 @@ def initialise_session() -> None:
         st.session_state.upload_signature = None
         st.session_state.upload_error_signature = None
         st.session_state.upload_feedback = None
+        st.session_state.pending_paste_upload = None
         st.session_state.external_ocr_consent = False
         st.session_state.pop("external_ocr_consent_checkbox", None)
         st.session_state.anonymous_storage_namespace = uuid4().hex
@@ -142,6 +258,7 @@ def initialise_session() -> None:
     st.session_state.setdefault("upload_signature", None)
     st.session_state.setdefault("upload_error_signature", None)
     st.session_state.setdefault("upload_feedback", None)
+    st.session_state.setdefault("pending_paste_upload", None)
     st.session_state.setdefault("upload_key", 0)
     st.session_state.setdefault("component_response", None)
     st.session_state.setdefault("last_component_event_signature", None)
@@ -557,14 +674,66 @@ def handle_component_event(event: object) -> None:
         commit_placement(committed)
 
 
+def queue_pasted_upload(payload: object) -> None:
+    if not isinstance(payload, dict):
+        st.session_state.upload_feedback = "Foutcode IMG-PASTE: de geplakte afbeelding kon niet worden gelezen."
+        st.rerun()
+    encoded_image = payload.get("data")
+    mime_type = payload.get("mime")
+    allowed_mime_types = {
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+    }
+    max_encoded_bytes = ((MAX_UPLOAD_BYTES + 2) // 3) * 4
+    if (
+        not isinstance(encoded_image, str)
+        or not isinstance(mime_type, str)
+        or mime_type.lower() not in allowed_mime_types
+        or len(encoded_image) > max_encoded_bytes
+    ):
+        st.session_state.upload_feedback = "Foutcode IMG-PASTE: plak een PNG-, JPG- of WebP-schermafbeelding van maximaal 2 MB."
+        st.rerun()
+    try:
+        image_bytes = base64.b64decode(encoded_image, validate=True)
+    except (ValueError, binascii.Error):
+        st.session_state.upload_feedback = "Foutcode IMG-PASTE: de geplakte afbeelding kon niet worden gelezen."
+        st.rerun()
+    if not image_bytes or len(image_bytes) > MAX_UPLOAD_BYTES:
+        st.session_state.upload_feedback = "Foutcode IMG-SIZE: deze schermafbeelding is groter dan 2 MB."
+        st.rerun()
+    mime = mime_type.lower()
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    st.session_state.pending_paste_upload = {
+        "bytes": image_bytes,
+        "name": f"clipboard.{allowed_mime_types[mime]}",
+        "file_id": digest,
+    }
+    st.session_state.upload_key += 1
+    st.session_state.upload_feedback = None
+    st.rerun()
+
+
 def process_upload() -> None:
-    upload = st.session_state.get("current_upload")
-    if upload is None:
-        return
+    pending_paste = st.session_state.pop("pending_paste_upload", None)
+    if pending_paste is not None:
+        upload_name = str(pending_paste["name"])
+        upload_size = len(pending_paste["bytes"])
+        upload_file_id = str(pending_paste["file_id"])
+        upload_bytes = pending_paste["bytes"]
+        upload = None
+    else:
+        upload = st.session_state.get("current_upload")
+        if upload is None:
+            return
+        upload_name = str(upload.name)
+        upload_size = int(getattr(upload, "size", 0) or 0)
+        upload_file_id = str(getattr(upload, "file_id", ""))
+        upload_bytes = None
     correlation_id = new_correlation_id()
     actor = current_actor()
-    if int(getattr(upload, "size", 0) or 0) > MAX_UPLOAD_BYTES:
-        signature = (str(upload.name), int(upload.size), str(getattr(upload, "file_id", "")), "oversize")
+    if upload_size > MAX_UPLOAD_BYTES:
+        signature = (upload_name, upload_size, upload_file_id, "oversize")
         if signature == st.session_state.upload_error_signature:
             return
         st.session_state.upload_error_signature = signature
@@ -578,9 +747,10 @@ def process_upload() -> None:
             error_category="byte_limit",
         )
         return
-    upload_bytes = upload.getvalue()
+    if upload_bytes is None:
+        upload_bytes = upload.getvalue()
     if len(upload_bytes) > MAX_UPLOAD_BYTES:
-        signature = (str(upload.name), len(upload_bytes), str(getattr(upload, "file_id", "")), "oversize")
+        signature = (upload_name, len(upload_bytes), upload_file_id, "oversize")
         if signature == st.session_state.upload_error_signature:
             return
         st.session_state.upload_error_signature = signature
@@ -595,9 +765,9 @@ def process_upload() -> None:
         )
         return
     signature = (
-        str(upload.name),
-        int(upload.size),
-        str(getattr(upload, "file_id", "")),
+        upload_name,
+        upload_size,
+        upload_file_id,
         hashlib.sha256(upload_bytes).hexdigest(),
     )
     if signature in {st.session_state.upload_signature, st.session_state.upload_error_signature}:
@@ -748,43 +918,67 @@ st.link_button("Uitloggen", "/feutsolver-logout")
 st.caption("Een meeschalend, interactief bord: bewerk lokaal en laat Python de schermafbeelding, zetten en punten controleren.")
 st.caption("Nederlandse OpenTaal-woordenlijst staat op de server klaar." if DEFAULT_WORDLIST.name.startswith("opentaal") else "Lokaal wordt de kleine demo-lijst gebruikt.")
 
-upload = st.file_uploader(
-    "Schermafbeelding uploaden",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=False,
-    key=f"current_upload_{st.session_state.upload_key}",
-)
-st.session_state.current_upload = upload
-ocr_backend_for_notice = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
-if ocr_backend_for_notice in {"auto", "openrouter"}:
-    consent = st.checkbox(
-        "Ik geef toestemming voor optionele externe OCR via OpenRouter.",
-        value=False,
-        key="external_ocr_consent_checkbox",
-        help=(
-            "Als lokale OCR niet volstaat, wordt alleen de genormaliseerde bord-/rekafbeelding "
-            "naar OpenRouter gestuurd voor letterherkenning. Dit is optioneel; de provider en "
-            "bewaartermijn vallen onder het beleid van OpenRouter. De afbeelding wordt daarna verwijderd."
-        ),
+with st.container(border=True):
+    st.subheader("Schermafbeelding uploaden of plakken")
+    upload = st.file_uploader(
+        "Upload een schermafbeelding",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=False,
+        key=f"current_upload_{st.session_state.upload_key}",
     )
-    st.session_state.external_ocr_consent = consent
-else:
-    st.session_state.external_ocr_consent = False
-process_upload()
+    st.session_state.current_upload = upload
+    paste_result = screenshot_paste(
+        key="screenshot-paste",
+        on_pasted_change=lambda: None,
+    )
+    if paste_result.pasted is not None:
+        queue_pasted_upload(paste_result.pasted)
+    ocr_backend_for_notice = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
+    if ocr_backend_for_notice in {"auto", "openrouter"}:
+        consent = st.checkbox(
+            "Ik geef toestemming voor optionele externe OCR via OpenRouter.",
+            value=False,
+            key="external_ocr_consent_checkbox",
+            help=(
+                "Als lokale OCR niet volstaat, wordt alleen de genormaliseerde bord-/rekafbeelding "
+                "naar OpenRouter gestuurd voor letterherkenning. Dit is optioneel; de provider en "
+                "bewaartermijn vallen onder het beleid van OpenRouter. De afbeelding wordt daarna verwijderd."
+            ),
+        )
+        st.session_state.external_ocr_consent = consent
+    else:
+        st.session_state.external_ocr_consent = False
+    process_upload()
+
+    word_suggestion_notice_slot = st.empty()
+    word_suggestions = st.session_state.get("word_suggestions", [])
+    word_suggestion_count = len(word_suggestions)
+    if can_mutate_wordlist and word_suggestion_count:
+        if word_suggestion_count == 1:
+            word_suggestion_notice = (
+                "Er is 1 nieuw woord gedetecteerd. Controleer de suggestie hieronder en voeg het toe aan de woordenlijst."
+            )
+        else:
+            word_suggestion_notice = (
+                f"Er zijn {word_suggestion_count} nieuwe woorden gedetecteerd. "
+                "Controleer de suggesties hieronder en voeg ze toe aan de woordenlijst."
+            )
+        word_suggestion_notice_slot.info(word_suggestion_notice, icon=":material/playlist_add:")
+
+    confidence = st.session_state.get("confidence")
+    if confidence is not None:
+        confidence_value = float(confidence)
+        st.caption(f"Gemeten OCR-zekerheid: {confidence_value:.0f}%. Controleer de zichtbare letters en bonussen.")
+        if confidence_value < 80:
+            st.warning(
+                "De lokale OCR heeft een of meer letters maar beperkt kunnen onderscheiden. "
+                "Controleer het bord voordat je oplossingen gebruikt."
+            )
+    if st.session_state.get("upload_feedback"):
+        st.info(st.session_state.upload_feedback)
+    render_word_suggestions()
 
 state = current_state()
-confidence = st.session_state.get("confidence")
-if confidence is not None:
-    confidence_value = float(confidence)
-    st.caption(f"Gemeten OCR-zekerheid: {confidence_value:.0f}%. Controleer de zichtbare letters en bonussen.")
-    if confidence_value < 80:
-        st.warning(
-            "De lokale OCR heeft een of meer letters maar beperkt kunnen onderscheiden. "
-            "Controleer het bord voordat je oplossingen gebruikt."
-        )
-if st.session_state.get("upload_feedback"):
-    st.info(st.session_state.upload_feedback)
-
 component_response = st.session_state.component_response
 st.session_state.component_response = None
 event = wordfeud_board(
@@ -801,7 +995,6 @@ event = wordfeud_board(
     key="wordfeud-board",
 )
 handle_component_event(event)
-render_word_suggestions()
 if replacement_update_active():
     render_wordlist_update_status()
 else:
