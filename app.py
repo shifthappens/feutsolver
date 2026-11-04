@@ -86,6 +86,8 @@ button, .paste-target { min-height:2.8rem; border:1px solid var(--st-border-colo
 button { cursor:pointer; }
 .paste-target { min-width:0; display:flex; align-items:center; justify-content:center; overflow:hidden; border-style:dashed; color:var(--st-secondary-text-color, #657168); font-size:.9rem; text-align:center; user-select:text; -webkit-user-select:text; -webkit-touch-callout:default; caret-color:transparent; }
 .paste-target:empty::before { content:attr(data-placeholder); pointer-events:none; }
+.paste-target.attention { border-color:var(--st-primary-color, #195b42); border-width:2px; animation:paste-pulse 1s ease-in-out 3; }
+@keyframes paste-pulse { 50% { box-shadow:0 0 0 4px rgba(25,91,66,.25); } }
 .paste-target img { max-height:2rem; }
 .paste-target:focus-visible, button:focus-visible { outline:3px solid var(--st-primary-color, #195b42); outline-offset:1px; }
 .paste-status { min-height:0; margin-top:.3rem; color:var(--st-secondary-text-color, #657168); font-size:.88rem; }
@@ -182,6 +184,7 @@ export default function(component) {
   async function sendImage(blob) {
     if (busy) return;
     busy = true;
+    pasteTarget.classList.remove("attention");
     setStatus("Schermafbeelding wordt gelezen…");
     try {
       let image = blob;
@@ -249,29 +252,44 @@ export default function(component) {
     void sendImage(file);
   }
 
+  function showFallback(message) {
+    pasteTarget.classList.remove("attention");
+    void pasteTarget.offsetWidth;
+    pasteTarget.classList.add("attention");
+    try { pasteTarget.focus({ preventScroll: true }); } catch (_error) { pasteTarget.focus(); }
+    setStatus(message);
+  }
   async function readClipboard() {
-    if (!navigator.clipboard?.read) {
-      pasteTarget.focus();
-      return setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
-    }
+    const fallback = "Houd het gemarkeerde plakvak vast en kies Plak.";
+    if (busy) return;
+    if (!navigator.clipboard?.read) return showFallback(fallback);
     // Call read() synchronously inside the tap; iOS rejects it otherwise.
     let pending;
     try {
       pending = navigator.clipboard.read();
     } catch (_error) {
-      return setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
+      return showFallback(fallback);
     }
+    setStatus("Klembord wordt gelezen… tik op Plak als iOS daarom vraagt.");
+    // Some iOS browsers (Brave) never show the paste prompt, so read() never
+    // settles. Fall back to the long-press paste box instead of hanging.
+    let timer = 0;
+    const timeout = new Promise((_resolve, reject) => {
+      timer = window.setTimeout(() => reject(Object.assign(new Error("timeout"), { name: "TimeoutError" })), 4000);
+    });
     try {
-      const items = await pending;
+      const items = await Promise.race([pending, timeout]);
+      window.clearTimeout(timer);
       for (const item of items) {
         const type = item.types.find(value => isImage(value));
         if (type) return await sendImage(await item.getType(type));
       }
       setStatus("Er staat geen afbeelding op het klembord.", 6000);
     } catch (error) {
-      setStatus(error?.name === "NotAllowedError"
-        ? "Tik op Plak in de melding van iOS, of houd het plakvak vast om Plak te kiezen."
-        : "Tik in het plakvak en houd vast om Plak te kiezen.");
+      window.clearTimeout(timer);
+      showFallback(error?.name === "TimeoutError"
+        ? "Deze browser geeft het klembord niet vrij via de knop. " + fallback
+        : fallback);
     }
   }
   function handleInput() {
