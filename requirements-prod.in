@@ -1,10 +1,10 @@
 # Direct production dependencies. Resolve this file to requirements.txt with
 # pip-compile --generate-hashes; do not install this unconstrained input in CI.
-Pillow==12.3.0
-gitpython==3.2.0
+Pillow==13.0.0
+gitpython==3.2.1
 numpy==2.5.1
 pydantic==2.13.4
 pytesseract==0.3.13
 requests==2.34.2
-streamlit==1.60.0
+streamlit==1.66.1
 urllib3==2.8.0

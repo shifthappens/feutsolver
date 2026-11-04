@@ -50,7 +50,7 @@ BONUS_LAYOUTS: dict[str, dict[str, tuple[tuple[int, int], ...]]] = {
 # A dot is an empty board square. Every non-dot is a confirmed board letter.
 EXPECTED: dict[str, dict[str, object]] = {
     "IMG_5912.PNG": {
-        "confidence": 96.2,
+        "confidence": 96.3,
         "rack": "WPHSOEO",
         "layout": "A",
         "rows": (
@@ -60,7 +60,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5913.PNG": {
-        "confidence": 95.4,
+        "confidence": 95.3,
         "rack": "OQOESJN",
         "layout": "B",
         "rows": (
@@ -82,7 +82,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5916.PNG": {
-        "confidence": 95.4,
+        "confidence": 95.3,
         "rack": "NJNJDME",
         "layout": "B",
         "rows": (
@@ -113,7 +113,7 @@ EXPECTED: dict[str, dict[str, object]] = {
         ),
     },
     "IMG_5932.PNG": {
-        "confidence": 95.4,
+        "confidence": 95.3,
         "rack": "OQMPERE",
         "layout": "B",
         "rows": (
