@@ -74,9 +74,8 @@ SCREENSHOT_PASTE_HTML = """
 <div class="paste-actions">
   <button id="paste-button" type="button">Plak screenshot</button>
   <div id="paste-target" class="paste-target" contenteditable="true" inputmode="none"
-       role="textbox" aria-label="Plak hier een schermafbeelding" aria-multiline="false">
-    Of tik hier en houd vast om Plak te kiezen
-  </div>
+       role="textbox" aria-label="Plak hier een schermafbeelding" aria-multiline="false"
+       data-placeholder="Of tik hier en houd vast om Plak te kiezen"></div>
 </div>
 <div id="paste-status" class="paste-status" role="status" aria-live="polite"></div>
 """
@@ -85,7 +84,9 @@ SCREENSHOT_PASTE_CSS = """
 .paste-actions { display:grid; grid-template-columns:auto minmax(0,1fr); gap:.5rem; }
 button, .paste-target { min-height:2.8rem; border:1px solid var(--st-border-color, #b8c9be); border-radius:.6rem; padding:.5rem .75rem; background:var(--st-secondary-background-color, #fff); color:var(--st-text-color, #243127); font:inherit; }
 button { cursor:pointer; }
-.paste-target { min-width:0; display:grid; place-items:center; border-style:dashed; color:var(--st-secondary-text-color, #657168); font-size:.9rem; text-align:center; user-select:text; -webkit-user-select:text; }
+.paste-target { min-width:0; display:flex; align-items:center; justify-content:center; overflow:hidden; border-style:dashed; color:var(--st-secondary-text-color, #657168); font-size:.9rem; text-align:center; user-select:text; -webkit-user-select:text; -webkit-touch-callout:default; caret-color:transparent; }
+.paste-target:empty::before { content:attr(data-placeholder); pointer-events:none; }
+.paste-target img { max-height:2rem; }
 .paste-target:focus-visible, button:focus-visible { outline:3px solid var(--st-primary-color, #195b42); outline-offset:1px; }
 .paste-status { min-height:0; margin-top:.3rem; color:var(--st-secondary-text-color, #657168); font-size:.88rem; }
 @media (max-width: 480px) { .paste-actions { grid-template-columns:1fr; } }
@@ -98,49 +99,147 @@ export default function(component) {
   const pasteTarget = parentElement.querySelector("#paste-target");
   const status = parentElement.querySelector("#paste-status");
   const maxBytes = 2 * 1024 * 1024;
+  const maxSide = 4096;
+  const sendableTypes = ["image/png", "image/jpeg", "image/webp"];
   const handledEvents = new WeakSet();
+  let busy = false;
+  let statusTimer = 0;
   if (!button || !pasteTarget || !status) return;
 
-  function setStatus(message) { status.textContent = message; }
-  function imageType(type) {
-    const normalized = String(type || "").toLowerCase();
-    if (normalized === "image/x-png") return "image/png";
-    return ["image/png", "image/jpeg", "image/webp"].includes(normalized) ? normalized : "";
+  function setStatus(message, clearAfterMs = 0) {
+    window.clearTimeout(statusTimer);
+    status.textContent = message;
+    if (clearAfterMs) statusTimer = window.setTimeout(() => { status.textContent = ""; }, clearAfterMs);
   }
+  function normalizedType(type) {
+    const value = String(type || "").toLowerCase().split(";")[0].trim();
+    return value === "image/x-png" ? "image/png" : value === "image/jpg" ? "image/jpeg" : value;
+  }
+  // iOS can hand over HEIC, TIFF or an untyped file; accept any image and
+  // convert it in the browser instead of rejecting it.
+  function isImage(type) { return normalizedType(type).startsWith("image/"); }
+  function clearTarget() { pasteTarget.replaceChildren(); }
+
   function clipboardFile(clipboardData) {
     if (!clipboardData) return null;
     for (const item of Array.from(clipboardData.items || [])) {
-      if (item.kind !== "file" || !imageType(item.type)) continue;
+      if (item.kind !== "file") continue;
       const file = item.getAsFile();
-      if (file) return file;
+      if (file && (isImage(item.type) || isImage(file.type) || !file.type)) return file;
     }
-    return Array.from(clipboardData.files || []).find(file => imageType(file.type)) || null;
+    return Array.from(clipboardData.files || []).find(file => isImage(file.type) || !file.type) || null;
+  }
+
+  function loadImage(blob) {
+    if (window.createImageBitmap) {
+      return window.createImageBitmap(blob).catch(() => loadImageElement(blob));
+    }
+    return loadImageElement(blob);
+  }
+  function loadImageElement(blob) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+      image.onerror = () => { URL.revokeObjectURL(url); reject(new Error("decode")); };
+      image.src = url;
+    });
+  }
+  function canvasBlob(canvas, type, quality) {
+    return new Promise(resolve => canvas.toBlob(resolve, type, quality));
+  }
+  async function reencode(blob) {
+    const image = await loadImage(blob);
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    if (!width || !height) throw new Error("decode");
+    let scale = Math.min(1, maxSide / Math.max(width, height));
+    const attempts = [["image/png", undefined], ["image/jpeg", 0.92], ["image/jpeg", 0.8]];
+    for (let round = 0; round < 4; round += 1) {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(width * scale));
+      canvas.height = Math.max(1, Math.round(height * scale));
+      const context = canvas.getContext("2d");
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      for (const [type, quality] of attempts) {
+        const result = await canvasBlob(canvas, type, quality);
+        if (result && result.size <= maxBytes) return result;
+      }
+      scale *= 0.75;
+    }
+    throw new Error("size");
+  }
+  function toBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",", 2)[1] || "");
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
   }
   async function sendImage(blob) {
-    const mime = imageType(blob?.type);
-    if (!mime) return setStatus("Gebruik een PNG-, JPG- of WebP-schermafbeelding.");
-    if (blob.size > maxBytes) return setStatus("Deze schermafbeelding is groter dan 2 MB.");
+    if (busy) return;
+    busy = true;
+    setStatus("Schermafbeelding wordt gelezen…");
     try {
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      let binary = "";
-      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+      let image = blob;
+      let mime = normalizedType(blob.type);
+      if (!sendableTypes.includes(mime) || blob.size > maxBytes) {
+        image = await reencode(blob);
+        mime = normalizedType(image.type);
       }
-      setStatus("Schermafbeelding wordt verwerkt…");
-      setTriggerValue("pasted", { mime, data: window.btoa(binary) });
-    } catch (_error) {
-      setStatus("De schermafbeelding kon niet van het klembord worden gelezen.");
+      const data = await toBase64(image);
+      if (!data) throw new Error("empty");
+      setStatus("Schermafbeelding wordt verwerkt…", 8000);
+      // The nonce makes every paste a new trigger, also for the same image.
+      setTriggerValue("pasted", { mime, data, nonce: Date.now() });
+    } catch (error) {
+      setStatus(error?.message === "size"
+        ? "Deze schermafbeelding is te groot om te verwerken."
+        : "De schermafbeelding kon niet van het klembord worden gelezen.");
+    } finally {
+      busy = false;
+      clearTarget();
     }
   }
+
+  // Fallback for WebKit builds that insert the image into the editable box
+  // without exposing it as a file on the paste event.
+  async function readInsertedImage() {
+    const image = pasteTarget.querySelector("img");
+    if (!image?.src) {
+      clearTarget();
+      return setStatus("Kopieer eerst een schermafbeelding en plak die hier.", 6000);
+    }
+    try {
+      const response = await fetch(image.src);
+      const blob = await response.blob();
+      clearTarget();
+      await sendImage(blob);
+    } catch (_error) {
+      clearTarget();
+      setStatus("Plakken lukte niet; gebruik de knop Plak screenshot of upload de afbeelding.");
+    }
+  }
+
   function handlePaste(event) {
     if (handledEvents.has(event)) return;
-    const target = event.target instanceof Element ? event.target : null;
-    const isPasteTarget = target?.closest("#paste-target");
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    const isPasteTarget = path.includes(pasteTarget) || event.target === pasteTarget;
     const file = clipboardFile(event.clipboardData);
     if (!file) {
       if (isPasteTarget) {
-        event.preventDefault();
-        setStatus("Kopieer eerst een schermafbeelding en plak die hier.");
+        handledEvents.add(event);
+        const types = Array.from(event.clipboardData?.types || []);
+        if (types.some(type => type === "text/html" || type === "Files" || isImage(type))) {
+          // Let the browser insert the image, then read it back.
+          window.setTimeout(readInsertedImage, 50);
+        } else {
+          event.preventDefault();
+          setStatus("Kopieer eerst een schermafbeelding en plak die hier.", 6000);
+        }
       }
       return;
     }
@@ -149,27 +248,46 @@ export default function(component) {
     event.stopPropagation();
     void sendImage(file);
   }
+
   async function readClipboard() {
     if (!navigator.clipboard?.read) {
+      pasteTarget.focus();
+      return setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
+    }
+    // Call read() synchronously inside the tap; iOS rejects it otherwise.
+    let pending;
+    try {
+      pending = navigator.clipboard.read();
+    } catch (_error) {
       return setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
     }
     try {
-      const items = await navigator.clipboard.read();
+      const items = await pending;
       for (const item of items) {
-        const type = item.types.find(value => imageType(value));
-        if (type) return sendImage(await item.getType(type));
+        const type = item.types.find(value => isImage(value));
+        if (type) return await sendImage(await item.getType(type));
       }
-      setStatus("Er staat geen ondersteunde afbeelding op het klembord.");
-    } catch (_error) {
-      setStatus("Tik in het plakvak en houd vast om Plak te kiezen.");
+      setStatus("Er staat geen afbeelding op het klembord.", 6000);
+    } catch (error) {
+      setStatus(error?.name === "NotAllowedError"
+        ? "Tik op Plak in de melding van iOS, of houd het plakvak vast om Plak te kiezen."
+        : "Tik in het plakvak en houd vast om Plak te kiezen.");
     }
   }
+  function handleInput() {
+    if (!pasteTarget.querySelector("img")) clearTarget();
+  }
+
+  clearTarget();
   button.addEventListener("click", readClipboard);
+  pasteTarget.addEventListener("input", handleInput);
   const ownerDocument = parentElement.ownerDocument || document;
   ownerDocument.addEventListener("paste", handlePaste, true);
   parentElement.addEventListener("paste", handlePaste, true);
   return () => {
+    window.clearTimeout(statusTimer);
     button.removeEventListener("click", readClipboard);
+    pasteTarget.removeEventListener("input", handleInput);
     ownerDocument.removeEventListener("paste", handlePaste, true);
     parentElement.removeEventListener("paste", handlePaste, true);
   };
@@ -770,7 +888,8 @@ def process_upload() -> None:
         upload_file_id,
         hashlib.sha256(upload_bytes).hexdigest(),
     )
-    if signature in {st.session_state.upload_signature, st.session_state.upload_error_signature}:
+    # A paste is always an explicit request, also when it repeats the last image.
+    if pending_paste is None and signature in {st.session_state.upload_signature, st.session_state.upload_error_signature}:
         return
     ocr_backend = secret_or_env("WORDFEUD_OCR_BACKEND", "local").strip().lower()
     api_key = secret_or_env("OPENROUTER_API_KEY")
