@@ -1,5 +1,5 @@
---- /etc/apache2/sites-available/coen.at-le-ssl.conf
-+++ /etc/apache2/sites-available/coen.at-le-ssl.conf
+--- /etc/apache2/sites-enabled/coen.at-le-ssl.conf
++++ /etc/apache2/sites-enabled/coen.at-le-ssl.conf
 @@ -14,6 +14,75 @@
 -    <Location /feutsolver/>
 -        AuthType Basic
@@ -40,7 +40,7 @@
 +        # token-revocation store in this vhost.
 +        SessionCookieName feutsolver_session_v2 path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
-+        SessionCookieRemove On
++        # SessionCookieRemove omitted: since CVE-2026-47360 (apache2 2.4.58-1ubuntu8.18) it breaks mod_auth_form login
 +        Header always set Cache-Control "no-store"
 +    </Location>
 +
@@ -55,7 +55,7 @@
 +        SessionMaxAge 1
 +        SessionCookieName feutsolver_session_v2 path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
-+        SessionCookieRemove On
++        # SessionCookieRemove omitted: since CVE-2026-47360 (apache2 2.4.58-1ubuntu8.18) it breaks mod_auth_form login
 +        Header always set Cache-Control "no-store"
 +        Require all granted
 +    </Location>
@@ -70,7 +70,7 @@
 +        SessionMaxAge 259200
 +        SessionCookieName feutsolver_session_v2 path=/;httponly;secure;samesite=lax
 +        SessionCryptoPassphraseFile /etc/apache2/feutsolver-session.keys
-+        SessionCookieRemove On
++        # SessionCookieRemove omitted: since CVE-2026-47360 (apache2 2.4.58-1ubuntu8.18) it breaks mod_auth_form login
 +        RequestHeader set X-Authenticated-User expr=%{REMOTE_USER}
 +        Header always set Cache-Control "no-store"
 +        # Start in report-only mode, review Streamlit/websocket reports, then
