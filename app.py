@@ -75,7 +75,7 @@ SCREENSHOT_PASTE_HTML = """
   <button id="paste-button" type="button">Plak screenshot</button>
   <div id="paste-target" class="paste-target" contenteditable="true" inputmode="none"
        role="textbox" aria-label="Plak hier een schermafbeelding" aria-multiline="false"
-       data-placeholder="Of tik hier en houd vast om Plak te kiezen"></div>
+       data-placeholder="Of tik hier om te plakken"></div>
 </div>
 <div id="paste-status" class="paste-status" role="status" aria-live="polite"></div>
 """
@@ -104,13 +104,19 @@ export default function(component) {
   const maxSide = 4096;
   const sendableTypes = ["image/png", "image/jpeg", "image/webp"];
   const handledEvents = new WeakSet();
+  // iPadOS reports itself as a Mac, so also look at the touch support.
+  const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const ownerDocument = parentElement.ownerDocument || document;
   let busy = false;
   let statusTimer = 0;
+  let dialog = null;
   if (!button || !pasteTarget || !status) return;
 
   function setStatus(message, clearAfterMs = 0) {
     window.clearTimeout(statusTimer);
     status.textContent = message;
+    if (dialog && !dialog.root.hidden) dialog.dialogStatus.textContent = message;
     if (clearAfterMs) statusTimer = window.setTimeout(() => { status.textContent = ""; }, clearAfterMs);
   }
   function normalizedType(type) {
@@ -130,6 +136,132 @@ export default function(component) {
       if (file && (isImage(item.type) || isImage(file.type) || !file.type)) return file;
     }
     return Array.from(clipboardData.files || []).find(file => isImage(file.type) || !file.type) || null;
+  }
+
+  // Streamlit renders components v2 inside a shadow root. iOS Safari cannot
+  // show its native Paste menu for a contenteditable inside a shadow root, so
+  // the paste area of this dialog lives in the normal document instead.
+  function ensureDialogStyles() {
+    if (ownerDocument.getElementById("feutsolver-paste-dialog-styles")) return;
+    const style = ownerDocument.createElement("style");
+    style.id = "feutsolver-paste-dialog-styles";
+    style.textContent = `
+      .feutsolver-paste-backdrop { position:fixed; inset:0; z-index:2147483000; display:flex; align-items:center; justify-content:center; padding:1rem; background:rgba(15,25,20,.55); }
+      .feutsolver-paste-backdrop[hidden] { display:none; }
+      .feutsolver-paste-card { box-sizing:border-box; width:100%; max-width:30rem; padding:1.1rem; border-radius:.9rem; background:#fff; color:#243127; box-shadow:0 18px 50px rgba(0,0,0,.35); font-family:inherit; }
+      .feutsolver-paste-card h2 { margin:0 0 .35rem; font-size:1.05rem; }
+      .feutsolver-paste-card p { margin:0 0 .7rem; font-size:.9rem; line-height:1.35; color:#4b5a50; }
+      .feutsolver-paste-area { box-sizing:border-box; display:flex; align-items:center; justify-content:center; min-height:9rem; padding:1rem; border:2px dashed #8aa595; border-radius:.7rem; background:rgba(25,91,66,.05); color:#657168; font-size:.95rem; text-align:center; overflow:hidden; user-select:text; -webkit-user-select:text; -webkit-touch-callout:default; caret-color:transparent; }
+      .feutsolver-paste-area:focus { outline:3px solid #195b42; outline-offset:2px; }
+      .feutsolver-paste-area img { max-width:100%; max-height:7rem; }
+      .feutsolver-paste-dialog-status { min-height:1.1rem; margin-top:.5rem; color:#4b5a50; font-size:.85rem; }
+      .feutsolver-paste-actions { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.7rem; }
+      .feutsolver-paste-actions button, .feutsolver-paste-file-label { display:inline-flex; align-items:center; justify-content:center; min-height:2.6rem; padding:.5rem .85rem; border:1px solid #b8c9be; border-radius:.6rem; background:#fff; color:#243127; font:inherit; cursor:pointer; }
+      .feutsolver-paste-actions button:focus-visible, .feutsolver-paste-file-label:focus-within { outline:3px solid #195b42; outline-offset:1px; }
+      .feutsolver-paste-file { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+      @media (prefers-color-scheme: dark) {
+        .feutsolver-paste-card { background:#1c2420; color:#e8efe9; }
+        .feutsolver-paste-card p, .feutsolver-paste-dialog-status { color:#b9c7bd; }
+        .feutsolver-paste-area { border-color:#4f7a62; background:rgba(255,255,255,.04); color:#b9c7bd; }
+        .feutsolver-paste-actions button, .feutsolver-paste-file-label { background:#243029; color:#e8efe9; border-color:#3f564a; }
+      }
+    `;
+    ownerDocument.head.appendChild(style);
+  }
+
+  function selectContents(element) {
+    try {
+      const selection = window.getSelection();
+      if (!selection) return;
+      // removeAllRanges() makes iOS drop focus from a contenteditable.
+      if (selection.setBaseAndExtent) {
+        selection.setBaseAndExtent(element, 0, element, element.childNodes.length);
+      } else {
+        const range = ownerDocument.createRange();
+        range.selectNodeContents(element);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    } catch (_error) { /* Selection is best effort. */ }
+  }
+
+  function resetDialogArea() {
+    if (!dialog) return;
+    dialog.area.replaceChildren(ownerDocument.createTextNode("Houd hier vast en kies Plak"));
+  }
+
+  function ensureDialog() {
+    if (dialog) return dialog;
+    ensureDialogStyles();
+    for (const stale of Array.from(ownerDocument.querySelectorAll(".feutsolver-paste-backdrop"))) stale.remove();
+    const root = ownerDocument.createElement("div");
+    root.className = "feutsolver-paste-backdrop";
+    root.hidden = true;
+    root.innerHTML = `
+      <div class="feutsolver-paste-card" role="dialog" aria-modal="true" aria-labelledby="feutsolver-paste-title">
+        <h2 id="feutsolver-paste-title">Schermafbeelding plakken</h2>
+        <p>Houd het vak hieronder vast en kies <strong>Plak</strong>. Op een computer kun je ook Ctrl+V of Cmd+V gebruiken.</p>
+        <div class="feutsolver-paste-area" contenteditable="true" inputmode="none" role="textbox" aria-label="Plak hier een schermafbeelding" spellcheck="false" autocapitalize="off" autocorrect="off"></div>
+        <div class="feutsolver-paste-dialog-status" role="status" aria-live="polite"></div>
+        <div class="feutsolver-paste-actions">
+          <label class="feutsolver-paste-file-label">Of kies een foto<input class="feutsolver-paste-file" type="file" accept="image/*"></label>
+          <button type="button" class="feutsolver-paste-close">Sluiten</button>
+        </div>
+      </div>`;
+    ownerDocument.body.appendChild(root);
+    const area = root.querySelector(".feutsolver-paste-area");
+    const dialogStatus = root.querySelector(".feutsolver-paste-dialog-status");
+    const closeButton = root.querySelector(".feutsolver-paste-close");
+    const fileInput = root.querySelector(".feutsolver-paste-file");
+    // iOS shows the native Paste menu more readily when the text is selected.
+    const onAreaClick = () => { if (isIOS) selectContents(area); };
+    const onClose = () => closeDialog();
+    const onBackdrop = event => { if (event.target === root) closeDialog(); };
+    const onKeyDown = event => { if (event.key === "Escape") closeDialog(); };
+    const onFile = () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) void sendImage(file);
+    };
+    area.addEventListener("click", onAreaClick);
+    area.addEventListener("focus", onAreaClick);
+    closeButton.addEventListener("click", onClose);
+    root.addEventListener("click", onBackdrop);
+    fileInput.addEventListener("change", onFile);
+    ownerDocument.addEventListener("keydown", onKeyDown);
+    dialog = { root, area, dialogStatus, closeButton, fileInput, onAreaClick, onClose, onBackdrop, onKeyDown, onFile };
+    resetDialogArea();
+    return dialog;
+  }
+
+  function openDialog(message) {
+    const active = ensureDialog();
+    if (message) active.dialogStatus.textContent = message;
+    active.root.hidden = false;
+    resetDialogArea();
+    // Focus synchronously so the tap still counts as a user gesture on iOS.
+    try { active.area.focus({ preventScroll: true }); } catch (_error) { try { active.area.focus(); } catch (_ignored) { /* no focus */ } }
+    if (isIOS) selectContents(active.area);
+  }
+
+  function closeDialog() {
+    if (!dialog) return;
+    dialog.root.hidden = true;
+    dialog.dialogStatus.textContent = "";
+    dialog.fileInput.value = "";
+    resetDialogArea();
+  }
+
+  function destroyDialog() {
+    if (!dialog) return;
+    const active = dialog;
+    active.area.removeEventListener("click", active.onAreaClick);
+    active.area.removeEventListener("focus", active.onAreaClick);
+    active.closeButton.removeEventListener("click", active.onClose);
+    active.root.removeEventListener("click", active.onBackdrop);
+    active.fileInput.removeEventListener("change", active.onFile);
+    ownerDocument.removeEventListener("keydown", active.onKeyDown);
+    active.root.remove();
+    dialog = null;
   }
 
   function loadImage(blob) {
@@ -198,6 +330,7 @@ export default function(component) {
       setStatus("Schermafbeelding wordt verwerkt…", 8000);
       // The nonce makes every paste a new trigger, also for the same image.
       setTriggerValue("pasted", { mime, data, nonce: Date.now() });
+      closeDialog();
     } catch (error) {
       setStatus(error?.message === "size"
         ? "Deze schermafbeelding is te groot om te verwerken."
@@ -205,44 +338,79 @@ export default function(component) {
     } finally {
       busy = false;
       clearTarget();
+      resetDialogArea();
     }
   }
 
-  // Fallback for WebKit builds that insert the image into the editable box
-  // without exposing it as a file on the paste event.
-  async function readInsertedImage() {
-    const image = pasteTarget.querySelector("img");
-    if (!image?.src) {
-      clearTarget();
-      return setStatus("Kopieer eerst een schermafbeelding en plak die hier.", 6000);
+  // Reads a pasted image that WebKit only inserted into an editable element.
+  async function blobFromImage(image) {
+    if (!image.complete || !(image.naturalWidth || image.width)) {
+      await new Promise(resolve => {
+        if (image.complete) return resolve();
+        image.addEventListener("load", resolve, { once: true });
+        image.addEventListener("error", resolve, { once: true });
+      });
     }
     try {
       const response = await fetch(image.src);
-      const blob = await response.blob();
-      clearTarget();
+      if (response.ok) {
+        const blob = await response.blob();
+        if (blob && blob.size) return blob;
+      }
+    } catch (_error) { /* Fall back to the decoded image below. */ }
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    if (!width || !height) throw new Error("decode");
+    const canvas = ownerDocument.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d").drawImage(image, 0, 0);
+    const blob = await canvasBlob(canvas, "image/png");
+    if (!blob) throw new Error("decode");
+    return blob;
+  }
+
+  // Fallback for WebKit builds that insert the image into the editable box
+  // without exposing it as a file on the paste event. WebKit can insert it a
+  // little later than the event itself, so poll briefly.
+  async function readInsertedImage(element) {
+    let image = null;
+    for (let attempt = 0; attempt < 20 && !image; attempt += 1) {
+      if (attempt) await new Promise(resolve => window.setTimeout(resolve, 50));
+      image = element.querySelector("img");
+    }
+    if (!image?.src) {
+      element.replaceChildren();
+      if (element === dialog?.area) resetDialogArea();
+      return setStatus("Kopieer eerst een schermafbeelding en plak die hier.", 6000);
+    }
+    try {
+      const blob = await blobFromImage(image);
+      element.replaceChildren();
       await sendImage(blob);
     } catch (_error) {
-      clearTarget();
-      setStatus("Plakken lukte niet; gebruik de knop Plak screenshot of upload de afbeelding.");
+      element.replaceChildren();
+      if (element === dialog?.area) resetDialogArea();
+      setStatus("Plakken lukte niet; kies de afbeelding via Upload of via 'Of kies een foto'.");
     }
   }
 
   function handlePaste(event) {
     if (handledEvents.has(event)) return;
     const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-    const isPasteTarget = path.includes(pasteTarget) || event.target === pasteTarget;
+    const dialogArea = dialog && !dialog.root.hidden ? dialog.area : null;
+    const editable = path.includes(pasteTarget) || event.target === pasteTarget
+      ? pasteTarget
+      : dialogArea && (path.includes(dialogArea) || event.target === dialogArea)
+        ? dialogArea
+        : null;
+
     const file = clipboardFile(event.clipboardData);
     if (!file) {
-      if (isPasteTarget) {
+      if (editable) {
         handledEvents.add(event);
-        const types = Array.from(event.clipboardData?.types || []);
-        if (types.some(type => type === "text/html" || type === "Files" || isImage(type))) {
-          // Let the browser insert the image, then read it back.
-          window.setTimeout(readInsertedImage, 50);
-        } else {
-          event.preventDefault();
-          setStatus("Kopieer eerst een schermafbeelding en plak die hier.", 6000);
-        }
+        // Let the browser insert the image, then read it back.
+        window.setTimeout(() => { void readInsertedImage(editable); }, 50);
       }
       return;
     }
@@ -256,12 +424,15 @@ export default function(component) {
     pasteTarget.classList.remove("attention");
     void pasteTarget.offsetWidth;
     pasteTarget.classList.add("attention");
-    try { pasteTarget.focus({ preventScroll: true }); } catch (_error) { pasteTarget.focus(); }
     setStatus(message);
+    openDialog(message);
   }
   async function readClipboard() {
-    const fallback = "Houd het gemarkeerde plakvak vast en kies Plak.";
+    const fallback = "Houd het plakvak vast en kies Plak.";
     if (busy) return;
+    // iOS Safari cannot reliably read images through clipboard.read(), and its
+    // paste prompt often never appears. Open the paste dialog right away.
+    if (isIOS) return showFallback("Houd het vak hieronder vast en kies Plak.");
     if (!navigator.clipboard?.read) return showFallback(fallback);
     // Call read() synchronously inside the tap; iOS rejects it otherwise.
     let pending;
@@ -270,12 +441,12 @@ export default function(component) {
     } catch (_error) {
       return showFallback(fallback);
     }
-    setStatus("Klembord wordt gelezen… tik op Plak als iOS daarom vraagt.");
+    setStatus("Klembord wordt gelezen… tik op Plak als je browser daarom vraagt.");
     // Some iOS browsers (Brave) never show the paste prompt, so read() never
-    // settles. Fall back to the long-press paste box instead of hanging.
+    // settles. Fall back to the paste dialog instead of hanging.
     let timer = 0;
     const timeout = new Promise((_resolve, reject) => {
-      timer = window.setTimeout(() => reject(Object.assign(new Error("timeout"), { name: "TimeoutError" })), 4000);
+      timer = window.setTimeout(() => reject(Object.assign(new Error("timeout"), { name: "TimeoutError" })), 8000);
     });
     try {
       const items = await Promise.race([pending, timeout]);
@@ -284,7 +455,9 @@ export default function(component) {
         const type = item.types.find(value => isImage(value));
         if (type) return await sendImage(await item.getType(type));
       }
-      setStatus("Er staat geen afbeelding op het klembord.", 6000);
+      // iOS often exposes only text through read(); the paste event can still
+      // hand over the image, so point the user at the dialog.
+      showFallback("Geen afbeelding via de knop gevonden. " + fallback);
     } catch (error) {
       window.clearTimeout(timer);
       showFallback(error?.name === "TimeoutError"
@@ -293,21 +466,44 @@ export default function(component) {
     }
   }
   function handleInput() {
-    if (!pasteTarget.querySelector("img")) clearTarget();
+    if (pasteTarget.querySelector("img")) return;
+    window.setTimeout(() => { if (!pasteTarget.querySelector("img")) clearTarget(); }, 400);
+  }
+
+  // On iOS the inline box sits in the shadow root, where the native Paste menu
+  // does not appear. Make it a plain button that opens the dialog in the
+  // normal document instead of trying to edit it in place.
+  function handleBoxClick() {
+    if (!isIOS) return;
+    openDialog();
+  }
+  function handleBoxKeyDown(event) {
+    if (!isIOS || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    openDialog();
+  }
+  if (isIOS) {
+    pasteTarget.removeAttribute("contenteditable");
+    pasteTarget.setAttribute("role", "button");
+    pasteTarget.setAttribute("tabindex", "0");
   }
 
   clearTarget();
   button.addEventListener("click", readClipboard);
   pasteTarget.addEventListener("input", handleInput);
-  const ownerDocument = parentElement.ownerDocument || document;
+  pasteTarget.addEventListener("click", handleBoxClick);
+  pasteTarget.addEventListener("keydown", handleBoxKeyDown);
   ownerDocument.addEventListener("paste", handlePaste, true);
   parentElement.addEventListener("paste", handlePaste, true);
   return () => {
     window.clearTimeout(statusTimer);
     button.removeEventListener("click", readClipboard);
     pasteTarget.removeEventListener("input", handleInput);
+    pasteTarget.removeEventListener("click", handleBoxClick);
+    pasteTarget.removeEventListener("keydown", handleBoxKeyDown);
     ownerDocument.removeEventListener("paste", handlePaste, true);
     parentElement.removeEventListener("paste", handlePaste, true);
+    destroyDialog();
   };
 }
 """
